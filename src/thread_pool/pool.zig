@@ -728,11 +728,4 @@ fn nowNs() u64 {
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 
-fn updatePeak(counter: *std.atomic.Value(u64), value: u64) void {
-    var current = counter.load(.monotonic);
-    while (value > current) {
-        const previous = counter.cmpxchgWeak(current, value, .monotonic, .monotonic);
-        if (previous == null) return;
-        current = previous.?;
-    }
-}
+const updatePeak = Accounting.updatePeak;

@@ -21,7 +21,7 @@ pub const Accounting = struct {
         _ = self.live_bytes.fetchSub(amount, .monotonic);
     }
 
-    fn updatePeak(counter: *std.atomic.Value(u64), value: u64) void {
+    pub fn updatePeak(counter: *std.atomic.Value(u64), value: u64) void {
         var current = counter.load(.monotonic);
         while (value > current) {
             const previous = counter.cmpxchgWeak(current, value, .monotonic, .monotonic);
