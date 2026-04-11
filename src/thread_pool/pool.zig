@@ -9,6 +9,8 @@ const process_memory = @import("stats/process_memory.zig");
 
 threadlocal var tls_worker_index: ?usize = null;
 
+/// Runtime context passed to every task function. Provides the worker
+/// index, cancellation state, and access to the per-worker scratch allocator.
 pub const TaskContext = struct {
     worker_index: usize,
     cancellation_token: ?*types.CancellationToken,
@@ -25,8 +27,11 @@ pub const TaskContext = struct {
     }
 };
 
+/// Function signature for submitted tasks. `ctx` is the opaque pointer
+/// passed to submit; `runtime` provides cancellation and scratch access.
 pub const TaskFn = *const fn (ctx: *anyopaque, runtime: *TaskContext) void;
 
+/// A task function paired with its context, for use with `submitBatch`.
 pub const BatchTask = struct {
     task_fn: TaskFn,
     ctx: *anyopaque,
@@ -678,9 +683,19 @@ const Core = struct {
     }
 };
 
+/// A bounded, fixed-capacity thread pool with configurable scheduling.
+///
+/// Supports two scheduler variants behind the same API: `global_queue`
+/// (single shared FIFO) and `work_stealing` (per-worker deques with
+/// steal-from-peer). All submissions are non-blocking by default; use
+/// `SubmitOptions.backpressure` for blocking behavior when the queue is full.
 pub const ThreadPool = struct {
     core: *Core,
 
+    /// Create a new thread pool with the given configuration.
+    /// Workers are spawned immediately and begin polling for tasks.
+    /// The allocator is retained for the pool's lifetime and used for
+    /// internal allocations (descriptors, queues, scratch buffers).
     pub fn init(allocator: std.mem.Allocator, config: types.Config) !ThreadPool {
         const core = try allocator.create(Core);
         errdefer allocator.destroy(core);
@@ -688,6 +703,9 @@ pub const ThreadPool = struct {
         return .{ .core = core };
     }
 
+    /// Shut down the pool and release all resources.
+    /// Drains remaining tasks up to `Config.deinit_timeout_ns` (default 30s),
+    /// then force-joins worker threads. After this call the pool is unusable.
     pub fn deinit(self: *ThreadPool) void {
         const allocator = self.core.allocator;
         self.core.deinit();
@@ -695,34 +713,61 @@ pub const ThreadPool = struct {
         self.* = undefined;
     }
 
+    /// Submit a task without blocking. Returns `error.QueueFull` or
+    /// `error.TaskPoolExhausted` immediately if capacity is exhausted,
+    /// regardless of the backpressure policy in `options`.
     pub fn trySubmit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
         return self.core.trySubmit(task_fn, ctx, options);
     }
 
+    /// Submit a task, optionally blocking per `options.backpressure`.
+    /// Returns a `TaskHandle` that can be passed to `wait()` if
+    /// `options.waitable` is true; otherwise returns an invalid handle.
     pub fn submit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
         return self.core.submit(task_fn, ctx, options);
     }
 
+    /// Submit multiple tasks atomically. Returns the count of tasks
+    /// successfully enqueued. If the first task fails, the error propagates;
+    /// subsequent failures return a partial `SubmitBatchResult`.
     pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
         return self.core.submitBatch(tasks, options);
     }
 
+    /// Block until a waitable task completes or is cancelled.
+    /// The task descriptor is released upon return. Passing an invalid
+    /// or non-waitable handle returns `error.InvalidHandle`.
     pub fn wait(self: *ThreadPool, handle: types.TaskHandle) !void {
         return self.core.wait(handle);
     }
 
+    /// Return a new `WaitGroup` for coordinating completion of a batch
+    /// of tasks. Pass `&wg` via `SubmitOptions.wait_group`, then call
+    /// `wg.wait()` to block until all tasks in the group finish.
     pub fn waitGroup(self: *ThreadPool) types.WaitGroup {
         return self.core.waitGroup();
     }
 
+    /// Initiate graceful or immediate shutdown.
+    /// `.drain` waits for all queued and active tasks to complete.
+    /// `.cancel_pending` cancels queued tasks, then waits for active ones.
+    /// Pass a `timeout_ns` to bound the wait; returns `error.Timeout`
+    /// if the deadline elapses with tasks still in flight.
     pub fn shutdown(self: *ThreadPool, mode: types.ShutdownMode, timeout_ns: ?u64) !void {
         return self.core.shutdown(mode, timeout_ns);
     }
 
+    /// Capture a point-in-time snapshot of pool statistics including
+    /// submission counts, latency histograms, memory usage, and
+    /// per-worker metrics. Worker stats are read without synchronization
+    /// and may be approximate while tasks are actively running.
     pub fn statsSnapshot(self: *ThreadPool) types.Stats {
         return self.core.statsSnapshot();
     }
 
+    /// Release scratch memory held by idle workers. Returns
+    /// `error.PoolBusy` if any tasks are currently active, since
+    /// purging during execution would corrupt scratch allocators.
     pub fn purgeWorkerCaches(self: *ThreadPool) !void {
         return self.core.purgeWorkerCaches();
     }
