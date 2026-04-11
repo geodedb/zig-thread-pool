@@ -19,6 +19,18 @@ pub const LatencyHistogram = struct {
         if (value_ns > self.max_ns) self.max_ns = value_ns;
     }
 
+    pub fn merge(self: *LatencyHistogram, other: LatencyHistogram) void {
+        for (&self.counts, other.counts) |*dst, src| {
+            dst.* += src;
+        }
+        self.count += other.count;
+        self.sum_ns += other.sum_ns;
+        if (other.count > 0) {
+            if (other.min_ns < self.min_ns) self.min_ns = other.min_ns;
+            if (other.max_ns > self.max_ns) self.max_ns = other.max_ns;
+        }
+    }
+
     pub fn summary(self: LatencyHistogram) types.LatencySummary {
         if (self.count == 0) return .{};
         return .{

@@ -54,6 +54,8 @@ const Worker = struct {
     thread: ?std.Thread = null,
     local_queue: WorkDeque(u32),
     scratch: WorkerScratch,
+    wait_histogram: LatencyHistogram = .{},
+    exec_histogram: LatencyHistogram = .{},
     busy_ns: u64 = 0,
     idle_ns: u64 = 0,
     local_queue_peak: u32 = 0,
@@ -76,9 +78,6 @@ const Core = struct {
     inject_queue: BoundedRing(u32),
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
-    wait_histogram: LatencyHistogram = .{},
-    exec_histogram: LatencyHistogram = .{},
-    latency_mutex: std.Thread.Mutex = .{},
     worker_stats_buffer: []types.WorkerStats,
     submit_round_robin: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -247,8 +246,12 @@ const Core = struct {
 
         const memory = process_memory.sample() catch types.ProcessMemoryStats{};
 
-        self.latency_mutex.lock();
-        defer self.latency_mutex.unlock();
+        var merged_wait = LatencyHistogram{};
+        var merged_exec = LatencyHistogram{};
+        for (self.workers) |*worker| {
+            merged_wait.merge(worker.wait_histogram);
+            merged_exec.merge(worker.exec_histogram);
+        }
 
         return .{
             .submitted = self.submitted.load(.acquire),
@@ -270,8 +273,8 @@ const Core = struct {
             .total_free_bytes = self.total_free_bytes.load(.acquire),
             .live_bytes = self.live_bytes.load(.acquire),
             .peak_live_bytes = self.peak_live_bytes.load(.acquire),
-            .task_wait_ns = self.wait_histogram.summary(),
-            .task_exec_ns = self.exec_histogram.summary(),
+            .task_wait_ns = merged_wait.summary(),
+            .task_exec_ns = merged_exec.summary(),
             .memory = memory,
             .worker_stats = self.worker_stats_buffer,
         };
@@ -425,9 +428,7 @@ const Core = struct {
         descriptor.start_ns = nowNs();
 
         const wait_ns = descriptor.start_ns - descriptor.submit_ns;
-        self.latency_mutex.lock();
-        self.wait_histogram.observe(wait_ns);
-        self.latency_mutex.unlock();
+        worker.wait_histogram.observe(wait_ns);
 
         _ = self.started.fetchAdd(1, .monotonic);
         _ = self.active_tasks.fetchAdd(1, .monotonic);
@@ -459,9 +460,7 @@ const Core = struct {
         worker.busy_ns += exec_ns;
         worker.last_idle_started_ns = descriptor.complete_ns;
 
-        self.latency_mutex.lock();
-        self.exec_histogram.observe(exec_ns);
-        self.latency_mutex.unlock();
+        worker.exec_histogram.observe(exec_ns);
 
         _ = self.active_tasks.fetchSub(1, .monotonic);
         if (descriptor.state != .cancelled) {
