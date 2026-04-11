@@ -74,8 +74,7 @@ const Core = struct {
     workers: []Worker,
     descriptors: []TaskDescriptor,
     free_indices: []u32,
-    free_top: usize,
-    free_mutex: std.Thread.Mutex = .{},
+    free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(u32),
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
@@ -112,7 +111,6 @@ const Core = struct {
             .workers = try allocator.alloc(Worker, normalized.max_threads),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
-            .free_top = normalized.queue_capacity,
             .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
         };
@@ -126,8 +124,16 @@ const Core = struct {
 
         for (self.descriptors, 0..) |*descriptor, idx| {
             descriptor.* = .{};
-            self.free_indices[idx] = @as(u32, @intCast(idx));
+            // Build a singly-linked freelist: each slot points to the next.
+            // The last slot uses the sentinel 0xFFFFFFFF (empty).
+            self.free_indices[idx] = if (idx + 1 < normalized.queue_capacity)
+                @as(u32, @intCast(idx + 1))
+            else
+                0xFFFFFFFF;
         }
+
+        // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
+        self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
         const accounting = Accounting{
             .total_alloc_bytes = &self.total_alloc_bytes,
@@ -568,26 +574,32 @@ const Core = struct {
         if (!descriptor.options.waitable) self.releaseDescriptor(descriptor_index);
     }
 
+    const free_sentinel: u32 = 0xFFFFFFFF;
+
     fn acquireDescriptor(self: *Core) ?u32 {
-        self.free_mutex.lock();
-        defer self.free_mutex.unlock();
-        if (self.free_top == 0) return null;
-        self.free_top -= 1;
-        const descriptor_index = self.free_indices[self.free_top];
-        var descriptor = &self.descriptors[descriptor_index];
-        const prev_generation = descriptor.generation;
-        descriptor.* = .{};
-        descriptor.generation = prev_generation +% 1;
-        if (descriptor.generation == 0) descriptor.generation = 1;
-        descriptor.state.store(.reserved, .release);
-        const live = self.task_desc_live.fetchAdd(1, .monotonic) + 1;
-        updatePeak(&self.task_desc_peak, live);
-        return descriptor_index;
+        while (true) {
+            const tagged = self.free_top_tagged.load(.acquire);
+            const head = @as(u32, @truncate(tagged));
+            if (head == free_sentinel) return null;
+            const aba = @as(u32, @truncate(tagged >> 32));
+            const next = self.free_indices[head];
+            const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, next);
+            if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                continue;
+            }
+            var descriptor = &self.descriptors[head];
+            const prev_generation = descriptor.generation;
+            descriptor.* = .{};
+            descriptor.generation = prev_generation +% 1;
+            if (descriptor.generation == 0) descriptor.generation = 1;
+            descriptor.state.store(.reserved, .release);
+            const live = self.task_desc_live.fetchAdd(1, .monotonic) + 1;
+            updatePeak(&self.task_desc_peak, live);
+            return head;
+        }
     }
 
     fn releaseDescriptor(self: *Core, descriptor_index: u32) void {
-        self.free_mutex.lock();
-        defer self.free_mutex.unlock();
         var descriptor = &self.descriptors[descriptor_index];
         descriptor.task_fn = null;
         descriptor.ctx = null;
@@ -596,9 +608,19 @@ const Core = struct {
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
         descriptor.state.store(.free, .release);
-        self.free_indices[self.free_top] = descriptor_index;
-        self.free_top += 1;
         _ = self.task_desc_live.fetchSub(1, .monotonic);
+
+        while (true) {
+            const tagged = self.free_top_tagged.load(.acquire);
+            const head = @as(u32, @truncate(tagged));
+            const aba = @as(u32, @truncate(tagged >> 32));
+            self.free_indices[descriptor_index] = head;
+            const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, descriptor_index);
+            if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                continue;
+            }
+            return;
+        }
     }
 
     fn recordOwnedAlloc(self: *Core, bytes: usize) void {
