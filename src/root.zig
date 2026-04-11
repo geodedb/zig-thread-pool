@@ -28,6 +28,7 @@ pub const LatencySummary = types.LatencySummary;
 pub const WorkerStats = types.WorkerStats;
 pub const ProcessMemoryStats = types.ProcessMemoryStats;
 pub const Stats = types.Stats;
+pub const WorkDeque = @import("thread_pool/queue/work_deque.zig").WorkDeque;
 
 test {
     std.testing.refAllDecls(@This());
