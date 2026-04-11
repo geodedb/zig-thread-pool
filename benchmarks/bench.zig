@@ -11,19 +11,19 @@ pub fn main() !void {
     const specs = [_]common.ScenarioSpec{
         .{
             .name = "conn_churn_seq",
-            .task_count = 128,
+            .task_count = 4096,
             .worker_count = 2,
             .submitter_count = 1,
-            .queue_capacity = 128,
+            .queue_capacity = 4096,
             .local_queue_capacity = 64,
             .scratch_bytes = 2048,
         },
         .{
             .name = "producer_contention",
-            .task_count = 128,
+            .task_count = 4096,
             .worker_count = 2,
             .submitter_count = 4,
-            .queue_capacity = 256,
+            .queue_capacity = 4096,
             .local_queue_capacity = 64,
         },
     };
