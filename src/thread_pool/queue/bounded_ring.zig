@@ -17,6 +17,7 @@ pub fn BoundedRing(comptime T: type) type {
         buffer: []Slot,
         mask: usize,
         head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        _pad_head: [std.atomic.cache_line - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
         tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
         pub fn init(allocator: std.mem.Allocator, size: usize) !Self {
