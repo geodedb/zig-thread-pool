@@ -535,8 +535,9 @@ const Core = struct {
         self.free_top -= 1;
         const descriptor_index = self.free_indices[self.free_top];
         var descriptor = &self.descriptors[descriptor_index];
+        const prev_generation = descriptor.generation;
         descriptor.* = .{};
-        descriptor.generation +%= 1;
+        descriptor.generation = prev_generation +% 1;
         if (descriptor.generation == 0) descriptor.generation = 1;
         descriptor.state = .reserved;
         const live = self.task_desc_live.fetchAdd(1, .monotonic) + 1;

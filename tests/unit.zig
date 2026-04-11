@@ -56,6 +56,23 @@ test "worker cache purge resets current scratch usage" {
     }
 }
 
+test "waitable handle generation increments across reuses" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const handle1 = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .waitable = true });
+    try pool.wait(handle1);
+
+    // Same descriptor index may be reused; generation must differ.
+    const handle2 = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .waitable = true });
+    try pool.wait(handle2);
+
+    if (handle1.index == handle2.index) {
+        try std.testing.expect(handle2.generation > handle1.generation);
+    }
+}
+
 test "recursive submission through local queues does not deadlock" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.work_stealing));
     defer pool.deinit();
