@@ -107,3 +107,119 @@ test "recursive submission through local queues does not deadlock" {
 
     try std.testing.expectEqual(@as(u64, 9), counter.value.load(.acquire));
 }
+
+test "pre-cancelled token prevents task body execution" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var token = thread_pool.CancellationToken{};
+    // Cancel BEFORE submitting -- the task body must never run.
+    token.cancel();
+    try std.testing.expect(token.isCancelled());
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{
+        .wait_group = &wg,
+        .cancellation_token = &token,
+    });
+    wg.wait();
+
+    // Task body was NOT executed; counter stays 0.
+    try std.testing.expectEqual(@as(u64, 0), counter.value.load(.acquire));
+
+    // Stats must reflect the cancellation.
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.cancelled > 0);
+}
+
+test "trySubmit returns error when queue is full" {
+    // Tiny queue + 1 worker + sleep tasks = guaranteed full queue.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 4,
+        .scheduler_variant = .global_queue,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 500_000_000 };
+
+    // Fill every queue slot with long-running sleep tasks.
+    for (0..4) |_| {
+        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg });
+    }
+
+    // trySubmit must fail immediately with a queue/pool exhaustion error.
+    // Either error.QueueFull or error.TaskPoolExhausted is acceptable --
+    // TaskPoolExhausted fires when all descriptors are consumed before
+    // the ring buffer itself is full.
+    const result = pool.trySubmit(common.counterTask, @ptrCast(&counter), .{});
+    if (result) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.QueueFull or err == error.TaskPoolExhausted);
+    }
+
+    // Clean up: let the sleep tasks finish.
+    wg.wait();
+}
+
+test "block_with_timeout returns Timeout when queue stays full" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 4,
+        .scheduler_variant = .global_queue,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 2_000_000_000 };
+
+    // Fill the queue with long-running tasks.
+    for (0..4) |_| {
+        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg });
+    }
+
+    // submit() with block_with_timeout should time out because the queue
+    // stays full for longer than the 100ms timeout.
+    const result = pool.submit(common.counterTask, @ptrCast(&counter), .{
+        .backpressure = .block_with_timeout,
+        .timeout_ns = 100_000_000,
+    });
+    try std.testing.expectError(error.Timeout, result);
+
+    // Clean up: let the pool drain.
+    wg.wait();
+}
+
+test "shutdown with timeout returns Timeout for long-running tasks" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 64,
+    });
+    // NOTE: no defer pool.deinit() here -- we call shutdown manually, then
+    // must still deinit. The deinit calls shutdown(.drain, null) internally
+    // which is safe to call after a timed-out shutdown.
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 2_000_000_000 };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{});
+
+    // Give the worker a moment to pick up the task so it becomes active.
+    std.Thread.sleep(10_000_000);
+
+    // Shutdown with a 50ms timeout -- the 2-second task won't finish in time.
+    const result = pool.core.shutdown(.drain, 50_000_000);
+    try std.testing.expectError(error.Timeout, result);
+}
