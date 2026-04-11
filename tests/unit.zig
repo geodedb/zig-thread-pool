@@ -323,3 +323,59 @@ test "Stats.wakeups reflects worker wakeup activity" {
     const stats = pool.statsSnapshot();
     try std.testing.expect(stats.wakeups > 0);
 }
+
+test "fuzz BoundedRing push/pop consistency" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, input: []const u8) !void {
+            const Ring = thread_pool.BoundedRing(u32);
+            var ring = Ring.init(std.testing.allocator, 16) catch return;
+            defer ring.deinit();
+
+            var pushed: u32 = 0;
+            var popped: u32 = 0;
+
+            for (input) |byte| {
+                if (byte % 2 == 0) {
+                    if (ring.tryPush(pushed)) {
+                        pushed += 1;
+                    }
+                } else {
+                    if (ring.pop()) |_| {
+                        popped += 1;
+                    }
+                }
+            }
+
+            // Drain remaining items
+            while (ring.pop()) |_| {
+                popped += 1;
+            }
+
+            // Conservation: every pushed item must have been popped
+            try std.testing.expectEqual(pushed, popped);
+        }
+    }.testOne, .{});
+}
+
+test "fuzz Config validation never panics" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, input: []const u8) !void {
+            if (input.len < 16) return;
+
+            const max_threads = std.mem.readInt(u32, input[0..4], .little);
+            const queue_cap = std.mem.readInt(u32, input[4..8], .little);
+            const local_cap = std.mem.readInt(u32, input[8..12], .little);
+            const scheduler_byte = input[12] % 3;
+
+            var cfg = thread_pool.Config{
+                .max_threads = max_threads,
+                .queue_capacity = queue_cap,
+                .local_queue_capacity = local_cap,
+                .scheduler_variant = @enumFromInt(scheduler_byte),
+            };
+            cfg = cfg.normalized();
+            // validate() must return cleanly (success or error) -- never panic
+            cfg.validate() catch {};
+        }
+    }.testOne, .{});
+}

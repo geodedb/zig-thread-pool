@@ -29,6 +29,7 @@ pub const WorkerStats = types.WorkerStats;
 pub const ProcessMemoryStats = types.ProcessMemoryStats;
 pub const Stats = types.Stats;
 pub const WorkDeque = @import("thread_pool/queue/work_deque.zig").WorkDeque;
+pub const BoundedRing = @import("thread_pool/queue/bounded_ring.zig").BoundedRing;
 
 test {
     std.testing.refAllDecls(@This());
