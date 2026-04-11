@@ -1,24 +1,40 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2024-2025 CodePros
-
-//! Basic usage example for thread-pool
-
 const std = @import("std");
+const thread_pool = @import("thread_pool");
 
-// Note: When running from the examples directory, you would import like this:
-// const lib = @import("thread_pool");
+const Counter = struct {
+    value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+fn counterTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const counter: *Counter = @ptrCast(@alignCast(raw_ctx));
+    _ = counter.value.fetchAdd(1, .monotonic);
+}
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    try stdout.print("thread-pool Example\n", .{});
-    try stdout.print("========================\n\n", .{});
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 128,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
 
-    // Example usage:
-    // const config = lib.Config{
-    //     .debug = true,
-    // };
-    // try lib.init(config);
+    var wg = pool.waitGroup();
+    var counter = Counter{};
+    for (0..32) |_| {
+        _ = try pool.submit(counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
 
-    try stdout.print("Example completed successfully!\n", .{});
+    const stats = pool.statsSnapshot();
+    std.debug.print("completed={d} count={d}\n", .{
+        stats.completed,
+        counter.value.load(.acquire),
+    });
 }

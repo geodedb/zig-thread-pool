@@ -1,80 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2024-2025 CodePros
+// Copyright (c) 2024-2026 CodePros
 
-//! # thread-pool
-//!
-//! A Zig library for thread-pool
-//!
-//! ## Features
-//!
-//! - Feature 1
-//! - Feature 2
-//! - Feature 3
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! const thread_pool = @import("thread_pool");
-//!
-//! pub fn main() !void {
-//!     // Your code here
-//! }
-//! ```
-//!
-//! ## License
-//!
-//! Apache-2.0
+//! `thread-pool` provides a bounded, reusable thread-pool for devnw/zig codebases.
+//! The public surface intentionally stays small while the implementation offers
+//! multiple scheduler variants behind the same API.
 
 const std = @import("std");
 
-/// Library version
-pub const version = "0.1.0";
+pub const types = @import("thread_pool/types.zig");
+pub const ThreadPool = @import("thread_pool/pool.zig").ThreadPool;
+pub const TaskContext = @import("thread_pool/pool.zig").TaskContext;
+pub const TaskFn = @import("thread_pool/pool.zig").TaskFn;
+pub const BatchTask = @import("thread_pool/pool.zig").BatchTask;
 
-// Re-export submodules here as the library grows:
-// pub const submodule = @import("submodule.zig");
+pub const version = "0.2.0";
 
-// ============================================================================
-// Public Types
-// ============================================================================
-
-/// Example configuration structure
-pub const Config = struct {
-    /// Enable debug output
-    debug: bool = false,
-    /// Maximum retry attempts
-    max_retries: u32 = 3,
-    /// Timeout in milliseconds
-    timeout_ms: u64 = 30_000,
-};
-
-// ============================================================================
-// Public Functions
-// ============================================================================
-
-/// Initialize the library with the given configuration.
-///
-/// Returns an error if the configuration is invalid.
-pub fn init(config: Config) !void {
-    _ = config;
-    // Implementation here
-}
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-test "Config default values" {
-    const config = Config{};
-    try std.testing.expectEqual(false, config.debug);
-    try std.testing.expectEqual(@as(u32, 3), config.max_retries);
-    try std.testing.expectEqual(@as(u64, 30_000), config.timeout_ms);
-}
-
-test "init with default config" {
-    try init(.{});
-}
+pub const Config = types.Config;
+pub const SchedulerVariant = types.SchedulerVariant;
+pub const AllocatorMode = types.AllocatorMode;
+pub const TaskLane = types.TaskLane;
+pub const BackpressurePolicy = types.BackpressurePolicy;
+pub const SubmitOptions = types.SubmitOptions;
+pub const ShutdownMode = types.ShutdownMode;
+pub const TaskHandle = types.TaskHandle;
+pub const WaitGroup = types.WaitGroup;
+pub const CancellationToken = types.CancellationToken;
+pub const LatencySummary = types.LatencySummary;
+pub const WorkerStats = types.WorkerStats;
+pub const ProcessMemoryStats = types.ProcessMemoryStats;
+pub const Stats = types.Stats;
 
 test {
-    // Ensure all declarations are referenced for test coverage
     std.testing.refAllDecls(@This());
 }

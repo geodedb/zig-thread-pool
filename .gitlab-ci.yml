@@ -1,25 +1,15 @@
 ---
-# GitLab CI/CD Pipeline for zig-template
+# GitLab CI/CD Pipeline for thread-pool
 # SPDX-License-Identifier: Apache-2.0
-#
-# This is a template project with placeholder values in build.zig.zon.
-# Build/test steps are omitted — only security scans and formatting run.
 
 include:
-  # Security scanning
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.7.1
-
-  # Code quality
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.2.1
-
-  # SBOM
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.7.1
-
-  # Release
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.7.1
 
 variables:
@@ -30,53 +20,165 @@ stages:
   - build
   - test
   - fuzz
+  - performance
   - security
   - sbom
   - release
 
-# Zig installation template (SEC-R6-02: SHA-256 verified via ziglang.org index)
 .install-zig: &install-zig
-  - apt-get update && apt-get install -y curl xz-utils python3
-  - |
-    if [ ! -f "zig-${ZIG_VERSION}/zig" ]; then
-      ARCH=$(uname -m)
-      case "$ARCH" in
-        x86_64)  ZIG_ARCH="x86_64" ;;
-        aarch64) ZIG_ARCH="aarch64" ;;
-        arm64)   ZIG_ARCH="aarch64" ;;
-        *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
-      esac
-      MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1)
-      MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
-      if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 15 ]; then
-        ARCHIVE_NAME="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
-      else
-        ARCHIVE_NAME="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
-      fi
-      TARBALL="${ARCHIVE_NAME}.tar.xz"
-      INDEX_FILE=$(mktemp)
-      curl -fsSL "https://ziglang.org/download/index.json" -o "${INDEX_FILE}"
-      EXPECTED_HASH=$(ZIG_VER="${ZIG_VERSION}" ZIG_ARCH_KEY="${ZIG_ARCH}-linux" ZIG_IDX="${INDEX_FILE}" \
-        python3 -c "
-    import json, os, sys
-    idx = json.load(open(os.environ['ZIG_IDX']))
-    pkg = idx.get(os.environ['ZIG_VER'], {}).get(os.environ['ZIG_ARCH_KEY'], {})
-    h = pkg.get('shasum', '')
-    if not h: sys.exit('SHA-256 not found for ' + os.environ['ZIG_VER'] + '/' + os.environ['ZIG_ARCH_KEY'])
-    print(h)
-    ")
-      rm -f "${INDEX_FILE}"
-      curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}" -o "${TARBALL}"
-      echo "${EXPECTED_HASH}  ${TARBALL}" | sha256sum --check --strict
-      tar -xJf "${TARBALL}"
-      mv "${ARCHIVE_NAME}" "zig-${ZIG_VERSION}"
-      rm -f "${TARBALL}"
-    fi
+  - bash scripts/install-zig.sh "${ZIG_VERSION}"
   - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
   - zig version
 
-# Override zig-format component to use the project's ZIG_VERSION.
-# The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
 zig-format:
   before_script:
     - *install-zig
+
+prepare-zig:
+  stage: build
+  image: debian:bookworm-slim
+  script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils
+    - *install-zig
+
+build:
+  stage: build
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build build
+    - zig build check
+
+test-unit:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test --summary all
+  needs: ["build"]
+
+test-integration:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test-integration --summary all
+  needs: ["build"]
+
+test-stress:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test-stress --summary all
+  needs: ["build"]
+
+test-release-safe:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test -Doptimize=ReleaseSafe --summary all
+  needs: ["build"]
+
+test-release-fast:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test -Doptimize=ReleaseFast --summary all
+  needs: ["build"]
+
+test-release-small:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build test -Doptimize=ReleaseSmall --summary all
+  needs: ["build"]
+
+cross-linux:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build-lib src/root.zig -target x86_64-linux
+  needs: ["build"]
+
+cross-macos:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build-lib src/root.zig -target aarch64-macos
+  needs: ["build"]
+
+cross-windows:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build-lib src/root.zig -target x86_64-windows-gnu
+  needs: ["build"]
+
+fuzz-regression:
+  stage: fuzz
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - timeout 60 zig build test --fuzz; rc=$?; if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then exit $rc; fi
+  needs: ["build"]
+
+benchmark-regression:
+  stage: performance
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - zig build bench -- --output benchmarks/results/ci-current.json
+    - zig build compare-bench -- --baseline benchmarks/results/baseline.json --current benchmarks/results/ci-current.json
+  artifacts:
+    when: always
+    paths:
+      - benchmarks/results/ci-current.json
+  needs: ["build"]
+
+scale-bench-manual:
+  stage: performance
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+  script:
+    - timeout 120 zig build scale-bench -- --output benchmarks/results/scale-current.json
+  artifacts:
+    when: always
+    paths:
+      - benchmarks/results/scale-current.json
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: manual
+  needs: ["build"]

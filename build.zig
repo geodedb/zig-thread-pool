@@ -1,54 +1,135 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2024-2025 CodePros
+// Copyright (c) 2024-2026 CodePros
 
 const std = @import("std");
+
+fn threadPoolModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn importedModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, module: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(path),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "thread_pool", .module = module },
+        },
+    });
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main library module
     const module = b.addModule("thread_pool", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Unit tests (run tests defined in the module itself)
-    const test_step = b.step("test", "Run unit tests");
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const static_lib = b.addLibrary(.{
+        .name = "thread-pool",
+        .linkage = .static,
+        .root_module = threadPoolModule(b, target, optimize),
     });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    test_step.dependOn(&run_unit_tests.step);
+    b.installArtifact(static_lib);
 
-    // Integration tests (separate test file with module import)
+    const build_step = b.step("build", "Build the standalone library");
+    build_step.dependOn(&static_lib.step);
+
+    const check_step = b.step("check", "Compile the library and unit tests without running them");
+    const check_tests = b.addTest(.{
+        .root_module = threadPoolModule(b, target, optimize),
+    });
+    check_step.dependOn(&check_tests.step);
+
+    const unit_step = b.step("test", "Run unit tests");
+    const unit_tests = b.addTest(.{
+        .root_module = importedModule(b, "tests/unit.zig", target, optimize, module),
+    });
+    unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/integration.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "thread_pool", .module = module },
-            },
-        }),
+        .root_module = importedModule(b, "tests/integration.zig", target, optimize, module),
     });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    integration_step.dependOn(&run_integration_tests.step);
+    integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
-    // Check step for IDE integration (fast syntax validation)
-    const check_step = b.step("check", "Check for compilation errors");
-    const check = b.addTest(.{
+    const stress_step = b.step("test-stress", "Run stress and load tests");
+    const stress_tests = b.addTest(.{
+        .root_module = importedModule(b, "tests/stress.zig", target, .ReleaseFast, module),
+    });
+    stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
+
+    const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
+    all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    all_tests_step.dependOn(&b.addRunArtifact(integration_tests).step);
+    all_tests_step.dependOn(&b.addRunArtifact(stress_tests).step);
+
+    const example_step = b.step("example", "Build and run the basic example");
+    const example_exe = b.addExecutable(.{
+        .name = "thread-pool-basic",
+        .root_module = importedModule(b, "examples/basic.zig", target, optimize, module),
+    });
+    example_step.dependOn(&b.addRunArtifact(example_exe).step);
+
+    const bench_step = b.step("bench", "Run the CI-safe benchmark suite");
+    const bench_exe = b.addExecutable(.{
+        .name = "thread-pool-bench",
+        .root_module = importedModule(b, "benchmarks/bench.zig", target, .ReleaseFast, module),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    bench_step.dependOn(&run_bench.step);
+    b.installArtifact(bench_exe);
+
+    const scale_bench_step = b.step("scale-bench", "Run the larger benchmark grid");
+    const scale_bench_exe = b.addExecutable(.{
+        .name = "thread-pool-scale-bench",
+        .root_module = importedModule(b, "benchmarks/scale_bench.zig", target, .ReleaseFast, module),
+    });
+    const run_scale_bench = b.addRunArtifact(scale_bench_exe);
+    if (b.args) |args| run_scale_bench.addArgs(args);
+    scale_bench_step.dependOn(&run_scale_bench.step);
+    b.installArtifact(scale_bench_exe);
+
+    const compare_step = b.step("compare-bench", "Compare two benchmark result files");
+    const compare_exe = b.addExecutable(.{
+        .name = "thread-pool-compare-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
+            .root_source_file = b.path("benchmarks/compare.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseFast,
         }),
     });
-    check_step.dependOn(&check.step);
+    const run_compare = b.addRunArtifact(compare_exe);
+    if (b.args) |args| run_compare.addArgs(args);
+    compare_step.dependOn(&run_compare.step);
+    b.installArtifact(compare_exe);
+
+    const tools_step = b.step("tools", "Build benchmark tooling");
+    tools_step.dependOn(&bench_exe.step);
+    tools_step.dependOn(&scale_bench_exe.step);
+    tools_step.dependOn(&compare_exe.step);
+
+    const cross_step = b.step("cross-check", "Compile smoke targets for Linux, macOS, and Windows");
+    const cross_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    };
+    for (cross_targets) |query| {
+        const resolved = b.resolveTargetQuery(query);
+        const cross_lib = b.addLibrary(.{
+            .name = "thread-pool-smoke",
+            .linkage = .static,
+            .root_module = threadPoolModule(b, resolved, optimize),
+        });
+        cross_step.dependOn(&cross_lib.step);
+    }
 }

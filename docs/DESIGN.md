@@ -1,0 +1,120 @@
+# thread-pool Design
+
+## Overview
+
+`thread-pool` is a fixed-capacity, shared-infrastructure thread-pool with two concrete scheduler implementations behind the same public API:
+
+- `global_queue`
+- `work_stealing`
+
+The public API stays stable while scheduler selection, queue topology, and instrumentation remain internal.
+
+## Public Surface
+
+- `ThreadPool.init(allocator, config) !ThreadPool`
+- `ThreadPool.deinit()`
+- `ThreadPool.submit(task_fn, ctx, options) !TaskHandle`
+- `ThreadPool.trySubmit(task_fn, ctx, options) !TaskHandle`
+- `ThreadPool.submitBatch(tasks, options) !void`
+- `ThreadPool.wait(handle) !void`
+- `ThreadPool.waitGroup() WaitGroup`
+- `ThreadPool.shutdown(mode, timeout) !void`
+- `ThreadPool.statsSnapshot() Stats`
+- `ThreadPool.purgeWorkerCaches() !void`
+
+## Scheduler Variants
+
+### `global_queue`
+
+- One bounded FIFO inject queue.
+- Fixed worker set.
+- Workers pop directly from the shared queue.
+- Included as the simplest correctness-first baseline and fallback.
+
+### `work_stealing`
+
+- One bounded central inject queue for external submitters.
+- One bounded local deque per worker.
+- Local submissions from worker threads prefer the local deque.
+- Idle workers refill from the inject queue, then attempt steals from peer deques.
+- Included as the low-contention candidate and still benchmarked on every baseline run.
+
+### `lane_extension`
+
+- Reserved API tag for keyed or blocking-aware scheduling work.
+- Current implementation routes through the same machinery and documents the gap in [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
+
+## Queue Design
+
+### Inject Queue
+
+- Bounded ring buffer.
+- Mutex-protected, no unbounded growth.
+- Backpressure is explicit: `QueueFull`, or blocking retry with timeout.
+
+### Local Worker Queue
+
+- Bounded deque.
+- Owner pushes and pops from the bottom.
+- Steals happen from the top.
+- Current implementation uses a per-deque mutex rather than a lock-free Chase-Lev design.
+
+## Memory Model
+
+- Task descriptors are preallocated from a bounded descriptor array.
+- Descriptor reuse happens only after task completion and, for waitable tasks, after `wait`.
+- Worker scratch allocates one bounded buffer per worker lazily on first use.
+- Scratch buffers can be purged explicitly or after configured idle periods.
+- All pool-owned allocations are counted in `total_alloc_bytes`, `total_free_bytes`, `live_bytes`, and `peak_live_bytes`.
+
+## Task Lifecycle
+
+1. Submission validates pool state and acquires a descriptor from the bounded freelist.
+2. The descriptor is enqueued either to the caller worker’s local deque or the central inject queue.
+3. A worker dequeues, steals, or refills and transitions the descriptor to `running`.
+4. The task executes exactly once.
+5. The descriptor transitions to `completed` or `cancelled`.
+6. Detached descriptors return to the freelist immediately; waitable descriptors return after `wait`.
+
+## Shutdown Semantics
+
+### `drain`
+
+- Reject new submissions.
+- Let queued and running work finish.
+- Join workers.
+- Purge worker scratch.
+- Release owned memory.
+
+### `cancel_pending`
+
+- Reject new submissions.
+- Cancel tasks still in queues.
+- Running tasks continue to completion.
+- Join workers and release resources.
+
+## Fairness and Tradeoffs
+
+- `global_queue` is simpler and sometimes slightly smaller in RSS because it lacks per-worker queue state.
+- `work_stealing` reduces multi-producer contention and improves local handoff, but it is not currently lock-free.
+- Recursive submission is safe because worker-originated tasks preferentially target the caller’s local deque.
+- Blocking tasks are supported through lane metadata today and leave room for a future dedicated blocking lane.
+
+## Observability
+
+`statsSnapshot()` reports:
+
+- task lifecycle counters
+- queue depth current and peak
+- steal and steal-failure counts
+- wakeups and parks
+- per-worker busy/idle/scratch/local-queue metrics
+- wait and execution latency summaries
+- Linux/macOS/Windows process memory metrics
+
+## Known Gaps
+
+- Adaptive grow/shrink is intentionally not implemented in phase 1.
+- Per-task allocator-count metrics are not yet separate from byte accounting.
+- Queue internals are mutex-backed instead of lock-free.
+- Lane-aware scheduling is tracked for follow-on work rather than enabled by default.

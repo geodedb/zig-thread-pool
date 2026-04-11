@@ -1,87 +1,70 @@
 # thread-pool
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/Zig-0.15.1+-orange.svg)](https://ziglang.org/)
+`thread-pool` is a standalone Zig thread-pool library for the `devnw/zig` ecosystem. It provides bounded task descriptors, fixed worker caps, a global-queue baseline, and a local-queue work-stealing scheduler behind one public API.
 
-A Zig library for thread-pool
+## Status
 
-## Features
+- Current Zig target: `0.15.2`
+- Scheduler variants shipped: `global_queue`, `work_stealing`
+- Current default: `global_queue`
+- Benchmark baseline: [benchmarks/results/baseline.json](benchmarks/results/baseline.json)
 
-- **Zero Dependencies**: Pure Zig standard library only
-- **Memory Safe**: Proper allocation patterns with no leaks
-- **Cross-Platform**: Linux, macOS, Windows support
-- **Well Tested**: Comprehensive unit and integration tests
+## Goals
 
-## Installation
+- bounded memory and explainable steady-state footprint
+- low submit-side contention under multi-producer load
+- explicit shutdown, drain, cancel, and cache-purge semantics
+- cross-platform process memory metrics for Linux, macOS, and Windows
+- machine-readable benchmark output for regression analysis
 
-### Using Zig Package Manager
-
-Add to your `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .thread_pool = .{
-        .url = "https://gitlab.com/devnw/zig/thread_pool/-/archive/v0.1.0/thread_pool-v0.1.0.tar.gz",
-        .hash = "...",
-    },
-},
-```
-
-Then in your `build.zig`:
+## Public API
 
 ```zig
-const thread_pool = b.dependency("thread_pool", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("thread_pool", thread_pool.module("thread_pool"));
-```
-
-## Quick Start
-
-```zig
-const std = @import("std");
 const thread_pool = @import("thread_pool");
 
-pub fn main() !void {
-    try thread_pool.init(.{
-        .debug = true,
-    });
-}
+var pool = try thread_pool.ThreadPool.init(allocator, .{
+    .min_threads = 2,
+    .max_threads = 4,
+    .queue_capacity = 1024,
+    .local_queue_capacity = 128,
+    .scheduler_variant = .work_stealing,
+});
+defer pool.deinit();
+
+var wg = pool.waitGroup();
+_ = try pool.submit(taskFn, ctx, .{ .wait_group = &wg });
+wg.wait();
 ```
 
-## Requirements
-
-- Zig 0.15.1 or later
-
-## Building
+## Commands
 
 ```bash
-# Build the library
 make build
-
-# Run tests
 make test
-
-# Quick development iteration
-make dev
-
-# Full CI pipeline
+make test-stress
+make bench-save
+make bench-compare
+make cross-check
 make ci
 ```
 
-## Documentation
+## Repository Docs
 
-See the [docs](docs/) directory for detailed documentation.
+- [docs/DESIGN.md](docs/DESIGN.md)
+- [docs/GAP_ANALYSIS.md](docs/GAP_ANALYSIS.md)
+- [docs/PERFORMANCE_TARGETS.md](docs/PERFORMANCE_TARGETS.md)
+- [docs/SCHEDULER_DECISION.md](docs/SCHEDULER_DECISION.md)
 
-## Contributing
+## Benchmarks
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+`zig build bench` runs the CI-safe suite and writes JSON. `zig build scale-bench` runs the broader scenario set intended for scheduled or manual performance runs.
 
-## Security
+The compare tool matches rows by scenario, scheduler, worker count, and submitter count:
 
-See [SECURITY.md](SECURITY.md) for security policy and vulnerability reporting.
+```bash
+zig build compare-bench -- --baseline benchmarks/results/baseline.json --current benchmarks/results/latest.json
+```
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Apache-2.0. See [LICENSE](LICENSE).
