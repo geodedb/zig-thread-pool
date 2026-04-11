@@ -64,6 +64,9 @@ pub const Config = struct {
         if (cfg.inject_batch_size == 0) {
             cfg.inject_batch_size = 1;
         }
+        if (cfg.local_queue_capacity != 0) {
+            cfg.local_queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.local_queue_capacity) catch cfg.local_queue_capacity;
+        }
         return cfg;
     }
 
@@ -223,4 +226,15 @@ test "WaitGroup blocks until count reaches zero" {
     wg.done();
     wg.wait();
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
+}
+
+test "Config normalized rounds local_queue_capacity to power of two" {
+    const cfg = (Config{ .local_queue_capacity = 100 }).normalized();
+    try std.testing.expectEqual(@as(usize, 128), cfg.local_queue_capacity);
+
+    const cfg2 = (Config{ .local_queue_capacity = 256 }).normalized();
+    try std.testing.expectEqual(@as(usize, 256), cfg2.local_queue_capacity);
+
+    const cfg3 = (Config{ .local_queue_capacity = 1 }).normalized();
+    try std.testing.expectEqual(@as(usize, 1), cfg3.local_queue_capacity);
 }
