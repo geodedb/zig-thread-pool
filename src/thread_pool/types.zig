@@ -79,6 +79,7 @@ pub const Config = struct {
         if (self.scheduler_variant == .work_stealing and self.local_queue_capacity == 0) {
             return error.InvalidLocalQueueCapacity;
         }
+        if (self.scheduler_variant == .lane_extension) return error.UnsupportedSchedulerVariant;
         if (self.inject_batch_size == 0) return error.InvalidInjectBatchSize;
     }
 };
@@ -209,6 +210,12 @@ pub const Stats = struct {
 test "Config validation rejects impossible bounds" {
     var cfg = Config{ .max_threads = 1, .min_threads = 2 };
     try std.testing.expectError(error.InvalidThreadBounds, cfg.validate());
+}
+
+test "Config validation rejects lane_extension variant" {
+    var cfg = Config{ .max_threads = 2, .min_threads = 1, .scheduler_variant = .lane_extension };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.UnsupportedSchedulerVariant, cfg.validate());
 }
 
 test "WaitGroup blocks until count reaches zero" {
