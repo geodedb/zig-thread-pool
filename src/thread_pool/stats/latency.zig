@@ -8,7 +8,7 @@ pub const LatencyHistogram = struct {
     count: u64 = 0,
     min_ns: u64 = std.math.maxInt(u64),
     max_ns: u64 = 0,
-    sum_ns: u128 = 0,
+    sum_ns: u64 = 0,
 
     pub fn observe(self: *LatencyHistogram, value_ns: u64) void {
         const bucket = bucketIndex(value_ns);
@@ -36,7 +36,7 @@ pub const LatencyHistogram = struct {
         return .{
             .count = self.count,
             .min_ns = self.min_ns,
-            .mean_ns = @as(u64, @intCast(self.sum_ns / self.count)),
+            .mean_ns = self.sum_ns / self.count,
             .p50_ns = quantile(self, 50),
             .p95_ns = quantile(self, 95),
             .p99_ns = quantile(self, 99),

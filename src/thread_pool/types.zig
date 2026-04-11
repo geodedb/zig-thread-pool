@@ -6,15 +6,9 @@ pub const SchedulerVariant = enum {
     lane_extension,
 };
 
-pub const AllocatorMode = enum {
-    caller_supplied,
-    caller_supplied_with_worker_scratch,
-};
-
 pub const TaskLane = enum {
     default,
     blocking,
-    keyed,
 };
 
 pub const BackpressurePolicy = enum {
@@ -46,7 +40,6 @@ pub const Config = struct {
     worker_scratch_cap_bytes: usize = 64 * 1024,
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
-    idle_shrink_after_ns: u64 = 60_000_000_000,
     spin_before_park_iters: usize = 128,
     scheduler_variant: SchedulerVariant = .global_queue,
     /// Advisory flag indicating the caller intends to submit blocking tasks.
@@ -55,8 +48,6 @@ pub const Config = struct {
     /// blocking worker subset. Setting this to false does not prevent submitting
     /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
-    allocator_mode: AllocatorMode = .caller_supplied_with_worker_scratch,
-    stats_enabled: bool = true,
 
     pub fn normalized(self: Config) Config {
         var cfg = self;
@@ -194,7 +185,6 @@ pub const Stats = struct {
     cancelled: u64 = 0,
     active_tasks: u64 = 0,
     parked_workers: u64 = 0,
-    retired_workers: u64 = 0,
     queue_depth_current: u64 = 0,
     queue_depth_peak: u64 = 0,
     steals: u64 = 0,

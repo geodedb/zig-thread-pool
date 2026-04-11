@@ -41,7 +41,7 @@ const PoolState = enum(u8) {
 
 const TaskDescriptor = struct {
     generation: u64 = 0,
-    state: types.TaskState = .free,
+    state: std.atomic.Value(types.TaskState) = std.atomic.Value(types.TaskState).init(.free),
     task_fn: ?TaskFn = null,
     ctx: ?*anyopaque = null,
     options: types.SubmitOptions = .{},
@@ -64,6 +64,7 @@ const Worker = struct {
     steals: u64 = 0,
     steal_failures: u64 = 0,
     last_idle_started_ns: u64 = 0,
+    scratch_init_failures: u64 = 0,
 };
 
 const Core = struct {
@@ -184,7 +185,7 @@ const Core = struct {
         while (true) {
             const descriptor = &self.descriptors[handle.index];
             if (descriptor.generation != handle.generation) return error.InvalidHandle;
-            switch (descriptor.state) {
+            switch (descriptor.state.load(.acquire)) {
                 .completed, .cancelled => {
                     self.releaseDescriptor(handle.index);
                     return;
@@ -228,6 +229,8 @@ const Core = struct {
     }
 
     pub fn statsSnapshot(self: *Core) types.Stats {
+        // Worker stats (busy_ns, idle_ns, etc.) are read without synchronization.
+        // Values are approximate when workers are actively running tasks.
         for (self.workers, 0..) |*worker, idx| {
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
@@ -260,7 +263,6 @@ const Core = struct {
             .cancelled = self.cancelled.load(.acquire),
             .active_tasks = self.active_tasks.load(.acquire),
             .parked_workers = self.parked_workers.load(.acquire),
-            .retired_workers = 0,
             .queue_depth_current = self.queued_tasks.load(.acquire),
             .queue_depth_peak = self.queue_depth_peak.load(.acquire),
             .steals = self.steals.load(.acquire),
@@ -323,7 +325,7 @@ const Core = struct {
         descriptor.submit_ns = nowNs();
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
-        descriptor.state = .queued;
+        descriptor.state.store(.queued, .release);
 
         var queued = false;
         if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
@@ -423,7 +425,7 @@ const Core = struct {
     fn runTask(self: *Core, worker_index: usize, descriptor_index: u32) void {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
-        descriptor.state = .running;
+        descriptor.state.store(.running, .release);
         descriptor.start_ns = nowNs();
 
         const wait_ns = descriptor.start_ns - descriptor.submit_ns;
@@ -446,11 +448,13 @@ const Core = struct {
         };
 
         if (!(descriptor.options.cancellation_token != null and descriptor.options.cancellation_token.?.isCancelled())) {
-            worker.scratch.beginTask() catch {};
+            worker.scratch.beginTask() catch {
+                worker.scratch_init_failures += 1;
+            };
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
         } else {
-            descriptor.state = .cancelled;
+            descriptor.state.store(.cancelled, .release);
             _ = self.cancelled.fetchAdd(1, .monotonic);
         }
 
@@ -462,8 +466,8 @@ const Core = struct {
         worker.exec_histogram.observe(exec_ns);
 
         _ = self.active_tasks.fetchSub(1, .monotonic);
-        if (descriptor.state != .cancelled) {
-            descriptor.state = .completed;
+        if (descriptor.state.load(.acquire) != .cancelled) {
+            descriptor.state.store(.completed, .release);
             _ = self.completed.fetchAdd(1, .monotonic);
         }
 
@@ -529,7 +533,7 @@ const Core = struct {
 
     fn cancelDescriptor(self: *Core, descriptor_index: u32) void {
         const descriptor = &self.descriptors[descriptor_index];
-        descriptor.state = .cancelled;
+        descriptor.state.store(.cancelled, .release);
         _ = self.cancelled.fetchAdd(1, .monotonic);
         if (descriptor.options.wait_group) |wait_group| wait_group.done();
         self.completion_mutex.lock();
@@ -549,7 +553,7 @@ const Core = struct {
         descriptor.* = .{};
         descriptor.generation = prev_generation +% 1;
         if (descriptor.generation == 0) descriptor.generation = 1;
-        descriptor.state = .reserved;
+        descriptor.state.store(.reserved, .release);
         const live = self.task_desc_live.fetchAdd(1, .monotonic) + 1;
         updatePeak(&self.task_desc_peak, live);
         return descriptor_index;
@@ -565,7 +569,7 @@ const Core = struct {
         descriptor.submit_ns = 0;
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
-        descriptor.state = .free;
+        descriptor.state.store(.free, .release);
         self.free_indices[self.free_top] = descriptor_index;
         self.free_top += 1;
         _ = self.task_desc_live.fetchSub(1, .monotonic);

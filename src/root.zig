@@ -17,7 +17,6 @@ pub const version = "0.2.0";
 
 pub const Config = types.Config;
 pub const SchedulerVariant = types.SchedulerVariant;
-pub const AllocatorMode = types.AllocatorMode;
 pub const TaskLane = types.TaskLane;
 pub const BackpressurePolicy = types.BackpressurePolicy;
 pub const SubmitOptions = types.SubmitOptions;
