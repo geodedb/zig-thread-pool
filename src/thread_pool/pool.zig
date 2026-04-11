@@ -332,7 +332,8 @@ const Core = struct {
             const worker = &self.workers[tls_worker_index.?];
             queued = worker.local_queue.tryPushBottom(descriptor_index);
             if (queued) {
-                worker.local_queue_peak = @max(worker.local_queue_peak, @as(u32, @intCast(worker.local_queue.len())));
+                const local_len = @as(u32, @intCast(worker.local_queue.len()));
+                worker.local_queue_peak = @max(worker.local_queue_peak, local_len);
             }
         }
         if (!queued) {
@@ -385,14 +386,14 @@ const Core = struct {
             if (self.inject_queue.pop()) |descriptor_index| {
                 var moved: usize = 1;
                 while (moved < self.config.inject_batch_size) : (moved += 1) {
-                    if (worker.local_queue.len() >= worker.local_queue.capacity()) break;
                     const extra = self.inject_queue.pop() orelse break;
                     if (!worker.local_queue.tryPushBottom(extra)) {
                         _ = self.inject_queue.tryPush(extra);
                         break;
                     }
-                    worker.local_queue_peak = @max(worker.local_queue_peak, @as(u32, @intCast(worker.local_queue.len())));
                 }
+                const local_len = @as(u32, @intCast(worker.local_queue.len()));
+                worker.local_queue_peak = @max(worker.local_queue_peak, local_len);
                 self.decrementQueued();
                 return descriptor_index;
             }
@@ -523,7 +524,7 @@ const Core = struct {
         }
         if (self.config.scheduler_variant == .work_stealing) {
             for (self.workers) |*worker| {
-                while (worker.local_queue.popBottom()) |descriptor_index| {
+                while (worker.local_queue.stealTop()) |descriptor_index| {
                     self.decrementQueued();
                     self.cancelDescriptor(descriptor_index);
                 }
