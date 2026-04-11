@@ -298,8 +298,8 @@ const Core = struct {
         var merged_wait = LatencyHistogram{};
         var merged_exec = LatencyHistogram{};
         for (self.workers) |*worker| {
-            merged_wait.merge(worker.wait_histogram);
-            merged_exec.merge(worker.exec_histogram);
+            merged_wait.merge(&worker.wait_histogram);
+            merged_exec.merge(&worker.exec_histogram);
         }
 
         return .{
@@ -604,10 +604,14 @@ const Core = struct {
         descriptor.state.store(.cancelled, .release);
         _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         if (descriptor.options.wait_group) |wait_group| wait_group.done();
-        self.sync.completion_mutex.lock();
-        self.sync.completion_cond.broadcast();
-        self.sync.completion_mutex.unlock();
-        if (!descriptor.options.waitable) self.releaseDescriptor(descriptor_index);
+        // Only broadcast for waitable tasks (matches runTask pattern)
+        if (descriptor.options.waitable) {
+            self.sync.completion_mutex.lock();
+            self.sync.completion_cond.broadcast();
+            self.sync.completion_mutex.unlock();
+        } else {
+            self.releaseDescriptor(descriptor_index);
+        }
     }
 
     const free_sentinel: u32 = 0xFFFFFFFF;
