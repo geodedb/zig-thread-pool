@@ -2,7 +2,7 @@
 
 ## Summary
 
-This repository exists to provide a bounded, reusable, observable thread-pool for `devnw/zig`. The initial implementation establishes fixed-size workers, bounded descriptors, bounded queues, two scheduler variants, cross-platform memory sampling hooks, and JSON benchmark output. Several requirements remain open and are tracked explicitly through GitLab work items.
+This repository provides a bounded, reusable, observable thread-pool for `devnw/zig`. The implementation establishes fixed-size workers, bounded descriptors, bounded queues, two scheduler variants, cross-platform memory sampling hooks, and JSON benchmark output. Several requirements remain open and are tracked explicitly through GitLab work items.
 
 ## Scope
 
@@ -58,19 +58,36 @@ This repository exists to provide a bounded, reusable, observable thread-pool fo
 
 | Gap ID | Title | Issue | Severity | Status | Owner | Acceptance Criteria | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| G-001 | Public API and lifecycle invariants | [#1](https://gitlab.com/devnw/zig/thread-pool/-/work_items/1) | High | In progress | `@benjiv` | API documented and lifecycle tests pass | `src/thread_pool/pool.zig`, `tests/unit.zig` |
-| G-002 | Scheduler baseline: global queue | [#2](https://gitlab.com/devnw/zig/thread-pool/-/work_items/2) | High | In progress | `@benjiv` | Bounded global queue implementation and tests | `src/thread_pool/pool.zig`, `benchmarks/results/baseline.json` |
-| G-003 | Scheduler candidate: work stealing | [#3](https://gitlab.com/devnw/zig/thread-pool/-/work_items/3) | High | In progress | `@benjiv` | Local deque + steal path implemented and benchmarked | `src/thread_pool/pool.zig`, `docs/SCHEDULER_DECISION.md` |
-| G-004 | Memory model and scratch purge | [#4](https://gitlab.com/devnw/zig/thread-pool/-/work_items/4) | High | In progress | `@benjiv` | Bounded descriptors, scratch caps, purge path | `src/thread_pool/memory/scratch.zig`, `tests/unit.zig` |
-| G-005 | Park/unpark and shrink policy | [#5](https://gitlab.com/devnw/zig/thread-pool/-/work_items/5) | Medium | Open | `@benjiv` | Phase-1 park policy documented; shrink deferred | `docs/DESIGN.md` |
-| G-006 | Descriptor slab/freelist | [#6](https://gitlab.com/devnw/zig/thread-pool/-/work_items/6) | High | In progress | `@benjiv` | Safe reuse and bounded live count | `src/thread_pool/pool.zig` |
-| G-007 | Stats and observability schema | [#7](https://gitlab.com/devnw/zig/thread-pool/-/work_items/7) | High | In progress | `@benjiv` | Snapshot and process memory metrics implemented | `src/thread_pool/stats/process_memory.zig`, `benchmarks/common.zig` |
-| G-008 | Unit/integration/stress/fuzz plan | [#8](https://gitlab.com/devnw/zig/thread-pool/-/work_items/8) | High | In progress | `@benjiv` | Test matrix exists and passes | `tests/unit.zig`, `tests/integration.zig`, `tests/stress.zig` |
-| G-009 | Benchmark harness and regression gates | [#9](https://gitlab.com/devnw/zig/thread-pool/-/work_items/9) | High | In progress | `@benjiv` | JSON bench + compare tool exist | `benchmarks/common.zig`, `benchmarks/compare.zig` |
-| G-010 | Cross-platform matrix | [#10](https://gitlab.com/devnw/zig/thread-pool/-/work_items/10) | Medium | In progress | `@benjiv` | CI jobs compile Linux/macOS/Windows targets | `.gitlab-ci.yml` |
-| G-011 | geode/quic-shaped scenarios | [#11](https://gitlab.com/devnw/zig/thread-pool/-/work_items/11) | High | In progress | `@benjiv` | Scenario names and harness coverage exist | `benchmarks/bench.zig`, `benchmarks/scale_bench.zig` |
-| G-012 | GAP analysis and performance targets docs | [#12](https://gitlab.com/devnw/zig/thread-pool/-/work_items/12) | High | In progress | `@benjiv` | Docs exist and stay current | `docs/GAP_ANALYSIS.md`, `docs/PERFORMANCE_TARGETS.md` |
-| G-013 | Default scheduler selection report | [#13](https://gitlab.com/devnw/zig/thread-pool/-/work_items/13) | Medium | In progress | `@benjiv` | Decision recorded with measured evidence | `docs/SCHEDULER_DECISION.md`, `benchmarks/results/baseline.json` |
+| G-001 | Public API and lifecycle invariants | [#1](https://gitlab.com/devnw/zig/thread-pool/-/work_items/1) | High | Closed | `@benjiv` | API documented and lifecycle tests pass | `src/thread_pool/pool.zig`, `tests/unit.zig` |
+| G-002 | Scheduler baseline: global queue | [#2](https://gitlab.com/devnw/zig/thread-pool/-/work_items/2) | High | Closed | `@benjiv` | Bounded global queue implementation and tests | `src/thread_pool/pool.zig`, `benchmarks/results/baseline.json` |
+| G-003 | Scheduler candidate: work stealing | [#3](https://gitlab.com/devnw/zig/thread-pool/-/work_items/3) | High | Closed | `@benjiv` | Local deque + steal path implemented and benchmarked | `src/thread_pool/pool.zig`, `docs/SCHEDULER_DECISION.md` |
+| G-004 | Memory model and scratch purge | [#4](https://gitlab.com/devnw/zig/thread-pool/-/work_items/4) | High | Closed | `@benjiv` | Bounded descriptors, scratch caps, purge path | `src/thread_pool/memory/scratch.zig`, `tests/unit.zig` |
+| G-005 | Park/unpark and shrink policy | [#5](https://gitlab.com/devnw/zig/thread-pool/-/work_items/5) | Medium | Partial | `@benjiv` | Phase-1 park policy documented; shrink deferred | `docs/DESIGN.md` |
+| G-006 | Descriptor slab/freelist | [#6](https://gitlab.com/devnw/zig/thread-pool/-/work_items/6) | High | Closed | `@benjiv` | Safe reuse and bounded live count; generation ABA fix applied | `src/thread_pool/pool.zig` |
+| G-007 | Stats and observability schema | [#7](https://gitlab.com/devnw/zig/thread-pool/-/work_items/7) | High | Closed | `@benjiv` | Snapshot and process memory metrics; per-worker histograms | `src/thread_pool/stats/`, `benchmarks/common.zig` |
+| G-008 | Unit/integration/stress/fuzz plan | [#8](https://gitlab.com/devnw/zig/thread-pool/-/work_items/8) | High | Partial | `@benjiv` | Test matrix exists and passes; fuzz targets not yet written | `tests/`, `.gitlab-ci.yml` |
+| G-009 | Benchmark harness and regression gates | [#9](https://gitlab.com/devnw/zig/thread-pool/-/work_items/9) | High | Closed | `@benjiv` | JSON bench + compare tool exist | `benchmarks/common.zig`, `benchmarks/compare.zig` |
+| G-010 | Cross-platform matrix | [#10](https://gitlab.com/devnw/zig/thread-pool/-/work_items/10) | Medium | Partial | `@benjiv` | CI jobs compile Linux/macOS/Windows targets; native runners pending | `.gitlab-ci.yml` |
+| G-011 | geode/quic-shaped scenarios | [#11](https://gitlab.com/devnw/zig/thread-pool/-/work_items/11) | High | Closed | `@benjiv` | Scenario names and harness coverage exist | `benchmarks/bench.zig`, `benchmarks/scale_bench.zig` |
+| G-012 | GAP analysis and performance targets docs | [#12](https://gitlab.com/devnw/zig/thread-pool/-/work_items/12) | High | Closed | `@benjiv` | Docs exist and stay current | `docs/GAP_ANALYSIS.md`, `docs/PERFORMANCE_TARGETS.md` |
+| G-013 | Default scheduler selection report | [#13](https://gitlab.com/devnw/zig/thread-pool/-/work_items/13) | Medium | Closed | `@benjiv` | Decision recorded with measured evidence | `docs/SCHEDULER_DECISION.md`, `benchmarks/results/baseline.json` |
+
+## Audit Findings (2026-04-11)
+
+The following findings were identified and addressed during a full codebase audit:
+
+| Finding | Domain | Severity | Status | Commit |
+| --- | --- | --- | --- | --- |
+| Descriptor generation ABA bug | Quality | Critical | Closed | `fix: close GAP-001` |
+| submitBatch partial-failure reporting | Quality | High | Closed | `fix: close GAP-002` |
+| lane_extension variant silently falls through | Quality | High | Closed | `fix: close GAP-003` |
+| Fuzz corpus empty | Gap | High | Documented | `chore: close GAP-004` |
+| latency_mutex serializes all workers | Perf | P1 | Closed | `perf: close GAP-005` |
+| Mutex-backed WorkDeque limits scalability | Perf | P1 | Deferred | Phase 2; lock-free Chase-Lev design tracked in DESIGN.md |
+| Unchecked @intCast on nanoTimestamp() | Security | Medium | Closed | `fix: close GAP-007` |
+| No bounds check on handle.index in wait() | Security | Medium | Closed | `fix: close GAP-008` |
+| allow_blocking_lane has no effect | Quality | Medium | Documented | `docs: close GAP-009` |
+| GAP_ANALYSIS.md statuses stale | Quality | Medium | Closed | This update |
 
 ## Unresolved Design Decisions
 
@@ -79,17 +96,17 @@ This repository exists to provide a bounded, reusable, observable thread-pool fo
 - whether allocator event counts should be tracked alongside bytes
 - whether a dedicated blocking lane should get its own worker subset in phase 3
 
-## Benchmark TODOs
+## Benchmark Gaps
 
 - validate scale-bench scenarios against longer-running scheduled jobs
 - collect larger conn-churn evidence for RSS plateau analysis
 - add CSV export if a downstream consumer needs spreadsheet ingestion
 
-## CI/CD TODOs
+## CI/CD Gaps
 
 - native macOS smoke runner
 - native Windows smoke runner
-- richer fuzz corpus management
+- fuzz targets for queue operations, config validation, and submit/cancel races
 - automatic refresh workflow for baseline benchmark artifacts
 
 ## Cross-platform Status
@@ -102,4 +119,4 @@ This repository exists to provide a bounded, reusable, observable thread-pool fo
 
 ## Next Review Date
 
-2026-04-25
+2026-05-09
