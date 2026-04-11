@@ -34,13 +34,6 @@ zig-format:
   before_script:
     - *install-zig
 
-prepare-zig:
-  stage: build
-  image: debian:bookworm-slim
-  script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils
-    - *install-zig
-
 build:
   stage: build
   image: debian:bookworm-slim
