@@ -48,7 +48,8 @@ test "batch submission with wait group completes" {
             .ctx = @ptrCast(&counter),
         };
     }
-    try pool.submitBatch(&tasks, .{ .wait_group = &wg });
+    const result = try pool.submitBatch(&tasks, .{ .wait_group = &wg });
+    try std.testing.expectEqual(@as(usize, 32), result.submitted);
     wg.wait();
 
     try std.testing.expectEqual(@as(u64, 32), counter.value.load(.acquire));

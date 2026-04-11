@@ -161,10 +161,18 @@ const Core = struct {
         return self.submitInternal(task_fn, ctx, options, true);
     }
 
-    pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !void {
-        for (tasks) |task| {
-            _ = try self.submit(task.task_fn, task.ctx, options);
+    pub const SubmitBatchResult = struct {
+        submitted: usize,
+    };
+
+    pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !SubmitBatchResult {
+        for (tasks, 0..) |task, idx| {
+            _ = self.submit(task.task_fn, task.ctx, options) catch |err| {
+                if (idx == 0) return err;
+                return .{ .submitted = idx };
+            };
         }
+        return .{ .submitted = tasks.len };
     }
 
     pub fn wait(self: *Core, handle: types.TaskHandle) !void {
@@ -639,7 +647,7 @@ pub const ThreadPool = struct {
         return self.core.submit(task_fn, ctx, options);
     }
 
-    pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !void {
+    pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
         return self.core.submitBatch(tasks, options);
     }
 
