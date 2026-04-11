@@ -7,11 +7,11 @@
 
 const std = @import("std");
 
-pub const types = @import("thread_pool/types.zig");
-pub const ThreadPool = @import("thread_pool/pool.zig").ThreadPool;
-pub const TaskContext = @import("thread_pool/pool.zig").TaskContext;
-pub const TaskFn = @import("thread_pool/pool.zig").TaskFn;
-pub const BatchTask = @import("thread_pool/pool.zig").BatchTask;
+pub const types = @import("types.zig");
+pub const ThreadPool = @import("pool.zig").ThreadPool;
+pub const TaskContext = @import("pool.zig").TaskContext;
+pub const TaskFn = @import("pool.zig").TaskFn;
+pub const BatchTask = @import("pool.zig").BatchTask;
 
 pub const version = "0.2.0";
 
@@ -28,8 +28,8 @@ pub const LatencySummary = types.LatencySummary;
 pub const WorkerStats = types.WorkerStats;
 pub const ProcessMemoryStats = types.ProcessMemoryStats;
 pub const Stats = types.Stats;
-pub const WorkDeque = @import("thread_pool/queue/work_deque.zig").WorkDeque;
-pub const BoundedRing = @import("thread_pool/queue/bounded_ring.zig").BoundedRing;
+pub const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
+pub const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
 
 test {
     std.testing.refAllDecls(@This());
