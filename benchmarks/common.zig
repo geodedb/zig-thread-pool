@@ -93,7 +93,22 @@ pub fn runScenarios(allocator: std.mem.Allocator, specs: []const ScenarioSpec, v
 
     for (specs) |spec| {
         for (variants) |variant| {
-            try rows.append(allocator, try runScenario(allocator, spec, variant));
+            // Run 3 times and keep median by throughput for statistical stability.
+            var results: [3]ResultRow = undefined;
+            for (&results) |*r| {
+                r.* = try runScenario(allocator, spec, variant);
+            }
+            std.sort.heap(ResultRow, &results, {}, struct {
+                fn lessThan(_: void, a: ResultRow, b: ResultRow) bool {
+                    return a.throughput_ops_per_sec < b.throughput_ops_per_sec;
+                }
+            }.lessThan);
+            // Free heap allocations from the non-median results.
+            for ([_]usize{ 0, 2 }) |i| {
+                allocator.free(results[i].git_sha);
+                allocator.free(results[i].cpu);
+            }
+            try rows.append(allocator, results[1]); // median
         }
     }
 
@@ -214,7 +229,7 @@ pub fn runScenario(allocator: std.mem.Allocator, spec: ScenarioSpec, variant: th
         .completion_latency_p99_ns = completion_summary.p99_ns,
         .cpu_time_ns = cpu_time_ns,
         .wall_time_ns = wall_end - wall_start,
-        .alloc_count = 0,
+        .alloc_count = stats.total_alloc_count,
         .alloc_bytes = stats.total_alloc_bytes,
         .live_bytes = stats.live_bytes,
         .peak_live_bytes = stats.peak_live_bytes,
