@@ -41,6 +41,7 @@ pub const Config = struct {
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
     spin_before_park_iters: usize = 128,
+    deinit_timeout_ns: u64 = 30_000_000_000,
     scheduler_variant: SchedulerVariant = .global_queue,
     /// Advisory flag indicating the caller intends to submit blocking tasks.
     /// Currently metadata-only: all lanes share the same worker set.

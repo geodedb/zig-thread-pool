@@ -159,7 +159,25 @@ const Core = struct {
     }
 
     pub fn deinit(self: *Core) void {
-        self.shutdown(.drain, null) catch {};
+        self.shutdown(.drain, self.config.deinit_timeout_ns) catch {
+            std.log.warn("thread-pool deinit timed out after {d}ms with {d} active tasks and {d} queued", .{
+                self.config.deinit_timeout_ns / std.time.ns_per_ms,
+                self.active_tasks.load(.acquire),
+                self.queued_tasks.load(.acquire),
+            });
+            // Force state to stopping so workers exit after current task.
+            self.state.store(.stopping, .release);
+            self.park_mutex.lock();
+            self.park_cond.broadcast();
+            self.park_mutex.unlock();
+            for (self.workers) |*worker| {
+                if (worker.thread) |thread| {
+                    thread.join();
+                    worker.thread = null;
+                }
+            }
+            self.state.store(.stopped, .release);
+        };
         self.deinitOwned();
     }
 
