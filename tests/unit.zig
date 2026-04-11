@@ -28,6 +28,22 @@ test "global scheduler waitable handle completes" {
     try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
 }
 
+test "wait rejects out-of-bounds handle index" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    const bad_handle = thread_pool.types.TaskHandle{
+        .index = 9999,
+        .generation = 1,
+        .waitable = true,
+    };
+    try std.testing.expectError(error.InvalidHandle, pool.wait(bad_handle));
+}
+
 test "shutdown rejects new submissions" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
     defer pool.deinit();

@@ -169,6 +169,7 @@ const Core = struct {
 
     pub fn wait(self: *Core, handle: types.TaskHandle) !void {
         if (!handle.isValid()) return error.InvalidHandle;
+        if (handle.index >= self.descriptors.len) return error.InvalidHandle;
 
         self.completion_mutex.lock();
         defer self.completion_mutex.unlock();
