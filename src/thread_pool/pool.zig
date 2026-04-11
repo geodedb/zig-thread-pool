@@ -665,7 +665,8 @@ pub const ThreadPool = struct {
 };
 
 fn nowNs() u64 {
-    return @as(u64, @intCast(std.time.nanoTimestamp()));
+    const ts = std.time.nanoTimestamp();
+    return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 
 fn updatePeak(counter: *std.atomic.Value(u64), value: u64) void {
