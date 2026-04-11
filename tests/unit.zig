@@ -224,6 +224,12 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     try std.testing.expectError(error.Timeout, result);
 }
 
+test "local_queue_capacity zero rejected for all scheduler variants" {
+    var cfg = thread_pool.types.Config{ .local_queue_capacity = 0, .scheduler_variant = .global_queue };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.InvalidLocalQueueCapacity, cfg.validate());
+}
+
 test "concurrent push-pop-steal does not lose or duplicate items" {
     const WorkDeque = @import("thread_pool").WorkDeque;
     const Deque = WorkDeque(u32);

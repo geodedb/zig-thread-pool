@@ -93,7 +93,7 @@ pub const Config = struct {
         if (self.min_threads == 0) return error.InvalidMinThreads;
         if (self.min_threads > self.max_threads) return error.InvalidThreadBounds;
         if (self.queue_capacity == 0 or self.queue_capacity > std.math.maxInt(u32)) return error.InvalidQueueCapacity;
-        if (self.scheduler_variant == .work_stealing and self.local_queue_capacity == 0) {
+        if (self.local_queue_capacity == 0) {
             return error.InvalidLocalQueueCapacity;
         }
         if (self.scheduler_variant == .lane_extension) return error.UnsupportedSchedulerVariant;
