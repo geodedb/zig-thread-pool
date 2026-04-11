@@ -198,6 +198,7 @@ pub const Stats = struct {
     task_desc_peak: u64 = 0,
     total_alloc_bytes: u64 = 0,
     total_free_bytes: u64 = 0,
+    total_alloc_count: u64 = 0,
     live_bytes: u64 = 0,
     peak_live_bytes: u64 = 0,
     task_wait_ns: LatencySummary = .{},

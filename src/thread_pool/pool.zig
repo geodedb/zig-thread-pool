@@ -96,6 +96,7 @@ const Core = struct {
     task_desc_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_alloc_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_free_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peak_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -129,6 +130,7 @@ const Core = struct {
         const accounting = Accounting{
             .total_alloc_bytes = &self.total_alloc_bytes,
             .total_free_bytes = &self.total_free_bytes,
+            .total_alloc_count = &self.total_alloc_count,
             .live_bytes = &self.live_bytes,
             .peak_live_bytes = &self.peak_live_bytes,
         };
@@ -272,6 +274,7 @@ const Core = struct {
             .task_desc_peak = self.task_desc_peak.load(.acquire),
             .total_alloc_bytes = self.total_alloc_bytes.load(.acquire),
             .total_free_bytes = self.total_free_bytes.load(.acquire),
+            .total_alloc_count = self.total_alloc_count.load(.acquire),
             .live_bytes = self.live_bytes.load(.acquire),
             .peak_live_bytes = self.peak_live_bytes.load(.acquire),
             .task_wait_ns = merged_wait.summary(),
@@ -582,6 +585,7 @@ const Core = struct {
         const accounting = Accounting{
             .total_alloc_bytes = &self.total_alloc_bytes,
             .total_free_bytes = &self.total_free_bytes,
+            .total_alloc_count = &self.total_alloc_count,
             .live_bytes = &self.live_bytes,
             .peak_live_bytes = &self.peak_live_bytes,
         };
@@ -592,6 +596,7 @@ const Core = struct {
         const accounting = Accounting{
             .total_alloc_bytes = &self.total_alloc_bytes,
             .total_free_bytes = &self.total_free_bytes,
+            .total_alloc_count = &self.total_alloc_count,
             .live_bytes = &self.live_bytes,
             .peak_live_bytes = &self.peak_live_bytes,
         };

@@ -3,12 +3,14 @@ const std = @import("std");
 pub const Accounting = struct {
     total_alloc_bytes: *std.atomic.Value(u64),
     total_free_bytes: *std.atomic.Value(u64),
+    total_alloc_count: *std.atomic.Value(u64),
     live_bytes: *std.atomic.Value(u64),
     peak_live_bytes: *std.atomic.Value(u64),
 
     pub fn recordAlloc(self: Accounting, bytes: usize) void {
         const amount = @as(u64, @intCast(bytes));
         _ = self.total_alloc_bytes.fetchAdd(amount, .monotonic);
+        _ = self.total_alloc_count.fetchAdd(1, .monotonic);
         const live = self.live_bytes.fetchAdd(amount, .monotonic) + amount;
         updatePeak(self.peak_live_bytes, live);
     }
@@ -103,11 +105,13 @@ pub const WorkerScratch = struct {
 test "worker scratch respects fixed cap and purge" {
     var total_alloc = std.atomic.Value(u64).init(0);
     var total_free = std.atomic.Value(u64).init(0);
+    var total_count = std.atomic.Value(u64).init(0);
     var live = std.atomic.Value(u64).init(0);
     var peak = std.atomic.Value(u64).init(0);
     const accounting = Accounting{
         .total_alloc_bytes = &total_alloc,
         .total_free_bytes = &total_free,
+        .total_alloc_count = &total_count,
         .live_bytes = &live,
         .peak_live_bytes = &peak,
     };
