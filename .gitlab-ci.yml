@@ -115,11 +115,7 @@ fuzz-regression:
   extends: .zig-job
   stage: fuzz
   script:
-    # NOTE: Requires fuzz-annotated tests (std.testing.fuzz) in the test binary.
-    # Currently runs as a regression gate only — meaningful fuzz coverage depends
-    # on adding fuzz targets for queue operations, config validation, and
-    # submit/cancel race conditions. See docs/GAP_ANALYSIS.md.
-    - timeout 60 zig build test --fuzz || true
+    - timeout 60 zig build test --fuzz
   needs: ["build"]
   allow_failure: true
 
