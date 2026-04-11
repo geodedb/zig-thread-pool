@@ -4,12 +4,12 @@ Last updated: 2026-04-11
 
 ## Summary
 
-| PerfSeverity | Count |
-|---|---|
-| P0 (SLO breach / outage risk) | 5 |
-| P1 (Material user-facing impact) | 10 |
-| P2 (Moderate impact / cost) | 6 |
-| **Total** | **21** |
+| PerfSeverity | Open | Closed | Won't Do | Total |
+|---|---|---|---|---|
+| P0 (SLO breach / outage risk) | 4 | 1 | 0 | 5 |
+| P1 (Material user-facing impact) | 4 | 4 | 2 | 10 |
+| P2 (Moderate impact / cost) | 1 | 4 | 1 | 6 |
+| **Total** | **9** | **9** | **3** | **21** |
 
 ### Top 5 Risks by Expected Impact
 
@@ -62,8 +62,8 @@ Sorted by PerfScore descending. PerfScore = Impact(1-5) x Likelihood(1-5) x 4.
 | 15 | P1 | 36 | PERF-015 | Benchmark single-shot measurement, no statistical repetition | `benchmarks/common.zig:121-229` | runScenario() called once; no confidence intervals | No statistical significance; noise dominates | Add 5-10 iterations with median/IQR reporting | @benjiv | Within sprint | Closed -- median-of-3 runs implemented in runScenarios; sorted by throughput, middle result kept, non-median heap allocs freed. |
 | 16 | P2 | 48 | PERF-016 | Steal scan O(N) with global round-robin -- thundering-herd | `pool.zig:399-414` | All idle workers use same round-robin counter; scan all peers | Steal storms at 16+ workers; O(N^2) total scan work | Use random victim selection or exponential backoff | @benjiv | Next quarter | Closed -- Replaced global atomic fetchAdd with per-worker pseudo-random start (worker_index +% submitted count). Eliminates contention on shared counter; removed submit_round_robin field. |
 | 17 | P2 | 48 | PERF-017 | submitBatch is N individual submits, not true batch | `pool.zig:167-175` | Loop calls submit() individually; N lock pairs per batch | 32x lock overhead for batch=32 | Acquire locks once, enqueue all, release once | @benjiv | Next quarter | Won't Do -- Batching free_mutex acquisition requires partial-rollback logic for queue-full, adds complexity. Real bottleneck is free_mutex being mutex-based (PERF-006); once lock-free, per-task cost drops making batch optimization unnecessary. |
-| 18 | P2 | 32 | PERF-020 | statsSnapshot reads non-atomic Worker fields cross-thread | `pool.zig:230-281` | busy_ns, idle_ns, local_queue_peak etc. read without sync | Stale/torn values in stats output | Use Acquire/Release or copy under per-worker lock | @benjiv | Next quarter | Open |
-| 19 | P2 | 32 | PERF-021 | Worker struct ~1.2KB with histograms; no hot/cold split | `pool.zig:53-67` | Entire Worker struct iterated during steal scan | Cache pressure during steal; histogram cold data pollutes L1 | Separate hot fields (local_queue ptr, counters) from cold (histograms) | @benjiv | Next quarter | Open |
+| 18 | P2 | 32 | PERF-020 | statsSnapshot reads non-atomic Worker fields cross-thread | `pool.zig:230-281` | busy_ns, idle_ns, local_queue_peak etc. read without sync | Stale/torn values in stats output | Use Acquire/Release or copy under per-worker lock | @benjiv | Next quarter | Closed -- Converted all Worker stat fields (busy_ns, idle_ns, tasks_completed, tasks_stolen, steal_failures, local_queue_peak) to std.atomic.Value with proper load/store/fetchAdd ordering. |
+| 19 | P2 | 32 | PERF-021 | Worker struct ~1.2KB with histograms; no hot/cold split | `pool.zig:53-67` | Entire Worker struct iterated during steal scan | Cache pressure during steal; histogram cold data pollutes L1 | Separate hot fields (local_queue ptr, counters) from cold (histograms) | @benjiv | Next quarter | Closed -- Split local_queues into separate dense array for cache-friendly steal scan; hot worker data (queue pointers) separated from cold data (histograms, stats). |
 | 20 | P2 | 20 | PERF-018 | CI installs Zig from scratch every job (~12 jobs x 50MB) | `.gitlab-ci.yml:28-31` | install-zig.sh runs per-job without caching | 30-60s extra per job; ~6-12 min total pipeline waste | Add `cache:` key on ZIG_VERSION or use pre-built image | @benjiv | Next quarter | Open |
 | 21 | P2 | 16 | PERF-019 | alloc_count always 0 in benchmark output | `benchmarks/common.zig:218` | Hardcoded `.alloc_count = 0` | Allocation regressions undetectable by CI gate | Wire up allocator wrapper counting or use Stats.total_alloc_bytes | @benjiv | Next quarter | Closed -- Added total_alloc_count atomic to Accounting/Core/Stats; Accounting.recordAlloc increments per call; benchmark wires stats.total_alloc_count into ResultRow.alloc_count. |
 
