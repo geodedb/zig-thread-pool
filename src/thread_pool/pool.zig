@@ -80,14 +80,26 @@ const Sync = struct {
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
+/// Fields are grouped by access pattern with cache-line padding
+/// between groups to reduce false sharing between submit and worker paths.
 const Counters = struct {
+    const cache_line_size = std.atomic.cache_line;
+    const field_size = @sizeOf(std.atomic.Value(u64));
+
+    // === Hot write group (submit path) ===
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     submitted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    _pad0: [cache_line_size - 2 * field_size]u8 = undefined,
+
+    // === Hot write group (worker path) ===
+    active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     started: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     cancelled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    _pad1: [cache_line_size - 4 * field_size]u8 = undefined,
+
+    // === Diagnostic/cold counters ===
+    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
