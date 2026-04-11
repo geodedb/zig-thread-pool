@@ -57,7 +57,7 @@ The public API stays stable while scheduler selection, queue topology, and instr
 - Bounded deque.
 - Owner pushes and pops from the bottom.
 - Steals happen from the top.
-- Current implementation uses a per-deque mutex rather than a lock-free Chase-Lev design.
+- The local deque uses a lock-free Chase-Lev design. The owner thread pushes and pops wait-free (no CAS on the fast path). Stealers use a CAS on the top index. Buffer size is constrained to power-of-2 for bitmask wrapping.
 
 ## Memory Model
 
@@ -116,5 +116,4 @@ The public API stays stable while scheduler selection, queue topology, and instr
 
 - Adaptive grow/shrink is intentionally not implemented in phase 1.
 - Per-task allocator-count metrics are not yet separate from byte accounting.
-- Queue internals are mutex-backed instead of lock-free.
 - Lane-aware scheduling is tracked for follow-on work rather than enabled by default.
