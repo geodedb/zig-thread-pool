@@ -80,7 +80,7 @@ pub const Config = struct {
         if (self.max_threads == 0) return error.InvalidMaxThreads;
         if (self.min_threads == 0) return error.InvalidMinThreads;
         if (self.min_threads > self.max_threads) return error.InvalidThreadBounds;
-        if (self.queue_capacity == 0) return error.InvalidQueueCapacity;
+        if (self.queue_capacity == 0 or self.queue_capacity > std.math.maxInt(u32)) return error.InvalidQueueCapacity;
         if (self.scheduler_variant == .work_stealing and self.local_queue_capacity == 0) {
             return error.InvalidLocalQueueCapacity;
         }
@@ -135,6 +135,7 @@ pub const WaitGroup = struct {
 
     pub fn done(self: *WaitGroup) void {
         const previous = self.pending.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
         if (previous == 1) {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -191,7 +192,7 @@ pub const Stats = struct {
     started: u64 = 0,
     completed: u64 = 0,
     cancelled: u64 = 0,
-    active_workers: u64 = 0,
+    active_tasks: u64 = 0,
     parked_workers: u64 = 0,
     retired_workers: u64 = 0,
     queue_depth_current: u64 = 0,

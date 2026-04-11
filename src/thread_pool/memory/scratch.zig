@@ -37,7 +37,6 @@ pub const WorkerScratch = struct {
     fba: ?std.heap.FixedBufferAllocator = null,
     current_bytes: usize = 0,
     peak_bytes: usize = 0,
-    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, accounting: Accounting, cap_bytes: usize) WorkerScratch {
         return .{
@@ -48,8 +47,6 @@ pub const WorkerScratch = struct {
     }
 
     pub fn beginTask(self: *WorkerScratch) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.ensureBuffer();
         if (self.buffer) |buf| {
             self.fba = std.heap.FixedBufferAllocator.init(buf);
@@ -58,8 +55,6 @@ pub const WorkerScratch = struct {
     }
 
     pub fn finishTask(self: *WorkerScratch) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.fba) |fba| {
             self.current_bytes = fba.end_index;
             if (self.current_bytes > self.peak_bytes) self.peak_bytes = self.current_bytes;
@@ -69,8 +64,6 @@ pub const WorkerScratch = struct {
     }
 
     pub fn alloc(self: *WorkerScratch, comptime T: type, count: usize) ![]T {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.ensureBuffer();
         if (self.fba == null) return error.ScratchUnavailable;
         var fba = &self.fba.?;
@@ -81,8 +74,6 @@ pub const WorkerScratch = struct {
     }
 
     pub fn purge(self: *WorkerScratch) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.buffer) |buf| {
             self.accounting.recordFree(buf.len);
             self.allocator.free(buf);
@@ -93,14 +84,10 @@ pub const WorkerScratch = struct {
     }
 
     pub fn bytesCurrent(self: *WorkerScratch) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.current_bytes;
     }
 
     pub fn bytesPeak(self: *WorkerScratch) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.peak_bytes;
     }
 

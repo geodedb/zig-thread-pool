@@ -425,5 +425,6 @@ fn processCpuTimeNs() !u64 {
 }
 
 fn nowNs() u64 {
-    return @as(u64, @intCast(std.time.nanoTimestamp()));
+    const ts = std.time.nanoTimestamp();
+    return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }

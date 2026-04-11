@@ -202,7 +202,7 @@ const Core = struct {
 
     pub fn shutdown(self: *Core, mode: types.ShutdownMode, timeout_ns: ?u64) !void {
         const old_state = self.state.swap(.shutdown_requested, .acq_rel);
-        if (old_state == .stopped) return;
+        if (old_state != .running) return;
 
         if (mode == .cancel_pending) {
             try self.cancelQueuedTasks();
@@ -258,7 +258,7 @@ const Core = struct {
             .started = self.started.load(.acquire),
             .completed = self.completed.load(.acquire),
             .cancelled = self.cancelled.load(.acquire),
-            .active_workers = self.active_tasks.load(.acquire),
+            .active_tasks = self.active_tasks.load(.acquire),
             .parked_workers = self.parked_workers.load(.acquire),
             .retired_workers = 0,
             .queue_depth_current = self.queued_tasks.load(.acquire),
@@ -343,7 +343,6 @@ const Core = struct {
 
         _ = self.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
-        _ = self.wakeups.fetchAdd(1, .monotonic);
 
         return if (options.waitable)
             .{
@@ -472,11 +471,11 @@ const Core = struct {
             wait_group.done();
         }
 
-        self.completion_mutex.lock();
-        self.completion_cond.broadcast();
-        self.completion_mutex.unlock();
-
-        if (!descriptor.options.waitable) {
+        if (descriptor.options.waitable) {
+            self.completion_mutex.lock();
+            self.completion_cond.broadcast();
+            self.completion_mutex.unlock();
+        } else {
             self.releaseDescriptor(descriptor_index);
         }
     }
@@ -486,8 +485,11 @@ const Core = struct {
         var spins: usize = 0;
         while (spins < self.config.spin_before_park_iters) : (spins += 1) {
             if (self.queued_tasks.load(.acquire) != 0) return;
+            if (self.state.load(.acquire) != .running) return;
             std.atomic.spinLoopHint();
         }
+
+        if (self.state.load(.acquire) != .running) return;
 
         _ = self.parks.fetchAdd(1, .monotonic);
         _ = self.parked_workers.fetchAdd(1, .monotonic);
@@ -607,17 +609,12 @@ const Core = struct {
     }
 
     fn incrementQueued(self: *Core) void {
-        const queue_depth = self.queued_tasks.fetchAdd(1, .monotonic) + 1;
+        const queue_depth = self.queued_tasks.fetchAdd(1, .release) +% 1;
         updatePeak(&self.queue_depth_peak, queue_depth);
     }
 
     fn decrementQueued(self: *Core) void {
-        var current = self.queued_tasks.load(.monotonic);
-        while (current != 0) {
-            const previous = self.queued_tasks.cmpxchgWeak(current, current - 1, .monotonic, .monotonic);
-            if (previous == null) return;
-            current = previous.?;
-        }
+        _ = self.queued_tasks.fetchSub(1, .release);
     }
 };
 
