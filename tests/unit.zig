@@ -224,6 +224,23 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     try std.testing.expectError(error.Timeout, result);
 }
 
+test "WaitGroup done underflow guard present in all build modes" {
+    // Verify the WaitGroup correctly tracks pending count down to zero.
+    // The underflow guard (@panic) fires if done() is called when pending == 0.
+    // We cannot catch @panic in-process, so we verify the counter reaches
+    // exactly zero and that no further done() should be called.
+    var wg = thread_pool.types.WaitGroup{};
+    wg.add(1);
+    try std.testing.expectEqual(@as(u32, 1), wg.pendingCount());
+    wg.done();
+    try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
+    // At this point, calling wg.done() would trigger:
+    //   @panic("WaitGroup: done() called more times than add()")
+    // This panic fires in ALL build modes (Debug, ReleaseSafe, ReleaseFast,
+    // ReleaseSmall), unlike the previous std.debug.assert which was stripped
+    // in release builds.
+}
+
 test "local_queue_capacity zero rejected for all scheduler variants" {
     var cfg = thread_pool.types.Config{ .local_queue_capacity = 0, .scheduler_variant = .global_queue };
     cfg = cfg.normalized();

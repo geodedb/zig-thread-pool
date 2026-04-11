@@ -147,7 +147,9 @@ pub const WaitGroup = struct {
 
     pub fn done(self: *WaitGroup) void {
         const previous = self.pending.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        if (previous == 0) {
+            @panic("WaitGroup: done() called more times than add()");
+        }
         if (previous == 1) {
             self.mutex.lock();
             defer self.mutex.unlock();
