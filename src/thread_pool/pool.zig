@@ -70,6 +70,7 @@ const Worker = struct {
 const Core = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
+    accounting: Accounting = undefined,
     state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
     workers: []Worker,
     descriptors: []TaskDescriptor,
@@ -116,6 +117,14 @@ const Core = struct {
         };
         errdefer self.deinitOwned();
 
+        self.accounting = .{
+            .total_alloc_bytes = &self.total_alloc_bytes,
+            .total_free_bytes = &self.total_free_bytes,
+            .total_alloc_count = &self.total_alloc_count,
+            .live_bytes = &self.live_bytes,
+            .peak_live_bytes = &self.peak_live_bytes,
+        };
+
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
         self.recordOwnedAlloc(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
@@ -135,18 +144,10 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
-        const accounting = Accounting{
-            .total_alloc_bytes = &self.total_alloc_bytes,
-            .total_free_bytes = &self.total_free_bytes,
-            .total_alloc_count = &self.total_alloc_count,
-            .live_bytes = &self.live_bytes,
-            .peak_live_bytes = &self.peak_live_bytes,
-        };
-
         for (self.workers) |*worker| {
             worker.* = .{
                 .local_queue = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity),
-                .scratch = WorkerScratch.init(allocator, accounting, normalized.worker_scratch_cap_bytes),
+                .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = nowNs(),
             };
             self.recordOwnedAlloc(worker.local_queue.capacity() * @sizeOf(u32));
@@ -625,25 +626,11 @@ const Core = struct {
     }
 
     fn recordOwnedAlloc(self: *Core, bytes: usize) void {
-        const accounting = Accounting{
-            .total_alloc_bytes = &self.total_alloc_bytes,
-            .total_free_bytes = &self.total_free_bytes,
-            .total_alloc_count = &self.total_alloc_count,
-            .live_bytes = &self.live_bytes,
-            .peak_live_bytes = &self.peak_live_bytes,
-        };
-        accounting.recordAlloc(bytes);
+        self.accounting.recordAlloc(bytes);
     }
 
     fn recordOwnedFree(self: *Core, bytes: usize) void {
-        const accounting = Accounting{
-            .total_alloc_bytes = &self.total_alloc_bytes,
-            .total_free_bytes = &self.total_free_bytes,
-            .total_alloc_count = &self.total_alloc_count,
-            .live_bytes = &self.live_bytes,
-            .peak_live_bytes = &self.peak_live_bytes,
-        };
-        accounting.recordFree(bytes);
+        self.accounting.recordFree(bytes);
     }
 
     fn deinitOwned(self: *Core) void {
