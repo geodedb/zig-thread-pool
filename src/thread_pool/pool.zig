@@ -72,21 +72,16 @@ const Worker = struct {
     scratch_init_failures: u64 = 0,
 };
 
-const Core = struct {
-    allocator: std.mem.Allocator,
-    config: types.Config,
-    accounting: Accounting = undefined,
-    state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
-    workers: []Worker,
-    descriptors: []TaskDescriptor,
-    free_indices: []u32,
-    free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    inject_queue: BoundedRing(u32),
+/// Synchronization primitives for task completion and worker parking.
+const Sync = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
     park_mutex: std.Thread.Mutex = .{},
     park_cond: std.Thread.Condition = .{},
-    worker_stats_buffer: []types.WorkerStats,
+};
+
+/// Atomic counters tracking pool-wide task and worker events.
+const Counters = struct {
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -106,6 +101,21 @@ const Core = struct {
     total_alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peak_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+const Core = struct {
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    accounting: Accounting = undefined,
+    state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
+    workers: []Worker,
+    descriptors: []TaskDescriptor,
+    free_indices: []u32,
+    free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    inject_queue: BoundedRing(u32),
+    sync: Sync = .{},
+    counters: Counters = .{},
+    worker_stats_buffer: []types.WorkerStats,
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -123,11 +133,11 @@ const Core = struct {
         errdefer self.deinitOwned();
 
         self.accounting = .{
-            .total_alloc_bytes = &self.total_alloc_bytes,
-            .total_free_bytes = &self.total_free_bytes,
-            .total_alloc_count = &self.total_alloc_count,
-            .live_bytes = &self.live_bytes,
-            .peak_live_bytes = &self.peak_live_bytes,
+            .total_alloc_bytes = &self.counters.total_alloc_bytes,
+            .total_free_bytes = &self.counters.total_free_bytes,
+            .total_alloc_count = &self.counters.total_alloc_count,
+            .live_bytes = &self.counters.live_bytes,
+            .peak_live_bytes = &self.counters.peak_live_bytes,
         };
 
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
@@ -167,14 +177,14 @@ const Core = struct {
         self.shutdown(.drain, self.config.deinit_timeout_ns) catch {
             std.log.warn("thread-pool deinit timed out after {d}ms with {d} active tasks and {d} queued", .{
                 self.config.deinit_timeout_ns / std.time.ns_per_ms,
-                self.active_tasks.load(.acquire),
-                self.queued_tasks.load(.acquire),
+                self.counters.active_tasks.load(.acquire),
+                self.counters.queued_tasks.load(.acquire),
             });
             // Force state to stopping so workers exit after current task.
             self.state.store(.stopping, .release);
-            self.park_mutex.lock();
-            self.park_cond.broadcast();
-            self.park_mutex.unlock();
+            self.sync.park_mutex.lock();
+            self.sync.park_cond.broadcast();
+            self.sync.park_mutex.unlock();
             for (self.workers) |*worker| {
                 if (worker.thread) |thread| {
                     thread.join();
@@ -212,8 +222,8 @@ const Core = struct {
         if (!handle.isValid()) return error.InvalidHandle;
         if (handle.index >= self.descriptors.len) return error.InvalidHandle;
 
-        self.completion_mutex.lock();
-        defer self.completion_mutex.unlock();
+        self.sync.completion_mutex.lock();
+        defer self.sync.completion_mutex.unlock();
 
         while (true) {
             const descriptor = &self.descriptors[handle.index];
@@ -224,7 +234,7 @@ const Core = struct {
                     return;
                 },
                 .free => return error.InvalidHandle,
-                else => self.completion_cond.wait(&self.completion_mutex),
+                else => self.sync.completion_cond.wait(&self.sync.completion_mutex),
             }
         }
     }
@@ -244,17 +254,17 @@ const Core = struct {
 
         const deadline = if (timeout_ns) |ns| nowNs() + ns else 0;
         while (true) {
-            const queued = self.queued_tasks.load(.acquire);
-            const active = self.active_tasks.load(.acquire);
+            const queued = self.counters.queued_tasks.load(.acquire);
+            const active = self.counters.active_tasks.load(.acquire);
             if (queued == 0 and active == 0) break;
             if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
             std.Thread.sleep(100_000);
         }
 
         self.state.store(.stopping, .release);
-        self.park_mutex.lock();
-        self.park_cond.broadcast();
-        self.park_mutex.unlock();
+        self.sync.park_mutex.lock();
+        self.sync.park_cond.broadcast();
+        self.sync.park_mutex.unlock();
         for (self.workers) |*worker| {
             if (worker.thread) |thread| {
                 thread.join();
@@ -293,25 +303,25 @@ const Core = struct {
         }
 
         return .{
-            .submitted = self.submitted.load(.acquire),
-            .started = self.started.load(.acquire),
-            .completed = self.completed.load(.acquire),
-            .cancelled = self.cancelled.load(.acquire),
-            .active_tasks = self.active_tasks.load(.acquire),
-            .parked_workers = self.parked_workers.load(.acquire),
-            .queue_depth_current = self.queued_tasks.load(.acquire),
-            .queue_depth_peak = self.queue_depth_peak.load(.acquire),
-            .steals = self.steals.load(.acquire),
-            .steal_failures = self.steal_failures.load(.acquire),
-            .wakeups = self.wakeups.load(.acquire),
-            .parks = self.parks.load(.acquire),
-            .task_desc_live = self.task_desc_live.load(.acquire),
-            .task_desc_peak = self.task_desc_peak.load(.acquire),
-            .total_alloc_bytes = self.total_alloc_bytes.load(.acquire),
-            .total_free_bytes = self.total_free_bytes.load(.acquire),
-            .total_alloc_count = self.total_alloc_count.load(.acquire),
-            .live_bytes = self.live_bytes.load(.acquire),
-            .peak_live_bytes = self.peak_live_bytes.load(.acquire),
+            .submitted = self.counters.submitted.load(.acquire),
+            .started = self.counters.started.load(.acquire),
+            .completed = self.counters.completed.load(.acquire),
+            .cancelled = self.counters.cancelled.load(.acquire),
+            .active_tasks = self.counters.active_tasks.load(.acquire),
+            .parked_workers = self.counters.parked_workers.load(.acquire),
+            .queue_depth_current = self.counters.queued_tasks.load(.acquire),
+            .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
+            .steals = self.counters.steals.load(.acquire),
+            .steal_failures = self.counters.steal_failures.load(.acquire),
+            .wakeups = self.counters.wakeups.load(.acquire),
+            .parks = self.counters.parks.load(.acquire),
+            .task_desc_live = self.counters.task_desc_live.load(.acquire),
+            .task_desc_peak = self.counters.task_desc_peak.load(.acquire),
+            .total_alloc_bytes = self.counters.total_alloc_bytes.load(.acquire),
+            .total_free_bytes = self.counters.total_free_bytes.load(.acquire),
+            .total_alloc_count = self.counters.total_alloc_count.load(.acquire),
+            .live_bytes = self.counters.live_bytes.load(.acquire),
+            .peak_live_bytes = self.counters.peak_live_bytes.load(.acquire),
             .task_wait_ns = merged_wait.summary(),
             .task_exec_ns = merged_exec.summary(),
             .memory = memory,
@@ -320,7 +330,7 @@ const Core = struct {
     }
 
     pub fn purgeWorkerCaches(self: *Core) !void {
-        if (self.active_tasks.load(.acquire) != 0) return error.PoolBusy;
+        if (self.counters.active_tasks.load(.acquire) != 0) return error.PoolBusy;
         for (self.workers) |*worker| {
             worker.scratch.purge();
         }
@@ -381,13 +391,13 @@ const Core = struct {
             return error.QueueFull;
         }
 
-        _ = self.submitted.fetchAdd(1, .monotonic);
+        _ = self.counters.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
 
-        if (self.parked_workers.load(.monotonic) > 0) {
-            self.park_mutex.lock();
-            self.park_cond.signal();
-            self.park_mutex.unlock();
+        if (self.counters.parked_workers.load(.monotonic) > 0) {
+            self.sync.park_mutex.lock();
+            self.sync.park_cond.signal();
+            self.sync.park_mutex.unlock();
         }
 
         return if (options.waitable)
@@ -444,20 +454,20 @@ const Core = struct {
             // Use worker_index mixed with submitted count for pseudo-random start.
             // Avoids global atomic fetchAdd contention that causes thundering-herd
             // when all idle workers get sequential starting indices.
-            const start = (worker_index +% @as(usize, @truncate(self.submitted.load(.monotonic)))) % self.workers.len;
+            const start = (worker_index +% @as(usize, @truncate(self.counters.submitted.load(.monotonic)))) % self.workers.len;
             var offset: usize = 0;
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
                 if (victim_index == worker_index) continue;
                 if (self.workers[victim_index].local_queue.stealTop()) |descriptor_index| {
                     self.decrementQueued();
-                    _ = self.steals.fetchAdd(1, .monotonic);
+                    _ = self.counters.steals.fetchAdd(1, .monotonic);
                     worker.steals += 1;
                     return descriptor_index;
                 }
             }
 
-            _ = self.steal_failures.fetchAdd(1, .monotonic);
+            _ = self.counters.steal_failures.fetchAdd(1, .monotonic);
             worker.steal_failures += 1;
             return null;
         }
@@ -478,8 +488,8 @@ const Core = struct {
         const wait_ns = descriptor.start_ns - descriptor.submit_ns;
         worker.wait_histogram.observe(wait_ns);
 
-        _ = self.started.fetchAdd(1, .monotonic);
-        _ = self.active_tasks.fetchAdd(1, .monotonic);
+        _ = self.counters.started.fetchAdd(1, .monotonic);
+        _ = self.counters.active_tasks.fetchAdd(1, .monotonic);
 
         const run_started_ns = descriptor.start_ns;
         const idle_started_ns = worker.last_idle_started_ns;
@@ -503,7 +513,7 @@ const Core = struct {
             worker.scratch.finishTask();
         } else {
             descriptor.state.store(.cancelled, .release);
-            _ = self.cancelled.fetchAdd(1, .monotonic);
+            _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
 
         descriptor.complete_ns = nowNs();
@@ -513,10 +523,10 @@ const Core = struct {
 
         worker.exec_histogram.observe(exec_ns);
 
-        _ = self.active_tasks.fetchSub(1, .monotonic);
+        _ = self.counters.active_tasks.fetchSub(1, .monotonic);
         if (descriptor.state.load(.acquire) != .cancelled) {
             descriptor.state.store(.completed, .release);
-            _ = self.completed.fetchAdd(1, .monotonic);
+            _ = self.counters.completed.fetchAdd(1, .monotonic);
         }
 
         if (descriptor.options.wait_group) |wait_group| {
@@ -524,9 +534,9 @@ const Core = struct {
         }
 
         if (descriptor.options.waitable) {
-            self.completion_mutex.lock();
-            self.completion_cond.broadcast();
-            self.completion_mutex.unlock();
+            self.sync.completion_mutex.lock();
+            self.sync.completion_cond.broadcast();
+            self.sync.completion_mutex.unlock();
         } else {
             self.releaseDescriptor(descriptor_index);
         }
@@ -536,27 +546,27 @@ const Core = struct {
         var worker = &self.workers[worker_index];
         var spins: usize = 0;
         while (spins < self.config.spin_before_park_iters) : (spins += 1) {
-            if (self.queued_tasks.load(.acquire) != 0) return;
+            if (self.counters.queued_tasks.load(.acquire) != 0) return;
             if (self.state.load(.acquire) != .running) return;
             std.atomic.spinLoopHint();
         }
 
         if (self.state.load(.acquire) != .running) return;
 
-        _ = self.parks.fetchAdd(1, .monotonic);
+        _ = self.counters.parks.fetchAdd(1, .monotonic);
         worker.parks += 1;
 
-        self.park_mutex.lock();
-        _ = self.parked_workers.fetchAdd(1, .monotonic);
-        if (self.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
-            _ = self.parked_workers.fetchSub(1, .monotonic);
-            self.park_mutex.unlock();
+        self.sync.park_mutex.lock();
+        _ = self.counters.parked_workers.fetchAdd(1, .monotonic);
+        if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
+            _ = self.counters.parked_workers.fetchSub(1, .monotonic);
+            self.sync.park_mutex.unlock();
             worker.wakeups += 1;
             return;
         }
-        self.park_cond.timedWait(&self.park_mutex, self.config.idle_park_after_ns) catch {};
-        _ = self.parked_workers.fetchSub(1, .monotonic);
-        self.park_mutex.unlock();
+        self.sync.park_cond.timedWait(&self.sync.park_mutex, self.config.idle_park_after_ns) catch {};
+        _ = self.counters.parked_workers.fetchSub(1, .monotonic);
+        self.sync.park_mutex.unlock();
         worker.wakeups += 1;
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
@@ -570,7 +580,7 @@ const Core = struct {
     fn shouldExit(self: *Core) bool {
         const state = self.state.load(.acquire);
         if (state == .running) return false;
-        return self.queued_tasks.load(.acquire) == 0 and self.active_tasks.load(.acquire) == 0;
+        return self.counters.queued_tasks.load(.acquire) == 0 and self.counters.active_tasks.load(.acquire) == 0;
     }
 
     fn cancelQueuedTasks(self: *Core) !void {
@@ -591,11 +601,11 @@ const Core = struct {
     fn cancelDescriptor(self: *Core, descriptor_index: u32) void {
         const descriptor = &self.descriptors[descriptor_index];
         descriptor.state.store(.cancelled, .release);
-        _ = self.cancelled.fetchAdd(1, .monotonic);
+        _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         if (descriptor.options.wait_group) |wait_group| wait_group.done();
-        self.completion_mutex.lock();
-        self.completion_cond.broadcast();
-        self.completion_mutex.unlock();
+        self.sync.completion_mutex.lock();
+        self.sync.completion_cond.broadcast();
+        self.sync.completion_mutex.unlock();
         if (!descriptor.options.waitable) self.releaseDescriptor(descriptor_index);
     }
 
@@ -618,8 +628,8 @@ const Core = struct {
             descriptor.generation = prev_generation +% 1;
             if (descriptor.generation == 0) descriptor.generation = 1;
             descriptor.state.store(.reserved, .release);
-            const live = self.task_desc_live.fetchAdd(1, .monotonic) + 1;
-            updatePeak(&self.task_desc_peak, live);
+            const live = self.counters.task_desc_live.fetchAdd(1, .monotonic) + 1;
+            updatePeak(&self.counters.task_desc_peak, live);
             return head;
         }
     }
@@ -633,7 +643,7 @@ const Core = struct {
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
         descriptor.state.store(.free, .release);
-        _ = self.task_desc_live.fetchSub(1, .monotonic);
+        _ = self.counters.task_desc_live.fetchSub(1, .monotonic);
 
         while (true) {
             const tagged = self.free_top_tagged.load(.acquire);
@@ -674,12 +684,12 @@ const Core = struct {
     }
 
     fn incrementQueued(self: *Core) void {
-        const queue_depth = self.queued_tasks.fetchAdd(1, .release) +% 1;
-        updatePeak(&self.queue_depth_peak, queue_depth);
+        const queue_depth = self.counters.queued_tasks.fetchAdd(1, .release) +% 1;
+        updatePeak(&self.counters.queue_depth_peak, queue_depth);
     }
 
     fn decrementQueued(self: *Core) void {
-        _ = self.queued_tasks.fetchSub(1, .release);
+        _ = self.counters.queued_tasks.fetchSub(1, .release);
     }
 };
 
