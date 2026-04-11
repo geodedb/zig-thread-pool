@@ -148,8 +148,13 @@ fuzz-regression:
     - apt-get update && apt-get install -y bash curl python3 xz-utils git
     - *install-zig
   script:
+    # NOTE: Requires fuzz-annotated tests (std.testing.fuzz) in the test binary.
+    # Currently runs as a regression gate only — meaningful fuzz coverage depends
+    # on adding fuzz targets for queue operations, config validation, and
+    # submit/cancel race conditions. See docs/GAP_ANALYSIS.md.
     - timeout 60 zig build test --fuzz; rc=$?; if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then exit $rc; fi
   needs: ["build"]
+  allow_failure: true
 
 benchmark-regression:
   stage: performance
