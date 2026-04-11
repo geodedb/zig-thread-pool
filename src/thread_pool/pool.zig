@@ -61,15 +61,15 @@ const Worker = struct {
     scratch: WorkerScratch,
     wait_histogram: LatencyHistogram = .{},
     exec_histogram: LatencyHistogram = .{},
-    busy_ns: u64 = 0,
-    idle_ns: u64 = 0,
-    local_queue_peak: u32 = 0,
-    parks: u64 = 0,
-    wakeups: u64 = 0,
-    steals: u64 = 0,
-    steal_failures: u64 = 0,
-    last_idle_started_ns: u64 = 0,
-    scratch_init_failures: u64 = 0,
+    busy_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    idle_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    local_queue_peak: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    parks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_idle_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    scratch_init_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 /// Synchronization primitives for task completion and worker parking.
@@ -163,7 +163,7 @@ const Core = struct {
             worker.* = .{
                 .local_queue = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity),
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
-                .last_idle_started_ns = nowNs(),
+                .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
             };
             self.recordOwnedAlloc(worker.local_queue.capacity() * @sizeOf(u32));
         }
@@ -275,19 +275,17 @@ const Core = struct {
     }
 
     pub fn statsSnapshot(self: *Core) types.Stats {
-        // Worker stats (busy_ns, idle_ns, etc.) are read without synchronization.
-        // Values are approximate when workers are actively running tasks.
         for (self.workers, 0..) |*worker, idx| {
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
-                .busy_ns = worker.busy_ns,
-                .idle_ns = worker.idle_ns,
+                .busy_ns = worker.busy_ns.load(.acquire),
+                .idle_ns = worker.idle_ns.load(.acquire),
                 .local_queue_depth = @as(u32, @intCast(worker.local_queue.len())),
-                .local_queue_peak = worker.local_queue_peak,
-                .parks = worker.parks,
-                .wakeups = worker.wakeups,
-                .steals = worker.steals,
-                .steal_failures = worker.steal_failures,
+                .local_queue_peak = worker.local_queue_peak.load(.acquire),
+                .parks = worker.parks.load(.acquire),
+                .wakeups = worker.wakeups.load(.acquire),
+                .steals = worker.steals.load(.acquire),
+                .steal_failures = worker.steal_failures.load(.acquire),
                 .scratch_current_bytes = @as(u64, @intCast(worker.scratch.bytesCurrent())),
                 .scratch_peak_bytes = @as(u64, @intCast(worker.scratch.bytesPeak())),
             };
@@ -380,7 +378,7 @@ const Core = struct {
             queued = worker.local_queue.tryPushBottom(descriptor_index);
             if (queued) {
                 const local_len = @as(u32, @intCast(worker.local_queue.len()));
-                worker.local_queue_peak = @max(worker.local_queue_peak, local_len);
+                updatePeakU32(&worker.local_queue_peak, local_len);
             }
         }
         if (!queued) {
@@ -446,7 +444,7 @@ const Core = struct {
                     }
                 }
                 const local_len = @as(u32, @intCast(worker.local_queue.len()));
-                worker.local_queue_peak = @max(worker.local_queue_peak, local_len);
+                updatePeakU32(&worker.local_queue_peak, local_len);
                 self.decrementQueued();
                 return descriptor_index;
             }
@@ -462,13 +460,13 @@ const Core = struct {
                 if (self.workers[victim_index].local_queue.stealTop()) |descriptor_index| {
                     self.decrementQueued();
                     _ = self.counters.steals.fetchAdd(1, .monotonic);
-                    worker.steals += 1;
+                    _ = worker.steals.fetchAdd(1, .release);
                     return descriptor_index;
                 }
             }
 
             _ = self.counters.steal_failures.fetchAdd(1, .monotonic);
-            worker.steal_failures += 1;
+            _ = worker.steal_failures.fetchAdd(1, .release);
             return null;
         }
 
@@ -492,9 +490,9 @@ const Core = struct {
         _ = self.counters.active_tasks.fetchAdd(1, .monotonic);
 
         const run_started_ns = descriptor.start_ns;
-        const idle_started_ns = worker.last_idle_started_ns;
+        const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
         if (idle_started_ns != 0 and run_started_ns >= idle_started_ns) {
-            worker.idle_ns += run_started_ns - idle_started_ns;
+            _ = worker.idle_ns.fetchAdd(run_started_ns - idle_started_ns, .release);
         }
 
         var runtime = TaskContext{
@@ -507,7 +505,7 @@ const Core = struct {
         const cancelled = if (descriptor.options.cancellation_token) |token| token.isCancelled() else false;
         if (!cancelled) {
             worker.scratch.beginTask() catch {
-                worker.scratch_init_failures += 1;
+                _ = worker.scratch_init_failures.fetchAdd(1, .release);
             };
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
@@ -518,8 +516,8 @@ const Core = struct {
 
         descriptor.complete_ns = nowNs();
         const exec_ns = descriptor.complete_ns - run_started_ns;
-        worker.busy_ns += exec_ns;
-        worker.last_idle_started_ns = descriptor.complete_ns;
+        _ = worker.busy_ns.fetchAdd(exec_ns, .release);
+        worker.last_idle_started_ns.store(descriptor.complete_ns, .release);
 
         worker.exec_histogram.observe(exec_ns);
 
@@ -554,24 +552,24 @@ const Core = struct {
         if (self.state.load(.acquire) != .running) return;
 
         _ = self.counters.parks.fetchAdd(1, .monotonic);
-        worker.parks += 1;
+        _ = worker.parks.fetchAdd(1, .release);
 
         self.sync.park_mutex.lock();
         _ = self.counters.parked_workers.fetchAdd(1, .monotonic);
         if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
             _ = self.counters.parked_workers.fetchSub(1, .monotonic);
             self.sync.park_mutex.unlock();
-            worker.wakeups += 1;
+            _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
         self.sync.park_cond.timedWait(&self.sync.park_mutex, self.config.idle_park_after_ns) catch {};
         _ = self.counters.parked_workers.fetchSub(1, .monotonic);
         self.sync.park_mutex.unlock();
-        worker.wakeups += 1;
+        _ = worker.wakeups.fetchAdd(1, .release);
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
             const now = nowNs();
-            if (now - worker.last_idle_started_ns >= self.config.idle_purge_after_ns) {
+            if (now - worker.last_idle_started_ns.load(.acquire) >= self.config.idle_purge_after_ns) {
                 worker.scratch.purge();
             }
         }
@@ -789,3 +787,12 @@ fn nowNs() u64 {
 }
 
 const updatePeak = Accounting.updatePeak;
+
+fn updatePeakU32(counter: *std.atomic.Value(u32), value: u32) void {
+    var current = counter.load(.monotonic);
+    while (value > current) {
+        const previous = counter.cmpxchgWeak(current, value, .monotonic, .monotonic);
+        if (previous == null) return;
+        current = previous.?;
+    }
+}
