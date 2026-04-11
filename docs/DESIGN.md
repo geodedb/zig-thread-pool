@@ -15,7 +15,7 @@ The public API stays stable while scheduler selection, queue topology, and instr
 - `ThreadPool.deinit()`
 - `ThreadPool.submit(task_fn, ctx, options) !TaskHandle`
 - `ThreadPool.trySubmit(task_fn, ctx, options) !TaskHandle`
-- `ThreadPool.submitBatch(tasks, options) !void`
+- `ThreadPool.submitBatch(tasks, options) !SubmitBatchResult`
 - `ThreadPool.wait(handle) !void`
 - `ThreadPool.waitGroup() WaitGroup`
 - `ThreadPool.shutdown(mode, timeout) !void`
