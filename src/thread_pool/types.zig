@@ -49,6 +49,11 @@ pub const Config = struct {
     idle_shrink_after_ns: u64 = 60_000_000_000,
     spin_before_park_iters: usize = 128,
     scheduler_variant: SchedulerVariant = .global_queue,
+    /// Advisory flag indicating the caller intends to submit blocking tasks.
+    /// Currently metadata-only: all lanes share the same worker set.
+    /// A future lane_extension scheduler may use this to reserve a dedicated
+    /// blocking worker subset. Setting this to false does not prevent submitting
+    /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
     allocator_mode: AllocatorMode = .caller_supplied_with_worker_scratch,
     stats_enabled: bool = true,
