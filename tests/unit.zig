@@ -223,3 +223,61 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     const result = pool.core.shutdown(.drain, 50_000_000);
     try std.testing.expectError(error.Timeout, result);
 }
+
+test "concurrent push-pop-steal does not lose or duplicate items" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    const Deque = WorkDeque(u32);
+    var deque = try Deque.init(std.testing.allocator, 256);
+    defer deque.deinit();
+
+    const total_items: u32 = 10_000;
+    var owner_collected = std.atomic.Value(u32).init(0);
+    var stolen_collected = std.atomic.Value(u32).init(0);
+
+    const Stealer = struct {
+        fn run(d: *Deque, owner_done: *std.atomic.Value(u32), stolen: *std.atomic.Value(u32)) void {
+            var count: u32 = 0;
+            while (true) {
+                if (d.stealTop()) |_| {
+                    count += 1;
+                } else {
+                    if (d.len() == 0 and owner_done.load(.acquire) > 0) {
+                        if (d.stealTop()) |_| {
+                            count += 1;
+                        } else break;
+                    }
+                    std.Thread.yield() catch {};
+                }
+            }
+            _ = stolen.fetchAdd(count, .release);
+        }
+    };
+
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Stealer.run, .{ &deque, &owner_collected, &stolen_collected });
+    }
+
+    var owner_count: u32 = 0;
+    var pushed: u32 = 0;
+    while (pushed < total_items) {
+        if (deque.tryPushBottom(pushed)) {
+            pushed += 1;
+        }
+        if (pushed % 4 == 0) {
+            if (deque.popBottom()) |_| {
+                owner_count += 1;
+            }
+        }
+    }
+    while (deque.popBottom()) |_| {
+        owner_count += 1;
+    }
+
+    _ = owner_collected.fetchAdd(owner_count, .release);
+
+    for (&threads) |t| t.join();
+
+    const total_recovered = owner_collected.load(.acquire) + stolen_collected.load(.acquire);
+    try std.testing.expectEqual(total_items, total_recovered);
+}
