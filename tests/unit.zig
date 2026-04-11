@@ -304,3 +304,22 @@ test "concurrent push-pop-steal does not lose or duplicate items" {
     const total_recovered = owner_collected.load(.acquire) + stolen_collected.load(.acquire);
     try std.testing.expectEqual(total_items, total_recovered);
 }
+
+test "Stats.wakeups reflects worker wakeup activity" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..8) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    // Workers must have been woken at least once to process tasks
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.wakeups > 0);
+}

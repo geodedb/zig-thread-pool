@@ -313,7 +313,13 @@ const Core = struct {
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
             .steals = self.counters.steals.load(.acquire),
             .steal_failures = self.counters.steal_failures.load(.acquire),
-            .wakeups = self.counters.wakeups.load(.acquire),
+            .wakeups = blk: {
+                var total: u64 = 0;
+                for (self.workers) |*w| {
+                    total += w.wakeups.load(.acquire);
+                }
+                break :blk total;
+            },
             .parks = self.counters.parks.load(.acquire),
             .task_desc_live = self.counters.task_desc_live.load(.acquire),
             .task_desc_peak = self.counters.task_desc_peak.load(.acquire),
