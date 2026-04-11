@@ -67,6 +67,9 @@ pub const Config = struct {
         if (cfg.local_queue_capacity != 0) {
             cfg.local_queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.local_queue_capacity) catch cfg.local_queue_capacity;
         }
+        if (cfg.queue_capacity != 0) {
+            cfg.queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.queue_capacity) catch cfg.queue_capacity;
+        }
         return cfg;
     }
 
@@ -238,4 +241,9 @@ test "Config normalized rounds local_queue_capacity to power of two" {
 
     const cfg3 = (Config{ .local_queue_capacity = 1 }).normalized();
     try std.testing.expectEqual(@as(usize, 1), cfg3.local_queue_capacity);
+}
+
+test "Config normalized rounds queue_capacity to power of two" {
+    const cfg = (Config{ .queue_capacity = 1000 }).normalized();
+    try std.testing.expectEqual(@as(usize, 1024), cfg.queue_capacity);
 }
