@@ -470,7 +470,8 @@ const Core = struct {
             .lane = descriptor.options.lane,
         };
 
-        if (!(descriptor.options.cancellation_token != null and descriptor.options.cancellation_token.?.isCancelled())) {
+        const cancelled = if (descriptor.options.cancellation_token) |token| token.isCancelled() else false;
+        if (!cancelled) {
             worker.scratch.beginTask() catch {
                 worker.scratch_init_failures += 1;
             };
