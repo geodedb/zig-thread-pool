@@ -30,116 +30,89 @@ stages:
   - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
   - zig version
 
+.zig-job:
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y bash curl python3 xz-utils git
+    - *install-zig
+
 zig-format:
   before_script:
     - *install-zig
 
 build:
+  extends: .zig-job
   stage: build
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build build
     - zig build check
 
 test-unit:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test --summary all
   needs: ["build"]
 
 test-integration:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test-integration --summary all
   needs: ["build"]
 
 test-stress:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test-stress --summary all
   needs: ["build"]
 
 test-release-safe:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test -Doptimize=ReleaseSafe --summary all
   needs: ["build"]
 
 test-release-fast:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test -Doptimize=ReleaseFast --summary all
   needs: ["build"]
 
 test-release-small:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build test -Doptimize=ReleaseSmall --summary all
   needs: ["build"]
 
 cross-linux:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build-lib src/root.zig -target x86_64-linux
   needs: ["build"]
 
 cross-macos:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build-lib src/root.zig -target aarch64-macos
   needs: ["build"]
 
 cross-windows:
+  extends: .zig-job
   stage: test
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build-lib src/root.zig -target x86_64-windows-gnu
   needs: ["build"]
 
 fuzz-regression:
+  extends: .zig-job
   stage: fuzz
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     # NOTE: Requires fuzz-annotated tests (std.testing.fuzz) in the test binary.
     # Currently runs as a regression gate only — meaningful fuzz coverage depends
@@ -150,11 +123,8 @@ fuzz-regression:
   allow_failure: true
 
 benchmark-regression:
+  extends: .zig-job
   stage: performance
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - zig build bench -- --output benchmarks/results/ci-current.json
     - zig build compare-bench -- --baseline benchmarks/results/baseline.json --current benchmarks/results/ci-current.json
@@ -165,11 +135,8 @@ benchmark-regression:
   needs: ["build"]
 
 scale-bench-manual:
+  extends: .zig-job
   stage: performance
-  image: debian:bookworm-slim
-  before_script:
-    - apt-get update && apt-get install -y bash curl python3 xz-utils git
-    - *install-zig
   script:
     - timeout 120 zig build scale-bench -- --output benchmarks/results/scale-current.json
   artifacts:
