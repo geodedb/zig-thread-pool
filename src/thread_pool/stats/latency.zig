@@ -3,44 +3,75 @@ const types = @import("../types.zig");
 
 pub const LatencyHistogram = struct {
     const bucket_count = 64;
+    const Atomic = std.atomic.Value(u64);
 
-    counts: [bucket_count]u64 = [_]u64{0} ** bucket_count,
-    count: u64 = 0,
-    min_ns: u64 = std.math.maxInt(u64),
-    max_ns: u64 = 0,
-    sum_ns: u64 = 0,
+    counts: [bucket_count]Atomic = [_]Atomic{Atomic.init(0)} ** bucket_count,
+    count: Atomic = Atomic.init(0),
+    min_ns: Atomic = Atomic.init(std.math.maxInt(u64)),
+    max_ns: Atomic = Atomic.init(0),
+    sum_ns: Atomic = Atomic.init(0),
 
+    /// Record a latency observation.  Called by a single worker thread on its
+    /// own histogram, but the fields must be atomic because `merge()` may read
+    /// them concurrently from `statsSnapshot()`.
     pub fn observe(self: *LatencyHistogram, value_ns: u64) void {
         const bucket = bucketIndex(value_ns);
-        self.counts[bucket] += 1;
-        self.count += 1;
-        self.sum_ns += value_ns;
-        if (value_ns < self.min_ns) self.min_ns = value_ns;
-        if (value_ns > self.max_ns) self.max_ns = value_ns;
+        _ = self.counts[bucket].fetchAdd(1, .monotonic);
+        _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.sum_ns.fetchAdd(value_ns, .monotonic);
+
+        // CAS loop to update min_ns.
+        var cur_min = self.min_ns.load(.monotonic);
+        while (value_ns < cur_min) {
+            cur_min = self.min_ns.cmpxchgWeak(cur_min, value_ns, .monotonic, .monotonic) orelse break;
+        }
+
+        // CAS loop to update max_ns.
+        var cur_max = self.max_ns.load(.monotonic);
+        while (value_ns > cur_max) {
+            cur_max = self.max_ns.cmpxchgWeak(cur_max, value_ns, .monotonic, .monotonic) orelse break;
+        }
     }
 
-    pub fn merge(self: *LatencyHistogram, other: LatencyHistogram) void {
+    /// Merge another histogram's values into this one.  `other` is typically a
+    /// per-worker histogram that may be concurrently updated by its owner
+    /// thread, so all reads from `other` use atomic loads.  `self` is assumed
+    /// to be thread-local (e.g. a freshly-initialised accumulator inside
+    /// `statsSnapshot()`), but uses atomic ops for field-type consistency.
+    pub fn merge(self: *LatencyHistogram, other: *const LatencyHistogram) void {
         for (&self.counts, other.counts) |*dst, src| {
-            dst.* += src;
+            _ = dst.fetchAdd(src.load(.monotonic), .monotonic);
         }
-        self.count += other.count;
-        self.sum_ns += other.sum_ns;
-        if (other.count > 0) {
-            if (other.min_ns < self.min_ns) self.min_ns = other.min_ns;
-            if (other.max_ns > self.max_ns) self.max_ns = other.max_ns;
+        const other_count = other.count.load(.monotonic);
+        _ = self.count.fetchAdd(other_count, .monotonic);
+        _ = self.sum_ns.fetchAdd(other.sum_ns.load(.monotonic), .monotonic);
+        if (other_count > 0) {
+            const other_min = other.min_ns.load(.monotonic);
+            var cur_min = self.min_ns.load(.monotonic);
+            while (other_min < cur_min) {
+                cur_min = self.min_ns.cmpxchgWeak(cur_min, other_min, .monotonic, .monotonic) orelse break;
+            }
+            const other_max = other.max_ns.load(.monotonic);
+            var cur_max = self.max_ns.load(.monotonic);
+            while (other_max > cur_max) {
+                cur_max = self.max_ns.cmpxchgWeak(cur_max, other_max, .monotonic, .monotonic) orelse break;
+            }
         }
     }
 
-    pub fn summary(self: LatencyHistogram) types.LatencySummary {
-        if (self.count == 0) return .{};
+    /// Produce a summary snapshot.  Typically called on a thread-local merged
+    /// histogram, so contention is not expected.
+    pub fn summary(self: *const LatencyHistogram) types.LatencySummary {
+        const c = self.count.load(.monotonic);
+        if (c == 0) return .{};
         return .{
-            .count = self.count,
-            .min_ns = self.min_ns,
-            .mean_ns = self.sum_ns / self.count,
-            .p50_ns = quantile(self, 50),
-            .p95_ns = quantile(self, 95),
-            .p99_ns = quantile(self, 99),
-            .max_ns = self.max_ns,
+            .count = c,
+            .min_ns = self.min_ns.load(.monotonic),
+            .mean_ns = self.sum_ns.load(.monotonic) / c,
+            .p50_ns = self.quantile(50),
+            .p95_ns = self.quantile(95),
+            .p99_ns = self.quantile(99),
+            .max_ns = self.max_ns.load(.monotonic),
         };
     }
 
@@ -60,14 +91,15 @@ pub const LatencyHistogram = struct {
         return @as(u64, 1) << @as(u6, @intCast(index));
     }
 
-    fn quantile(self: LatencyHistogram, percentile: u8) u64 {
-        const target = @max((self.count * percentile + 99) / 100, 1);
+    fn quantile(self: *const LatencyHistogram, percentile: u8) u64 {
+        const c = self.count.load(.monotonic);
+        const target = @max((c * percentile + 99) / 100, 1);
         var seen: u64 = 0;
-        for (self.counts, 0..) |bucket_count_value, idx| {
-            seen += bucket_count_value;
+        for (self.counts, 0..) |bucket_atomic, idx| {
+            seen += bucket_atomic.load(.monotonic);
             if (seen >= target) return bucketUpperBound(idx);
         }
-        return self.max_ns;
+        return self.max_ns.load(.monotonic);
     }
 };
 

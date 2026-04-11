@@ -182,18 +182,7 @@ const Core = struct {
                 self.counters.active_tasks.load(.acquire),
                 self.counters.queued_tasks.load(.acquire),
             });
-            // Force state to stopping so workers exit after current task.
-            self.state.store(.stopping, .release);
-            self.sync.park_mutex.lock();
-            self.sync.park_cond.broadcast();
-            self.sync.park_mutex.unlock();
-            for (self.workers) |*worker| {
-                if (worker.thread) |thread| {
-                    thread.join();
-                    worker.thread = null;
-                }
-            }
-            self.state.store(.stopped, .release);
+            self.joinAllWorkers();
         };
         self.deinitOwned();
     }
@@ -248,7 +237,12 @@ const Core = struct {
 
     pub fn shutdown(self: *Core, mode: types.ShutdownMode, timeout_ns: ?u64) !void {
         const old_state = self.state.swap(.shutdown_requested, .acq_rel);
-        if (old_state != .running) return;
+        if (old_state != .running) {
+            // Another shutdown is already in progress or completed.
+            // Ensure all threads are joined before returning.
+            self.joinAllWorkers();
+            return;
+        }
 
         if (mode == .cancel_pending) {
             try self.cancelQueuedTasks();
@@ -263,10 +257,17 @@ const Core = struct {
             std.Thread.sleep(100_000);
         }
 
+        self.joinAllWorkers();
+    }
+
+    fn joinAllWorkers(self: *Core) void {
+        // Signal all workers to exit
         self.state.store(.stopping, .release);
         self.sync.park_mutex.lock();
         self.sync.park_cond.broadcast();
         self.sync.park_mutex.unlock();
+
+        // Join all threads
         for (self.workers) |*worker| {
             if (worker.thread) |thread| {
                 thread.join();
