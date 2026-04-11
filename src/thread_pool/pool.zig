@@ -80,7 +80,6 @@ const Core = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
     worker_stats_buffer: []types.WorkerStats,
-    submit_round_robin: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -398,7 +397,10 @@ const Core = struct {
                 return descriptor_index;
             }
 
-            const start = @as(usize, @intCast(self.submit_round_robin.fetchAdd(1, .monotonic) % self.workers.len));
+            // Use worker_index mixed with submitted count for pseudo-random start.
+            // Avoids global atomic fetchAdd contention that causes thundering-herd
+            // when all idle workers get sequential starting indices.
+            const start = (worker_index +% @as(usize, @truncate(self.submitted.load(.monotonic)))) % self.workers.len;
             var offset: usize = 0;
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
