@@ -79,6 +79,8 @@ const Core = struct {
     inject_queue: BoundedRing(u32),
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
+    park_mutex: std.Thread.Mutex = .{},
+    park_cond: std.Thread.Condition = .{},
     worker_stats_buffer: []types.WorkerStats,
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -220,6 +222,9 @@ const Core = struct {
         }
 
         self.state.store(.stopping, .release);
+        self.park_mutex.lock();
+        self.park_cond.broadcast();
+        self.park_mutex.unlock();
         for (self.workers) |*worker| {
             if (worker.thread) |thread| {
                 thread.join();
@@ -348,6 +353,12 @@ const Core = struct {
 
         _ = self.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
+
+        if (self.parked_workers.load(.monotonic) > 0) {
+            self.park_mutex.lock();
+            self.park_cond.signal();
+            self.park_mutex.unlock();
+        }
 
         return if (options.waitable)
             .{
@@ -502,10 +513,19 @@ const Core = struct {
         if (self.state.load(.acquire) != .running) return;
 
         _ = self.parks.fetchAdd(1, .monotonic);
-        _ = self.parked_workers.fetchAdd(1, .monotonic);
         worker.parks += 1;
-        std.Thread.sleep(self.config.idle_park_after_ns);
+
+        self.park_mutex.lock();
+        _ = self.parked_workers.fetchAdd(1, .monotonic);
+        if (self.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
+            _ = self.parked_workers.fetchSub(1, .monotonic);
+            self.park_mutex.unlock();
+            worker.wakeups += 1;
+            return;
+        }
+        self.park_cond.timedWait(&self.park_mutex, self.config.idle_park_after_ns) catch {};
         _ = self.parked_workers.fetchSub(1, .monotonic);
+        self.park_mutex.unlock();
         worker.wakeups += 1;
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
