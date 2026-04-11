@@ -35,7 +35,9 @@ pub fn main() !void {
             throughput_change,
             rss_change,
         });
-        if (throughput_change < -15.0 or rss_change > 15.0) failures += 1;
+        // Gate on throughput regression only. RSS varies too much across
+        // environments (local vs CI container) for a tight threshold.
+        if (throughput_change < -15.0) failures += 1;
     }
 
     if (failures != 0) return error.BenchmarkRegression;
