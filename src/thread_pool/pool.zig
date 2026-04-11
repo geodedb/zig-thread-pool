@@ -57,7 +57,6 @@ const TaskDescriptor = struct {
 
 const Worker = struct {
     thread: ?std.Thread = null,
-    local_queue: WorkDeque(u32),
     scratch: WorkerScratch,
     wait_histogram: LatencyHistogram = .{},
     exec_histogram: LatencyHistogram = .{},
@@ -109,6 +108,7 @@ const Core = struct {
     accounting: Accounting = undefined,
     state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
     workers: []Worker,
+    local_queues: []WorkDeque(u32),
     descriptors: []TaskDescriptor,
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -125,6 +125,7 @@ const Core = struct {
             .allocator = allocator,
             .config = normalized,
             .workers = try allocator.alloc(Worker, normalized.max_threads),
+            .local_queues = try allocator.alloc(WorkDeque(u32), normalized.max_threads),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
@@ -141,6 +142,7 @@ const Core = struct {
         };
 
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
+        self.recordOwnedAlloc(self.local_queues.len * @sizeOf(WorkDeque(u32)));
         self.recordOwnedAlloc(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
@@ -159,13 +161,13 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
-        for (self.workers) |*worker| {
+        for (self.workers, self.local_queues) |*worker, *lq| {
+            lq.* = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity);
             worker.* = .{
-                .local_queue = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity),
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
             };
-            self.recordOwnedAlloc(worker.local_queue.capacity() * @sizeOf(u32));
+            self.recordOwnedAlloc(lq.capacity() * @sizeOf(u32));
         }
 
         for (self.workers, 0..) |*worker, idx| {
@@ -280,7 +282,7 @@ const Core = struct {
                 .worker_index = idx,
                 .busy_ns = worker.busy_ns.load(.acquire),
                 .idle_ns = worker.idle_ns.load(.acquire),
-                .local_queue_depth = @as(u32, @intCast(worker.local_queue.len())),
+                .local_queue_depth = @as(u32, @intCast(self.local_queues[idx].len())),
                 .local_queue_peak = worker.local_queue_peak.load(.acquire),
                 .parks = worker.parks.load(.acquire),
                 .wakeups = worker.wakeups.load(.acquire),
@@ -374,11 +376,11 @@ const Core = struct {
 
         var queued = false;
         if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
-            const worker = &self.workers[tls_worker_index.?];
-            queued = worker.local_queue.tryPushBottom(descriptor_index);
+            const wi = tls_worker_index.?;
+            queued = self.local_queues[wi].tryPushBottom(descriptor_index);
             if (queued) {
-                const local_len = @as(u32, @intCast(worker.local_queue.len()));
-                updatePeakU32(&worker.local_queue_peak, local_len);
+                const local_len = @as(u32, @intCast(self.local_queues[wi].len()));
+                updatePeakU32(&self.workers[wi].local_queue_peak, local_len);
             }
         }
         if (!queued) {
@@ -427,9 +429,10 @@ const Core = struct {
 
     fn nextTask(self: *Core, worker_index: usize) ?u32 {
         var worker = &self.workers[worker_index];
+        var lq = &self.local_queues[worker_index];
 
         if (self.config.scheduler_variant == .work_stealing) {
-            if (worker.local_queue.popBottom()) |descriptor_index| {
+            if (lq.popBottom()) |descriptor_index| {
                 self.decrementQueued();
                 return descriptor_index;
             }
@@ -438,12 +441,12 @@ const Core = struct {
                 var moved: usize = 1;
                 while (moved < self.config.inject_batch_size) : (moved += 1) {
                     const extra = self.inject_queue.pop() orelse break;
-                    if (!worker.local_queue.tryPushBottom(extra)) {
+                    if (!lq.tryPushBottom(extra)) {
                         _ = self.inject_queue.tryPush(extra);
                         break;
                     }
                 }
-                const local_len = @as(u32, @intCast(worker.local_queue.len()));
+                const local_len = @as(u32, @intCast(lq.len()));
                 updatePeakU32(&worker.local_queue_peak, local_len);
                 self.decrementQueued();
                 return descriptor_index;
@@ -457,7 +460,7 @@ const Core = struct {
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
                 if (victim_index == worker_index) continue;
-                if (self.workers[victim_index].local_queue.stealTop()) |descriptor_index| {
+                if (self.local_queues[victim_index].stealTop()) |descriptor_index| {
                     self.decrementQueued();
                     _ = self.counters.steals.fetchAdd(1, .monotonic);
                     _ = worker.steals.fetchAdd(1, .release);
@@ -587,8 +590,8 @@ const Core = struct {
             self.cancelDescriptor(descriptor_index);
         }
         if (self.config.scheduler_variant == .work_stealing) {
-            for (self.workers) |*worker| {
-                while (worker.local_queue.stealTop()) |descriptor_index| {
+            for (self.local_queues) |*lq| {
+                while (lq.stealTop()) |descriptor_index| {
                     self.decrementQueued();
                     self.cancelDescriptor(descriptor_index);
                 }
@@ -667,8 +670,10 @@ const Core = struct {
     fn deinitOwned(self: *Core) void {
         for (self.workers) |*worker| {
             worker.scratch.purge();
-            self.recordOwnedFree(worker.local_queue.capacity() * @sizeOf(u32));
-            worker.local_queue.deinit();
+        }
+        for (self.local_queues) |*lq| {
+            self.recordOwnedFree(lq.capacity() * @sizeOf(u32));
+            lq.deinit();
         }
         self.inject_queue.deinit();
         self.recordOwnedFree(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
@@ -677,6 +682,8 @@ const Core = struct {
         self.allocator.free(self.free_indices);
         self.recordOwnedFree(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.allocator.free(self.descriptors);
+        self.recordOwnedFree(self.local_queues.len * @sizeOf(WorkDeque(u32)));
+        self.allocator.free(self.local_queues);
         self.recordOwnedFree(self.workers.len * @sizeOf(Worker));
         self.allocator.free(self.workers);
     }
