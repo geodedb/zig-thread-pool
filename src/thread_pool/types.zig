@@ -22,6 +22,20 @@ pub const ShutdownMode = enum {
     cancel_pending,
 };
 
+/// Task lifecycle state machine:
+///
+///     free ──> reserved ──> queued ──> running ──> completed
+///      ^                                  │            │
+///      │                                  └──> cancelled│
+///      │                                       │       │
+///      └───────────────────────────────────────-┴───────┘
+///
+/// - `free`:      Descriptor slot available for reuse.
+/// - `reserved`:  Slot claimed by acquireDescriptor; being populated.
+/// - `queued`:    Task enqueued in inject or local queue.
+/// - `running`:   Worker thread is executing the task function.
+/// - `completed`: Task finished normally; awaiting wait() or auto-release.
+/// - `cancelled`: Task was cancelled before or during execution.
 pub const TaskState = enum(u8) {
     free,
     reserved,
