@@ -71,7 +71,7 @@ fn sampleLinux() !types.ProcessMemoryStats {
         .rss_current_bytes = parseProcStatusKiB(contents, "VmRSS:") * 1024,
         .rss_peak_bytes = parseProcStatusKiB(contents, "VmHWM:") * 1024,
         .private_current_bytes = parseProcStatusKiB(contents, "RssAnon:") * 1024,
-        .private_peak_bytes = parseProcStatusKiB(contents, "VmHWM:") * 1024,
+        .private_peak_bytes = parseProcStatusKiB(contents, "RssAnon:") * 1024,
     };
 }
 
