@@ -7,7 +7,7 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const output = try parseOutputArg(allocator);
+    const output = try common.parseOutputArg(allocator);
     const specs = [_]common.ScenarioSpec{
         .{
             .name = "conn_churn_seq",
@@ -29,14 +29,4 @@ pub fn main() !void {
     };
     const variants = [_]thread_pool.SchedulerVariant{ .global_queue, .work_stealing };
     try common.runScenarios(allocator, &specs, &variants, output);
-}
-
-fn parseOutputArg(allocator: std.mem.Allocator) !?[]const u8 {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    var idx: usize = 0;
-    while (idx + 1 < args.len) : (idx += 1) {
-        if (std.mem.eql(u8, args[idx], "--output")) return args[idx + 1];
-    }
-    return null;
 }

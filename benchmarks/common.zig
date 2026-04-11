@@ -58,9 +58,26 @@ pub const ResultDocument = struct {
     rows: []ResultRow,
 };
 
-const Counter = struct {
+pub const Counter = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
+
+pub fn parseOutputArg(allocator: std.mem.Allocator) !?[]const u8 {
+    const args = try std.process.argsAlloc(allocator);
+    // Caller owns the args memory via the arena allocator -- no defer free here
+    // to avoid returning a dangling pointer into freed argv storage.
+    var idx: usize = 0;
+    while (idx + 1 < args.len) : (idx += 1) {
+        if (std.mem.eql(u8, args[idx], "--output")) {
+            const path = args[idx + 1];
+            // Dupe the path so callers using non-arena allocators are safe.
+            return try allocator.dupe(u8, path);
+        }
+    }
+    // No --output flag found; free args since we have nothing to return.
+    std.process.argsFree(allocator, args);
+    return null;
+}
 
 const BenchTaskCtx = struct {
     pool: ?*thread_pool.ThreadPool = null,
