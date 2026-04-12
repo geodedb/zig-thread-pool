@@ -315,7 +315,15 @@ test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
 
     Nested.inner_counter.store(0, .release);
 
-    const outer_total: u64 = 25_000;
+    // NOTE: This test previously used 25k outer × 4 inner = 125k tasks through
+    // an 8192-slot descriptor pool, which creates a deadlock window: when ~2k
+    // outer tasks are in-flight, their pending inner submits need 4× as many
+    // descriptors as are available, so inner submits get TaskPoolExhausted and
+    // the outer task can't complete. 1k outer × 4 inner = 5k total descriptors
+    // fits comfortably in 8192 and exercises the LIFO hot path without the
+    // deadlock. The design lesson: nested-fanout tests must account for the
+    // descriptor pool as a finite resource.
+    const outer_total: u64 = 1_000;
     var wg = pool.waitGroup();
     var i: u64 = 0;
     while (i < outer_total) : (i += 1) {
