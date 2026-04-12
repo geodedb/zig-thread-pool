@@ -233,3 +233,61 @@ test "queue_kind matrix: chase_lev executes all submitted tasks" {
 test "queue_kind matrix: ring executes all submitted tasks" {
     try runQueueKindScenario(.ring, 50_000);
 }
+
+test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 8192,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .idle_park_after_ns = 50_000,
+        .spin_before_park_iters = 4,
+    });
+    defer pool.deinit();
+
+    const Nested = struct {
+        var inner_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+        fn innerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = raw_ctx;
+            _ = runtime;
+            _ = inner_counter.fetchAdd(1, .release);
+        }
+        fn outerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = runtime;
+            const p: *thread_pool.ThreadPool = @ptrCast(@alignCast(raw_ctx));
+            // Each outer submits 4 inner tasks from worker context — exercises
+            // the lifo_slot miss-to-local-ring path (slot holds #1; #2-#4 go to ring).
+            var i: u32 = 0;
+            while (i < 4) : (i += 1) {
+                while (true) {
+                    _ = p.submit(innerTask, @ptrCast(p), .{}) catch {
+                        std.Thread.sleep(1_000);
+                        continue;
+                    };
+                    break;
+                }
+            }
+        }
+    };
+
+    Nested.inner_counter.store(0, .release);
+
+    const outer_total: u64 = 25_000;
+    var wg = pool.waitGroup();
+    var i: u64 = 0;
+    while (i < outer_total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(Nested.outerTask, @ptrCast(&pool), .{ .wait_group = &wg }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try pool.shutdown(.drain, null); // inner tasks have no wait-group
+
+    try std.testing.expectEqual(outer_total * 4, Nested.inner_counter.load(.acquire));
+}
