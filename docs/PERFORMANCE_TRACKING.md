@@ -4,6 +4,34 @@ Rolling record of micro-benchmark numbers as the Tokio-parity plan progresses.
 All numbers from local dev machine unless noted. CI baselines tracked in
 `benchmarks/results/baseline.json`.
 
+## Verdict vs Targets
+
+| Target | v0.2.0 baseline | After plan | Met? |
+|--------|----------------|-----------|------|
+| `conn_churn_seq/global_queue` throughput ≥ 5M ops/s | 1.48M | ~711K (median) | ❌ regressed |
+| `conn_churn_seq/work_stealing` throughput ≥ 3M ops/s | 648K | ~544K | ❌ regressed |
+| Submit p50 (single-producer) < 200 ns | 619 ns | ~1.8 µs | ❌ regressed |
+| Submit p99 (4 producers) < 1 µs | 6.7 µs | ~12.8 µs | ❌ regressed |
+| `producer_contention/*` completion p50 < 100 µs | 1.46 ms | 1.24 ms | ❌ marginal improvement only (queue never filled) |
+| Hot-path `nanoTimestamp()` calls per task | 3 | 1 (mandatory; 0 with `timestamp_mode=disabled`) | ✅ (Task 5) |
+| Hot-path atomic ops per task | ~10 | ~5 (per-worker counters) | ✅ (Tasks 6, 7) |
+| Tokio-parity benchmark suite exists | — | yes (2 scenarios) | ✅ (Task 15) |
+| Micro-benchmarks for submit/steal/wake exist | — | yes | ✅ (Tasks 2-4) |
+| CI advisory micro-bench job | — | yes | ✅ (Task 16) |
+
+**Net result on macro throughput: NEGATIVE.** Phase 2 (atomic + clock reductions) won
+~500 ns of submit p50. Phase 3 (per-worker park condvar with broadcast fallback) cost
+~1100 ns on the same path because the broadcast fires whenever the parked_workers
+counter shows a worker mid-transition. At 2 workers there's no shared-mutex contention
+to remove, so the regression dominates.
+
+**What's salvageable**: the measurement infrastructure (Phases 1 + 5), `timestamp_mode`,
+and per-worker counter consolidation are net wins regardless. Phase 3 (per-worker park)
+needs either a re-tune (drop the broadcast fallback in favor of one extra signal hop)
+or a revert before this branch should ship. The batch-steal infra (Tasks 9-10) is
+correctness-blocked behind Chase-Lev's single-item proof — true batch steal needs a
+different deque design.
+
 ## Micro: submit_latency (samples=100000, 1 worker, queue=101024, smp_allocator)
 
 | Phase | p50 (ns) | p95 (ns) | p99 (ns) | Notes |
