@@ -197,3 +197,39 @@ test "RingQueue: 1 owner + 4 stealers — no duplicates, no losses" {
     try std.testing.expectEqual(N, popped.load(.acquire) + stolen.load(.acquire));
     for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.acquire));
 }
+
+fn runQueueKindScenario(kind: thread_pool.QueueKind, total: u64) !void {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .queue_kind = kind,
+        .scheduler_variant = .work_stealing,
+        .steal_batch_size = if (kind == .ring) 8 else 1,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
+
+test "queue_kind matrix: chase_lev executes all submitted tasks" {
+    try runQueueKindScenario(.chase_lev, 50_000);
+}
+
+test "queue_kind matrix: ring executes all submitted tasks" {
+    try runQueueKindScenario(.ring, 50_000);
+}
