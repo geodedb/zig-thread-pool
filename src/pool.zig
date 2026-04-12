@@ -500,10 +500,28 @@ const Core = struct {
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
                 if (victim_index == worker_index) continue;
-                if (self.local_queues[victim_index].stealTop()) |descriptor_index| {
+                var stolen: [32]u32 = undefined;
+                const budget = @min(self.config.steal_batch_size, stolen.len);
+                const n = self.local_queues[victim_index].stealTopBatch(stolen[0..budget]);
+                if (n > 0) {
+                    // Keep the first for ourselves, push the rest to our local deque.
+                    // queued_tasks is decremented only for the item being returned for
+                    // immediate execution; items moved into the local deque remain queued
+                    // and decrement when later popped (matches the inject-queue drain
+                    // pattern above). Decrementing by `n` here would double-decrement
+                    // those items and cause queued_tasks to underflow, breaking shutdown.
+                    const first = stolen[0];
+                    for (stolen[1..n]) |idx| {
+                        if (!lq.tryPushBottom(idx)) {
+                            // Local deque full — put overflow on the inject queue so it isn't lost.
+                            _ = self.inject_queue.tryPush(idx);
+                        }
+                    }
                     self.decrementQueued();
-                    _ = worker.steals.fetchAdd(1, .release);
-                    return descriptor_index;
+                    _ = worker.steals.fetchAdd(n, .release);
+                    const local_len: u32 = @intCast(lq.len());
+                    updatePeakU32(&worker.local_queue_peak, local_len);
+                    return first;
                 }
             }
 

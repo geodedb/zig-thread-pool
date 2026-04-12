@@ -16,11 +16,12 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 
 ## Micro: steal_throughput (tasks=200000, 2 workers, inject_batch=1, smp_allocator)
 
-| Phase | ops/s | steals | steal_failures |
-|-------|-------|--------|----------------|
-| Phase 0 (baseline) | 686840 | 0 | 72154 |
-| Phase 2 (Task 7: per-worker steal/park counters) | 663352 | 0 | 78662 |
-| Phase 2 (Task 8: TaskDescriptor hot/cold split) | 1437441 | 0 | 120361 |
+| Phase | ops/s | steals | steal_failures | Notes |
+|-------|-------|--------|----------------|-------|
+| Phase 0 (baseline) | 686840 | 0 | 72154 | |
+| Phase 2 (Task 7: per-worker steal/park counters) | 663352 | 0 | 78662 | |
+| Phase 2 (Task 8: TaskDescriptor hot/cold split) | 1437441 | 0 | 120361 | |
+| Phase 3 (Task 10: batch-steal infra, default size=1) | 636735 | 0 | 101621 | wash — batch-steal default disabled due to popBottom race; infra ready for future deque rework |
 
 ## Micro: wake_latency (samples=5000, 2 workers, quiesce=300us, smp_allocator)
 

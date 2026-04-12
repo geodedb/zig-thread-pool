@@ -75,6 +75,14 @@ pub const Config = struct {
     /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
     timestamp_mode: TimestampMode = .full,
+    /// Maximum number of tasks a stealer takes from a single victim per steal
+    /// attempt.  Default: 1 (correct under Chase-Lev's single-item steal proof).
+    /// Values >1 use `WorkDeque.stealTopBatch` which is correct in isolation but
+    /// races with concurrent `popBottom` on the same victim — the race can
+    /// cause double-execution of a descriptor.  A future task replaces the deque
+    /// with a design (e.g. Tokio's split run/steal queues) that supports true
+    /// batch steal.
+    steal_batch_size: usize = 1,
 
     pub fn normalized(self: Config) Config {
         var cfg = self;
@@ -97,6 +105,7 @@ pub const Config = struct {
         if (cfg.queue_capacity != 0) {
             cfg.queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.queue_capacity) catch cfg.queue_capacity;
         }
+        cfg.steal_batch_size = std.math.clamp(cfg.steal_batch_size, 1, 32);
         return cfg;
     }
 
