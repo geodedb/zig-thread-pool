@@ -10,7 +10,7 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 |--------|----------------|-----------|------|
 | `conn_churn_seq/global_queue` throughput ≥ 5M ops/s | 1.48M | ~711K (median) | ❌ regressed |
 | `conn_churn_seq/work_stealing` throughput ≥ 3M ops/s | 648K | ~544K | ❌ regressed |
-| Submit p50 (single-producer) < 200 ns | 619 ns | ~1.8 µs | ❌ regressed |
+| Submit p50 (single-producer) < 200 ns | 619 ns | 781 ns (Phase A) | ❌ still above target; Phase A recovered the broadcast-fallback regression (~1.8 µs → 781 ns median of 5 runs); remaining gap addressed in Phase B |
 | Submit p99 (4 producers) < 1 µs | 6.7 µs | ~12.8 µs | ❌ regressed |
 | `producer_contention/*` completion p50 < 100 µs | 1.46 ms | 1.24 ms | ❌ marginal improvement only (queue never filled) |
 | Hot-path `nanoTimestamp()` calls per task | 3 | 1 (mandatory; 0 with `timestamp_mode=disabled`) | ✅ (Task 5) |
@@ -41,6 +41,7 @@ different deque design.
 | Phase 2 (per-worker started/completed) | 419 | 565 | 618 | Task 6: move started/completed counters per-worker to reduce hot-path contention (median of 8 runs; variance 365-538ns) |
 | Phase 2 (remove global steal/park counters) | 435 | 588 | 643 | Task 7: consolidate steals/steal_failures/parks to per-worker only (median of 5 runs; high variance 365-843ns — within noise) |
 | Phase 2 (TaskDescriptor hot/cold split) | 510 | 639 | 696 | Task 8: reorder fields so hot group (state/task_fn/ctx/options/generation) fits in one cache line (hot_size=64B, cache_line=128B); cold metric fields pushed behind. Single-run noise; wash vs Task 7. |
+| Phase A (park handshake simplification) | 781 | 1387 | 1690 | A1: removed parked_workers counter + broadcast fallback. A2: seq_cst handshake on is_parked + queued_tasks (median of 5 runs). |
 
 ## Micro: steal_throughput (tasks=200000, 2 workers, inject_batch=1, smp_allocator)
 
@@ -60,6 +61,7 @@ different deque design.
 | Phase 2 (Task 7: per-worker steal/park counters) | 10649 | 13016 | 16166 | |
 | Phase 2 (Task 8: TaskDescriptor hot/cold split) | 9267 | 11026 | 14400 | |
 | Phase 3 (Task 12: per-worker park condvar) | 12768 | 17140 | 21321 | median of 8 runs (10515, 12001, 12074, 12665, 12768, 13859, 13870, 14239, 14307 ns p50). Wake-bench is fixed at 2 workers where a shared park_mutex has ~zero contention, so this micro regresses here; the design removes an N-way mutex serialization point on submit and should pay off at higher worker counts — re-validate when macro adds many-worker scenarios. |
+| Phase A (park handshake simplification) | 9985 | 14080 | 17898 | median of 5 runs; single-signal path, no N-way broadcast. |
 
 ## Macro: conn_churn_seq (bench scenario, workers=2, queue=4096)
 
