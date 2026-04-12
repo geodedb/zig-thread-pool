@@ -130,6 +130,90 @@ The single-item steal improvement (+109%) and the recovered submit-latency
 mean the ring queue and park simplification are both net wins and should
 ship. The Tokio-parity 1M ops/s target is out of reach in this pass.
 
+## Phase E: Steal-Scan Bitmap (negative result — REVERTED)
+
+**Hypothesis:** The Phase D `perf record` profile attributed 42.1% of
+`flood_1m` cumulative cycles to the O(N²) sibling-peek steal scan in
+`nextTask`. Phase E replaced that scan with an O(1) bitmap-driven scan:
+`Core.non_empty_workers: std.atomic.Value(u64)` with one bit per worker,
+set on owner push, cleared with Tokio-style re-check on pop-to-empty and
+steal-drain. See
+`docs/superpowers/specs/2026-04-12-steal-scan-bitmap-design.md` and
+`docs/superpowers/plans/2026-04-12-steal-scan-bitmap.md`.
+
+Targets: flood_1m ≥ 700K ops/s, cache-miss ≤ 8%.
+
+**Measured (median of 5 runs, ReleaseFast, 56-core host):**
+
+| Metric | Phase C | Phase E (measured) | Delta |
+|---|---:|---:|---:|
+| `bench_tokio_parity/flood_1m` ops/s | 340K | **322K** | **-5%** |
+| `bench_tokio_parity/contended_spawn_8x` ops/s | 534K | 550K | +3% (noise) |
+| submit p50 | 917 ns | 529 ns | -42% (see caveat) |
+| submit p99 | 1690 ns | 762 ns | -55% (see caveat) |
+| `perf stat` cache-miss rate | 34.1% | 35.9% | slightly worse |
+| `perf stat` IPC | 0.19 | 0.14 | slightly worse |
+| Context-switches / 1M tasks | ~1.0M | ~878K | unchanged |
+| `test-stress` 5× consecutive | pass | pass | no hang |
+
+Rollback floor was `flood_1m < 550K` → triggered. Behavior-change commits
+(Tasks 2-6: bitmap infrastructure, all three bit-update sites, scan
+rewrite) were reset out. Retained: Task 1 (`error.TooManyWorkers` cap at
+`max_threads > 64` — a defensive guard that's independently useful)
+and Tasks 7-8 (a racing-threads bitmap-invariant unit test and a
+wide-pool flood stress test — both exercise the scheduler without
+reading the bitmap directly, so they remain valid regression guards).
+
+### Why the profile misled us
+
+The Phase D profile counted cumulative cycles across all 56 workers.
+Reclaiming 42% of that cumulative cost does not translate to 42% fewer
+wall-clock seconds when workers are not the critical path — `flood_1m`
+is driven by a single submitter + N drainers with ~1 context-switch per
+task. Context-switch count barely moved (1.0M → 0.878M), confirming
+the park/unpark path is the hard floor. The bitmap maintenance overhead
+(`fetchOr` on every push, `fetchAnd` + re-check on every drain edge)
+slightly offsets the scan savings, producing a small regression on the
+macro workload.
+
+### Caveat on submit-latency improvement
+
+`bench-micro-submit` shows a dramatic p50/p99 improvement (917 → 529 ns
+and 1690 → 762 ns), larger than the code change should produce. Two
+possibilities: (a) real side effect of reduced cross-core atomic
+contention, or (b) environmental noise between measurement sessions
+(the bench-micro-submit harness runs with a single worker — no siblings
+to scan — so the bitmap is trivially inert in that path). The sign is
+directionally positive but the magnitude is not trustworthy without
+re-verification.
+
+### Lessons learned
+
+1. **Cumulative-time profiles mislead when workers aren't the critical
+   path.** A wall-clock measurement of the specific contended path
+   (single submitter, N drainers) would have shown park/unpark as the
+   dominant cost before we wrote any code.
+2. **The steal-scan cost was real but not load-bearing.** Reclaiming it
+   without addressing park/unpark produces workers that find work faster
+   and then park faster — throughput is unchanged because park frequency
+   dominates.
+3. The bitmap infrastructure was correct (passed 5/5 stress runs, no
+   hangs, no lost tasks). It could be re-landed alongside a Phase F
+   park/unpark fix if the maintenance cost stops being a net loss once
+   workers park less. For now: YAGNI, reverted.
+
+### Follow-up priority order
+
+Unchanged from Phase D:
+
+1. **Phase F: park/unpark path.** ~17% of Phase D cycles; now the dominant
+   remaining cost after the scan was addressed. Options: keep-alive spin
+   window on recent-submit workers, notify-coalescing, or event-based
+   worker wakes. Must be evaluated with a wall-clock profile of the
+   single-submitter flood scenario, not cumulative.
+2. Phase G: inject queue + descriptor pool.
+3. Phase H: worker-local allocation / cache locality.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
