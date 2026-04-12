@@ -8,8 +8,8 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 
 | Target | v0.2.0 baseline | After plan | Met? |
 |--------|----------------|-----------|------|
-| `conn_churn_seq/global_queue` throughput ≥ 5M ops/s | 1.48M | ~711K (median) | ❌ regressed |
-| `conn_churn_seq/work_stealing` throughput ≥ 3M ops/s | 648K | ~544K | ❌ regressed |
+| `conn_churn_seq/global_queue` throughput ≥ 5M ops/s | 1.48M | ~817K (Phase A+B baseline; not re-measured in B7; see C2 for final verdict) | ❌ regressed |
+| `conn_churn_seq/work_stealing` throughput ≥ 3M ops/s | 648K | ~763K (Phase A+B baseline; not re-measured in B7; see C2 for final verdict) | ❌ regressed |
 | Submit p50 (single-producer) < 200 ns | 619 ns | 781 ns (Phase A) | ❌ still above target; Phase A recovered the broadcast-fallback regression (~1.8 µs → 781 ns median of 5 runs); remaining gap addressed in Phase B |
 | Submit p99 (4 producers) < 1 µs | 6.7 µs | ~12.8 µs | ❌ regressed |
 | `producer_contention/*` completion p50 < 100 µs | 1.46 ms | 1.24 ms | ❌ marginal improvement only (queue never filled) |
@@ -18,6 +18,8 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Tokio-parity benchmark suite exists | — | yes (2 scenarios) | ✅ (Task 15) |
 | Micro-benchmarks for submit/steal/wake exist | — | yes | ✅ (Tasks 2-4) |
 | CI advisory micro-bench job | — | yes | ✅ (Task 16) |
+| `bench_tokio_parity/flood_1m` ≥ 1M ops/s | 297K | 347K (Phase A+B median of 3) | ❌ BELOW TARGET — 346K ops/s; 65% gap remains |
+| `bench_tokio_parity/contended_spawn_8x` ≥ 1M ops/s | 497K | 508K (Phase A+B median of 3) | ❌ BELOW TARGET — 508K ops/s; 49% gap remains |
 
 **Net result on macro throughput: NEGATIVE.** Phase 2 (atomic + clock reductions) won
 ~500 ns of submit p50. Phase 3 (per-worker park condvar with broadcast fallback) cost
@@ -90,5 +92,9 @@ Numbers from `zig build bench-tokio-parity`. Directly comparable to Tokio's
 |----------|-------|-------|-----------|-------|
 | flood_1m | 297151 | 1000000 | 1 | Pure throughput; backpressure=block exercises the condvar path because 1M tasks > 4096 queue capacity, so submitter blocks repeatedly waiting for workers to drain |
 | contended_spawn_8x | 496883 | 100000 | 8 | Multi-producer contention; 8 submitter threads + cpu_count workers |
+| flood_1m (Phase A+B) | 346772 | 1000000 | 1 | Park handshake simplified; ring queue batch-steal=8; median of 3 runs |
+| contended_spawn_8x (Phase A+B) | 507753 | 100000 | 8 | Park handshake simplified; ring queue batch-steal=8; median of 3 runs |
 
 For reference, Tokio's `rt_multi_threaded` flood-equivalent typically runs 5–15M ops/s on similar hardware. Our gap is the work the remaining tasks (true batch-steal via deque rework, hot-path atomic reductions beyond Phase 2) target.
+
+**WARNING: Both Phase A+B Tokio-parity numbers (346K and 508K ops/s) are below the 1M ops/s target.** The RingQueue swap and park simplification together yield only a ~17% improvement on flood_1m (297K→347K) and ~2% on contended_spawn_8x (497K→508K). The bottleneck is the backpressure condvar path that fires on every queue-full event: with 1M tasks and a 4096-capacity queue, the submitter blocks ~244 times, each block paying a full condvar wait+signal round-trip. Phase C should investigate reducing condvar overhead on the backpressure path or increasing effective throughput via larger inject batches.
