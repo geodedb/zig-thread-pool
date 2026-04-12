@@ -120,6 +120,14 @@ pub fn build(b: *std.Build) void {
     const micro_submit_step = b.step("bench-micro-submit", "Micro-benchmark: submit latency");
     micro_submit_step.dependOn(&run_micro_submit.step);
 
+    const micro_steal = b.addExecutable(.{
+        .name = "thread-pool-micro-steal",
+        .root_module = importedModule(b, "benchmarks/micro/steal_throughput.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_steal = b.addRunArtifact(micro_steal);
+    const micro_steal_step = b.step("bench-micro-steal", "Micro-benchmark: steal throughput");
+    micro_steal_step.dependOn(&run_micro_steal.step);
+
     const tools_step = b.step("tools", "Build benchmark tooling");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);
