@@ -282,6 +282,50 @@ Unchanged from Phase D:
 2. Phase G: inject queue + descriptor pool.
 3. Phase H: worker-local allocation / cache locality.
 
+## Phase F1: Hot-Spin Wake Elimination (negative result — REVERTED, A/B gate caught it)
+
+**Hypothesis:** A wall-clock `perf sched record` profile (2026-04-12) identified the submitter at 89% CPU-bound with ~50% of cycles in the `futex_wake` chain inside `enqueueTask`. An A/B-disable experiment (stub the wake block to a no-op) lifted `flood_1m` from 335K → 506K (+51%) — proving the wake path was a real, addressable ceiling. Phase F1 attempted to capture most of that ceiling by adding `Core.active_spinners: std.atomic.Value(u32)`, bracketing the existing `idle()` spin phase with `fetchAdd`/`fetchSub`, and making `enqueueTask` skip the `is_parked[]` scan + `futex_wake` when `active_spinners > 0`. See `docs/superpowers/specs/2026-04-12-phase-f-hot-spin-wake-design.md` and `docs/superpowers/plans/2026-04-12-phase-f-hot-spin-wake.md`.
+
+### Measured (median of 3, ReleaseFast, 56-core host)
+
+| Metric | Baseline | Phase F1 (default) | Phase F1 (spin=0 A/B) |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 335K | **383K** | **386K** |
+| `contended_spawn_8x` ops/s | 534K | 568K (mean of 3) | 575K (mean of 3) |
+
+The F1 configuration and the spin=0 A/B are **within noise of each other**. Disabling the spin phase (so workers can never be caught in the "hot-spin" window) did not regress throughput. That proves the `active_spinners > 0` short-circuit in `enqueueTask` was firing ~never: the mechanic was dead code at runtime.
+
+### Why the mechanic didn't engage
+
+Workers are 73% parked during `flood_1m` (per the same perf sched profile). The `idle()` spin phase runs `spin_before_park_iters = 128` iterations × ~1 ns each = **~128 ns**. Inter-submit interval at ~337K ops/s is **~3 µs** — 20× longer than the spin window. The probability that the submitter's `active_spinners.load` observes a non-zero value is negligible; the submitter almost always takes the cold path (full `is_parked` scan + `park_cond.signal` + `futex_wake`), exactly as before. The ~14% throughput movement (335K → 383K) is noise floor / micro-architectural chance, not a Phase F1 win.
+
+### A/B gate worked — keep doing this
+
+Phases D and E both shipped, merged, and documented negative results because the plans committed code before measuring whether the target was engaging. **Phase F1's spec required an A/B-disable measurement before acceptance**, and the gate correctly refused to sign off: the default config and `spin_before_park_iters = 0` produced indistinguishable results. Total cost: 4 commits on a feature branch, never merged, caught in ~15 minutes of measurement after the mechanic was in place.
+
+This is the methodology succeeding. A failing phase was pre-empted before it reached main.
+
+### What was kept
+
+- `tests/unit.zig` — `active_spinners: counter stays non-negative under concurrent workers`. Exercises `spin_before_park_iters = 8` to stress every exit path of `idle()`'s spin loop, submits 40K tasks + a trailing single task. Independently useful as a scheduler stress probe regardless of whether `active_spinners` exists; retained as a permanent regression guard.
+
+All behavior-change commits (infrastructure field, worker maintenance, submitter skip-wake, ordering tweak) were reset out of the feature branch before merge.
+
+### Next attempts (design directions, not yet planned)
+
+The underlying problem — `active_spinners` is 0 at submit time because workers park too quickly — has two correctness-neutral fixes:
+
+1. **F1a: longer spin.** Increase `spin_before_park_iters` dramatically (e.g., ~16K iterations, ~16 µs spin). Workers overlap submits and `active_spinners > 0` becomes frequently true. Trade-off: idle CPU burn in scenarios with no work. Unacceptable for a real no-op workload (56 workers × 100% CPU).
+2. **F1b: reserved hot-spin workers.** A small number (1–2) of workers never park; the rest park normally. Submitter can rely on the hot-spinners being catchable. Trade-off: fixed CPU cost regardless of load — but we're already burning those cycles on futex_wake, so net CPU may be flat or down.
+
+Both require a new spec + fresh A/B ceiling measurement before planning.
+
+### Lessons learned
+
+1. **A/B-disable before acceptance, every phase.** Phase F's spec made this a rule; the rule paid out on the first attempt.
+2. **A/B must target the mechanic under measurement, not just the suspected bottleneck.** The pre-planning A/B (stub the wake block) validated the target (wake path). The post-implementation A/B (spin=0) validated the mechanic (spin → skip-wake → throughput). Both are needed — a valid target with an ineffective mechanic still produces zero gain.
+3. **Probability-of-engagement matters.** The design assumed workers would "often" be spinning at submit time without quantifying "often." Ratio of (spin window duration) : (inter-submit interval) is the correct figure of merit; when it's < 1, the mechanic effectively never fires.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
