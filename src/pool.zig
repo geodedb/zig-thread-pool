@@ -123,7 +123,6 @@ const Counters = struct {
     _pad1: [cache_line_size - 2 * field_size]u8 = undefined,
 
     // === Diagnostic/cold counters ===
-    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queue_depth_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     task_desc_live: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -396,7 +395,6 @@ const Core = struct {
             .completed = aggregate_completed,
             .cancelled = self.counters.cancelled.load(.acquire),
             .active_tasks = self.counters.active_tasks.load(.acquire),
-            .parked_workers = self.counters.parked_workers.load(.acquire),
             .queue_depth_current = self.counters.queued_tasks.load(.acquire),
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
             .steals = aggregate_steals,
@@ -482,53 +480,29 @@ const Core = struct {
         _ = self.counters.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
 
-        // Wake one parked worker. Round-robin on submit count to spread load
-        // across workers. Per-worker park primitives avoid the N-way mutex
-        // contention a shared park_mutex would create on the submit path.
-        //
-        // Correctness note: parked_workers is incremented under the target
-        // worker's park_mutex BEFORE the worker re-checks queued_tasks. We
-        // push the task and increment queued_tasks BEFORE loading
-        // parked_workers here. So if submitter observes parked_workers > 0,
-        // either (a) the worker has already finished its re-check and will
-        // enter timedWait without seeing our task — in which case our signal
-        // on its park_mutex/cond will deliver — or (b) the worker is still
-        // holding its park_mutex between parked_workers++ and the re-check,
-        // in which case our lock() will block until it either bails (no
-        // signal needed) or enters timedWait (our signal delivers).
-        //
-        // is_parked is an optimisation: when set we can skip workers that
-        // definitely aren't parked. When we observe parked_workers > 0 but
-        // no is_parked == 1 (worker is mid-transition), fall back to
-        // signalling the hinted worker under its park_mutex — this
-        // guarantees correctness at the cost of one extra futex syscall
-        // in the rare race window.
-        if (self.counters.parked_workers.load(.monotonic) > 0) {
-            const submitted = self.counters.submitted.load(.monotonic);
-            const hint_idx: usize = @intCast(submitted % self.workers.len);
-            var off: usize = 0;
-            var signalled = false;
-            while (off < self.workers.len) : (off += 1) {
-                const idx = (hint_idx + off) % self.workers.len;
-                const w = &self.workers[idx];
-                if (w.is_parked.load(.acquire) == 1) {
-                    w.park_mutex.lock();
+        // Wake one parked worker. Scan `is_parked` across workers starting at a
+        // round-robin offset so load spreads across the pool. The submit-before-park
+        // handshake (see idle()) guarantees: if any worker is about to miss this
+        // task because it's heading to park, its `is_parked := 1` store is ordered
+        // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
+        // and signal it, OR the worker reloads `queued_tasks` and sees our push —
+        // no lost wakeup. No broadcast fallback is needed.
+        const submitted = self.counters.submitted.load(.monotonic);
+        const hint_idx: usize = @intCast(submitted % self.workers.len);
+        var off: usize = 0;
+        while (off < self.workers.len) : (off += 1) {
+            const idx = (hint_idx + off) % self.workers.len;
+            const w = &self.workers[idx];
+            if (w.is_parked.load(.seq_cst) == 1) {
+                w.park_mutex.lock();
+                // Re-check under the mutex: the worker may have unparked between our
+                // load and this acquire. The signal is a no-op if it isn't parked —
+                // but we do not want to hold the mutex for a worker that is running.
+                if (w.is_parked.load(.monotonic) == 1) {
                     w.park_cond.signal();
-                    w.park_mutex.unlock();
-                    signalled = true;
-                    break;
                 }
-            }
-            if (!signalled) {
-                // Race-window fallback: broadcast to all workers. This is
-                // rare (only when a worker is between parked_workers++ and
-                // is_parked := 1), and broadcasting is cheap since at most
-                // a handful of workers exist.
-                for (self.workers) |*w| {
-                    w.park_mutex.lock();
-                    w.park_cond.signal();
-                    w.park_mutex.unlock();
-                }
+                w.park_mutex.unlock();
+                break;
             }
         }
 
@@ -720,9 +694,7 @@ const Core = struct {
         _ = worker.parks.fetchAdd(1, .release);
 
         worker.park_mutex.lock();
-        _ = self.counters.parked_workers.fetchAdd(1, .monotonic);
         if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
-            _ = self.counters.parked_workers.fetchSub(1, .monotonic);
             worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
@@ -730,15 +702,9 @@ const Core = struct {
         // Mark parked *before* waiting. The mutex is held, so any submitter
         // that observes is_parked == 1 will block on park_mutex until we
         // enter timedWait (which atomically releases the mutex and waits).
-        // Submitters that arrive before we set is_parked will have already
-        // observed parked_workers == 0 (or a different worker) and signalled
-        // that one; if they observed parked_workers > 0 but no worker has
-        // is_parked == 1 yet, the task is visible via queued_tasks and our
-        // double-check above handled it.
         worker.is_parked.store(1, .release);
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
         worker.is_parked.store(0, .release);
-        _ = self.counters.parked_workers.fetchSub(1, .monotonic);
         worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .release);
 

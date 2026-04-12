@@ -519,6 +519,12 @@ test "Stats.started and .completed aggregate from per-worker counters" {
     try std.testing.expectEqual(@as(u64, 64), stats.completed);
 }
 
+test "runtime_stats omits parked_workers counter after simplification" {
+    // Compile-time assertion: RuntimeStats (types.Stats) must NOT have
+    // a `parked_workers` field after this refactor.
+    comptime std.debug.assert(!@hasField(thread_pool.types.Stats, "parked_workers"));
+}
+
 test "backpressure block policy returns when capacity frees" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 1,

@@ -230,7 +230,6 @@ pub const Stats = struct {
     completed: u64 = 0,
     cancelled: u64 = 0,
     active_tasks: u64 = 0,
-    parked_workers: u64 = 0,
     queue_depth_current: u64 = 0,
     queue_depth_peak: u64 = 0,
     steals: u64 = 0,
