@@ -550,10 +550,19 @@ const Core = struct {
         var queued = false;
         if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
             const wi = tls_worker_index.?;
-            queued = self.local_queues[wi].tryPushBottom(descriptor_index);
-            if (queued) {
-                const local_len = @as(u32, @intCast(self.local_queues[wi].len()));
-                updatePeakU32(&self.workers[wi].local_queue_peak, local_len);
+            // Try the LIFO slot first. Owner-only write; if the slot is empty,
+            // a plain store is sufficient — no stealer writes to this slot.
+            // If the slot is full, fall through to the local ring.
+            const w = &self.workers[wi];
+            if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
+                w.lifo_slot.store(descriptor_index, .release);
+                queued = true;
+            } else {
+                queued = self.local_queues[wi].tryPushBottom(descriptor_index);
+                if (queued) {
+                    const local_len = @as(u32, @intCast(self.local_queues[wi].len()));
+                    updatePeakU32(&w.local_queue_peak, local_len);
+                }
             }
         }
         if (!queued) {
@@ -625,6 +634,14 @@ const Core = struct {
         var lq = &self.local_queues[worker_index];
 
         if (self.config.scheduler_variant == .work_stealing) {
+            // LIFO slot first: owner-only swap-to-empty. Most-recently-submitted
+            // task runs next. This is the hot path for "task spawns task".
+            const cached = worker.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
+            if (cached != LIFO_SLOT_EMPTY) {
+                self.decrementQueued();
+                return cached;
+            }
+
             if (lq.popBottom()) |descriptor_index| {
                 self.decrementQueued();
                 return descriptor_index;
@@ -824,6 +841,14 @@ const Core = struct {
             self.cancelDescriptor(descriptor_index);
         }
         if (self.config.scheduler_variant == .work_stealing) {
+            // Drain LIFO slots too.
+            for (self.workers) |*w| {
+                const cached = w.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
+                if (cached != LIFO_SLOT_EMPTY) {
+                    self.decrementQueued();
+                    self.cancelDescriptor(cached);
+                }
+            }
             for (self.local_queues) |*lq| {
                 while (lq.stealOne()) |descriptor_index| {
                     self.decrementQueued();
