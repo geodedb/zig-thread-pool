@@ -305,7 +305,7 @@ test "concurrent push-pop-steal does not lose or duplicate items" {
     try std.testing.expectEqual(total_items, total_recovered);
 }
 
-test "Stats.wakeups reflects worker wakeup activity" {
+test "Stats.wakeups aggregates from per-worker counters" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 2,
         .queue_capacity = 64,
@@ -319,9 +319,18 @@ test "Stats.wakeups reflects worker wakeup activity" {
     }
     wg.wait();
 
-    // Workers must have been woken at least once to process tasks
+    // Pool-level wakeups must equal the sum of per-worker wakeups. This is
+    // the correctness invariant Q-022 fixed: the pool-level counter was
+    // previously never incremented while workers did increment their own.
+    // The actual value may be zero under ReleaseFast when workers never
+    // needed to park (8 trivial tasks finish before the idle threshold),
+    // so we only assert the aggregation invariant, not a minimum count.
     const stats = pool.statsSnapshot();
-    try std.testing.expect(stats.wakeups > 0);
+    var expected: u64 = 0;
+    for (stats.worker_stats) |w| {
+        expected += w.wakeups;
+    }
+    try std.testing.expectEqual(expected, stats.wakeups);
 }
 
 test "fuzz BoundedRing push/pop consistency" {

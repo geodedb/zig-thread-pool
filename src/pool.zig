@@ -290,7 +290,10 @@ const Core = struct {
     }
 
     pub fn statsSnapshot(self: *Core) types.Stats {
+        var aggregate_wakeups: u64 = 0;
         for (self.workers, 0..) |*worker, idx| {
+            const w_wakeups = worker.wakeups.load(.acquire);
+            aggregate_wakeups += w_wakeups;
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
                 .busy_ns = worker.busy_ns.load(.acquire),
@@ -298,7 +301,7 @@ const Core = struct {
                 .local_queue_depth = @as(u32, @intCast(self.local_queues[idx].len())),
                 .local_queue_peak = worker.local_queue_peak.load(.acquire),
                 .parks = worker.parks.load(.acquire),
-                .wakeups = worker.wakeups.load(.acquire),
+                .wakeups = w_wakeups,
                 .steals = worker.steals.load(.acquire),
                 .steal_failures = worker.steal_failures.load(.acquire),
                 .scratch_current_bytes = @as(u64, @intCast(worker.scratch.bytesCurrent())),
@@ -326,13 +329,7 @@ const Core = struct {
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
             .steals = self.counters.steals.load(.acquire),
             .steal_failures = self.counters.steal_failures.load(.acquire),
-            .wakeups = blk: {
-                var total: u64 = 0;
-                for (self.workers) |*w| {
-                    total += w.wakeups.load(.acquire);
-                }
-                break :blk total;
-            },
+            .wakeups = aggregate_wakeups,
             .parks = self.counters.parks.load(.acquire),
             .task_desc_live = self.counters.task_desc_live.load(.acquire),
             .task_desc_peak = self.counters.task_desc_peak.load(.acquire),
