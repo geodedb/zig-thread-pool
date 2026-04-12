@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
 const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
+const RingQueue = @import("queue/ring_queue.zig").RingQueue;
 const WorkerScratch = @import("memory/scratch.zig").WorkerScratch;
 const Accounting = @import("memory/scratch.zig").Accounting;
 const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
@@ -44,15 +45,100 @@ const PoolState = enum(u8) {
     stopped,
 };
 
+/// Tagged-union wrapper over the two per-worker local queue implementations.
+/// Selected per-pool via `Config.queue_kind`. All call sites dispatch through
+/// the unified methods (tryPushBottom, popBottom, steal, stealOne, len,
+/// capacity) so the rest of `Core` is queue-kind agnostic.
+const LocalQueue = union(enum) {
+    chase_lev: WorkDeque(u32),
+    ring: RingQueue(u32),
+
+    fn init(allocator: std.mem.Allocator, size: usize, kind: types.QueueKind) !LocalQueue {
+        return switch (kind) {
+            .chase_lev => .{ .chase_lev = try WorkDeque(u32).init(allocator, size) },
+            .ring => .{ .ring = try RingQueue(u32).init(allocator, size) },
+        };
+    }
+
+    fn deinit(self: *LocalQueue) void {
+        switch (self.*) {
+            .chase_lev => |*q| q.deinit(),
+            .ring => |*q| q.deinit(),
+        }
+    }
+
+    fn tryPushBottom(self: *LocalQueue, value: u32) bool {
+        return switch (self.*) {
+            .chase_lev => |*q| q.tryPushBottom(value),
+            .ring => |*q| q.tryPush(value),
+        };
+    }
+
+    fn popBottom(self: *LocalQueue) ?u32 {
+        return switch (self.*) {
+            .chase_lev => |*q| q.popBottom(),
+            .ring => |*q| q.pop(),
+        };
+    }
+
+    /// Steal up to `out.len` items. For chase_lev returns at most 1; for
+    /// ring returns up to (len+1)/2 items via stealHalf.
+    fn steal(self: *LocalQueue, out: []u32) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| if (q.stealTop()) |v| blk: {
+                out[0] = v;
+                break :blk @as(usize, 1);
+            } else 0,
+            .ring => |*q| q.stealHalf(out),
+        };
+    }
+
+    /// Single-item drain — used by shutdown to cancel pending tasks.
+    fn stealOne(self: *LocalQueue) ?u32 {
+        return switch (self.*) {
+            .chase_lev => |*q| q.stealTop(),
+            .ring => |*q| blk: {
+                var buf: [1]u32 = undefined;
+                if (q.stealHalf(buf[0..]) == 1) break :blk buf[0];
+                break :blk null;
+            },
+        };
+    }
+
+    fn len(self: *LocalQueue) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| q.len(),
+            .ring => |*q| q.len(),
+        };
+    }
+
+    fn capacity(self: *LocalQueue) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| q.capacity(),
+            .ring => |*q| q.capacity(),
+        };
+    }
+};
+
 const TaskDescriptor = struct {
-    generation: u64 = 0,
+    // === Hot fields (read on every dispatch and complete) ===
     state: std.atomic.Value(types.TaskState) = std.atomic.Value(types.TaskState).init(.free),
     task_fn: ?TaskFn = null,
     ctx: ?*anyopaque = null,
     options: types.SubmitOptions = .{},
+    generation: u64 = 0,
+
+    // === Cold fields (metrics/observability only) ===
     submit_ns: u64 = 0,
     start_ns: u64 = 0,
     complete_ns: u64 = 0,
+
+    comptime {
+        // Document the intended cache layout: ensure the hot fields fit in
+        // one cache line so dispatch never touches the cold metric fields.
+        const hot_size = @offsetOf(TaskDescriptor, "submit_ns");
+        std.debug.assert(hot_size <= std.atomic.cache_line);
+    }
 };
 
 const Worker = struct {
@@ -67,16 +153,32 @@ const Worker = struct {
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    started: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_idle_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scratch_init_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    park_mutex: std.Thread.Mutex = .{},
+    park_cond: std.Thread.Condition = .{},
+    /// 1 when this worker is parked, 0 otherwise. Fast-path check before
+    /// acquiring park_mutex during signal — saves a futex syscall when the
+    /// worker isn't actually parked.
+    is_parked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 };
 
-/// Synchronization primitives for task completion and worker parking.
+/// Synchronization primitives for task completion. Worker parking uses
+/// per-Worker park_mutex/park_cond to avoid contention on a shared mutex.
 const Sync = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
-    park_mutex: std.Thread.Mutex = .{},
-    park_cond: std.Thread.Condition = .{},
+    /// Backpressure primitives: blocked submitters (when queue/descriptor
+    /// pool is full) sleep on `backpressure_cond` rather than polling with
+    /// a fixed-interval `Thread.sleep`. `releaseDescriptor` signals the
+    /// condvar when capacity becomes available. `backpressure_waiters` is
+    /// an atomic fast-path counter so the producer path can skip acquiring
+    /// `backpressure_mutex` entirely when nobody is blocked.
+    backpressure_mutex: std.Thread.Mutex = .{},
+    backpressure_cond: std.Thread.Condition = .{},
+    backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
@@ -93,17 +195,11 @@ const Counters = struct {
 
     // === Hot write group (worker path) ===
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    started: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     cancelled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    _pad1: [cache_line_size - 4 * field_size]u8 = undefined,
+    _pad1: [cache_line_size - 2 * field_size]u8 = undefined,
 
     // === Diagnostic/cold counters ===
-    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    parks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queue_depth_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     task_desc_live: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     task_desc_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -120,7 +216,7 @@ const Core = struct {
     accounting: Accounting = undefined,
     state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
     workers: []Worker,
-    local_queues: []WorkDeque(u32),
+    local_queues: []LocalQueue,
     descriptors: []TaskDescriptor,
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -137,7 +233,7 @@ const Core = struct {
             .allocator = allocator,
             .config = normalized,
             .workers = try allocator.alloc(Worker, normalized.max_threads),
-            .local_queues = try allocator.alloc(WorkDeque(u32), normalized.max_threads),
+            .local_queues = try allocator.alloc(LocalQueue, normalized.max_threads),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
@@ -154,7 +250,7 @@ const Core = struct {
         };
 
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
-        self.recordOwnedAlloc(self.local_queues.len * @sizeOf(WorkDeque(u32)));
+        self.recordOwnedAlloc(self.local_queues.len * @sizeOf(LocalQueue));
         self.recordOwnedAlloc(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
@@ -174,7 +270,7 @@ const Core = struct {
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
         for (self.workers, self.local_queues) |*worker, *lq| {
-            lq.* = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity);
+            lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
@@ -266,7 +362,12 @@ const Core = struct {
             const active = self.counters.active_tasks.load(.acquire);
             if (queued == 0 and active == 0) break;
             if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
-            std.Thread.sleep(100_000);
+
+            // Wait on the backpressure condvar, which releaseDescriptor signals on
+            // every completion. Cap at 10ms so we re-check state even if a signal
+            // is lost. Reuse waitForCapacity to avoid code duplication and register
+            // as a waiter so releaseDescriptor takes the signal fast-path.
+            self.waitForCapacity(deadline);
         }
 
         self.joinAllWorkers();
@@ -275,9 +376,18 @@ const Core = struct {
     fn joinAllWorkers(self: *Core) void {
         // Signal all workers to exit
         self.state.store(.stopping, .release);
-        self.sync.park_mutex.lock();
-        self.sync.park_cond.broadcast();
-        self.sync.park_mutex.unlock();
+        // Wake every worker so they observe the state change and exit.
+        for (self.workers) |*w| {
+            w.park_mutex.lock();
+            w.park_cond.broadcast();
+            w.park_mutex.unlock();
+        }
+        // Wake any submitters blocked on backpressure so they observe the
+        // state change and return error.ShutdownInProgress instead of
+        // sleeping forever.
+        self.sync.backpressure_mutex.lock();
+        self.sync.backpressure_cond.broadcast();
+        self.sync.backpressure_mutex.unlock();
 
         // Join all threads
         for (self.workers) |*worker| {
@@ -289,21 +399,58 @@ const Core = struct {
         self.state.store(.stopped, .release);
     }
 
+    /// Wait for descriptor/queue capacity to free up, bounded by `deadline`
+    /// (absolute nanoseconds; 0 = no deadline). Cap each wait at 10ms so we
+    /// re-check state periodically even if a signal is missed.
+    fn waitForCapacity(self: *Core, deadline: u64) void {
+        _ = self.sync.backpressure_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.sync.backpressure_waiters.fetchSub(1, .monotonic);
+
+        self.sync.backpressure_mutex.lock();
+        defer self.sync.backpressure_mutex.unlock();
+
+        const wait_ns: u64 = if (deadline != 0) blk: {
+            const now = nowNs();
+            break :blk if (now >= deadline) 0 else @min(deadline - now, 10_000_000);
+        } else 10_000_000;
+
+        if (wait_ns > 0) {
+            self.sync.backpressure_cond.timedWait(&self.sync.backpressure_mutex, wait_ns) catch {};
+        }
+    }
+
     pub fn statsSnapshot(self: *Core) types.Stats {
         var aggregate_wakeups: u64 = 0;
+        var aggregate_started: u64 = 0;
+        var aggregate_completed: u64 = 0;
+        var aggregate_steals: u64 = 0;
+        var aggregate_steal_failures: u64 = 0;
+        var aggregate_parks: u64 = 0;
         for (self.workers, 0..) |*worker, idx| {
             const w_wakeups = worker.wakeups.load(.acquire);
+            const w_started = worker.started.load(.acquire);
+            const w_completed = worker.completed.load(.acquire);
+            const w_steals = worker.steals.load(.acquire);
+            const w_steal_failures = worker.steal_failures.load(.acquire);
+            const w_parks = worker.parks.load(.acquire);
             aggregate_wakeups += w_wakeups;
+            aggregate_started += w_started;
+            aggregate_completed += w_completed;
+            aggregate_steals += w_steals;
+            aggregate_steal_failures += w_steal_failures;
+            aggregate_parks += w_parks;
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
                 .busy_ns = worker.busy_ns.load(.acquire),
                 .idle_ns = worker.idle_ns.load(.acquire),
                 .local_queue_depth = @as(u32, @intCast(self.local_queues[idx].len())),
                 .local_queue_peak = worker.local_queue_peak.load(.acquire),
-                .parks = worker.parks.load(.acquire),
+                .parks = w_parks,
                 .wakeups = w_wakeups,
-                .steals = worker.steals.load(.acquire),
-                .steal_failures = worker.steal_failures.load(.acquire),
+                .steals = w_steals,
+                .steal_failures = w_steal_failures,
+                .started = w_started,
+                .completed = w_completed,
                 .scratch_current_bytes = @as(u64, @intCast(worker.scratch.bytesCurrent())),
                 .scratch_peak_bytes = @as(u64, @intCast(worker.scratch.bytesPeak())),
             };
@@ -320,17 +467,16 @@ const Core = struct {
 
         return .{
             .submitted = self.counters.submitted.load(.acquire),
-            .started = self.counters.started.load(.acquire),
-            .completed = self.counters.completed.load(.acquire),
+            .started = aggregate_started,
+            .completed = aggregate_completed,
             .cancelled = self.counters.cancelled.load(.acquire),
             .active_tasks = self.counters.active_tasks.load(.acquire),
-            .parked_workers = self.counters.parked_workers.load(.acquire),
             .queue_depth_current = self.counters.queued_tasks.load(.acquire),
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
-            .steals = self.counters.steals.load(.acquire),
-            .steal_failures = self.counters.steal_failures.load(.acquire),
+            .steals = aggregate_steals,
+            .steal_failures = aggregate_steal_failures,
             .wakeups = aggregate_wakeups,
-            .parks = self.counters.parks.load(.acquire),
+            .parks = aggregate_parks,
             .task_desc_live = self.counters.task_desc_live.load(.acquire),
             .task_desc_peak = self.counters.task_desc_peak.load(.acquire),
             .total_alloc_bytes = self.counters.total_alloc_bytes.load(.acquire),
@@ -366,7 +512,7 @@ const Core = struct {
                 error.QueueFull, error.TaskPoolExhausted => {
                     if (!allow_block or options.backpressure == .return_error) return err;
                     if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
-                    std.Thread.sleep(50_000);
+                    self.waitForCapacity(deadline);
                 },
                 else => return err,
             }
@@ -385,7 +531,7 @@ const Core = struct {
         descriptor.task_fn = task_fn;
         descriptor.ctx = ctx;
         descriptor.options = options;
-        descriptor.submit_ns = nowNs();
+        descriptor.submit_ns = if (self.config.timestamp_mode == .full) nowNs() else 0;
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
         descriptor.state.store(.queued, .release);
@@ -410,10 +556,30 @@ const Core = struct {
         _ = self.counters.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
 
-        if (self.counters.parked_workers.load(.monotonic) > 0) {
-            self.sync.park_mutex.lock();
-            self.sync.park_cond.signal();
-            self.sync.park_mutex.unlock();
+        // Wake one parked worker. Scan `is_parked` across workers starting at a
+        // round-robin offset so load spreads across the pool. The submit-before-park
+        // handshake (see idle()) guarantees: if any worker is about to miss this
+        // task because it's heading to park, its `is_parked := 1` store is ordered
+        // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
+        // and signal it, OR the worker reloads `queued_tasks` and sees our push —
+        // no lost wakeup. No broadcast fallback is needed.
+        const submitted = self.counters.submitted.load(.monotonic);
+        const hint_idx: usize = @intCast(submitted % self.workers.len);
+        var off: usize = 0;
+        while (off < self.workers.len) : (off += 1) {
+            const idx = (hint_idx + off) % self.workers.len;
+            const w = &self.workers[idx];
+            if (w.is_parked.load(.seq_cst) == 1) {
+                w.park_mutex.lock();
+                // Re-check under the mutex: the worker may have unparked between our
+                // load and this acquire. The signal is a no-op if it isn't parked —
+                // but we do not want to hold the mutex for a worker that is running.
+                if (w.is_parked.load(.monotonic) == 1) {
+                    w.park_cond.signal();
+                }
+                w.park_mutex.unlock();
+                break;
+            }
         }
 
         return if (options.waitable)
@@ -476,15 +642,36 @@ const Core = struct {
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
                 if (victim_index == worker_index) continue;
-                if (self.local_queues[victim_index].stealTop()) |descriptor_index| {
+                // Cheap peek before paying the seq_cst CAS cost in steal().
+                // len() reads bottom and top with acquire loads; under contention it
+                // may return a stale value, but skipping a victim that *appears* empty
+                // just means we move to the next one — correctness is unaffected.
+                if (self.local_queues[victim_index].len() == 0) continue;
+                var stolen: [32]u32 = undefined;
+                const budget = @min(self.config.steal_batch_size, stolen.len);
+                const n = self.local_queues[victim_index].steal(stolen[0..budget]);
+                if (n > 0) {
+                    // Keep the first for ourselves, push the rest to our local deque.
+                    // queued_tasks is decremented only for the item being returned for
+                    // immediate execution; items moved into the local deque remain queued
+                    // and decrement when later popped (matches the inject-queue drain
+                    // pattern above). Decrementing by `n` here would double-decrement
+                    // those items and cause queued_tasks to underflow, breaking shutdown.
+                    const first = stolen[0];
+                    for (stolen[1..n]) |idx| {
+                        if (!lq.tryPushBottom(idx)) {
+                            // Local deque full — put overflow on the inject queue so it isn't lost.
+                            _ = self.inject_queue.tryPush(idx);
+                        }
+                    }
                     self.decrementQueued();
-                    _ = self.counters.steals.fetchAdd(1, .monotonic);
-                    _ = worker.steals.fetchAdd(1, .release);
-                    return descriptor_index;
+                    _ = worker.steals.fetchAdd(n, .release);
+                    const local_len: u32 = @intCast(lq.len());
+                    updatePeakU32(&worker.local_queue_peak, local_len);
+                    return first;
                 }
             }
 
-            _ = self.counters.steal_failures.fetchAdd(1, .monotonic);
             _ = worker.steal_failures.fetchAdd(1, .release);
             return null;
         }
@@ -500,18 +687,23 @@ const Core = struct {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
         descriptor.state.store(.running, .release);
-        descriptor.start_ns = nowNs();
+        const timestamps_enabled = self.config.timestamp_mode == .full;
+        const start_ns = if (timestamps_enabled) nowNs() else 0;
+        descriptor.start_ns = start_ns;
 
-        const wait_ns = descriptor.start_ns - descriptor.submit_ns;
-        worker.wait_histogram.observe(wait_ns);
+        if (timestamps_enabled) {
+            const wait_ns = start_ns - descriptor.submit_ns;
+            worker.wait_histogram.observe(wait_ns);
+        }
 
-        _ = self.counters.started.fetchAdd(1, .monotonic);
+        _ = worker.started.fetchAdd(1, .monotonic);
         _ = self.counters.active_tasks.fetchAdd(1, .monotonic);
 
-        const run_started_ns = descriptor.start_ns;
-        const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
-        if (idle_started_ns != 0 and run_started_ns >= idle_started_ns) {
-            _ = worker.idle_ns.fetchAdd(run_started_ns - idle_started_ns, .release);
+        if (timestamps_enabled) {
+            const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
+            if (idle_started_ns != 0 and start_ns >= idle_started_ns) {
+                _ = worker.idle_ns.fetchAdd(start_ns - idle_started_ns, .release);
+            }
         }
 
         var runtime = TaskContext{
@@ -533,17 +725,22 @@ const Core = struct {
             _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
 
-        descriptor.complete_ns = nowNs();
-        const exec_ns = descriptor.complete_ns - run_started_ns;
-        _ = worker.busy_ns.fetchAdd(exec_ns, .release);
-        worker.last_idle_started_ns.store(descriptor.complete_ns, .release);
+        // Always update last_idle_started_ns so the idle-purge logic in idle() works
+        // regardless of timestamp_mode. Read the clock once.
+        const complete_ns = nowNs();
+        worker.last_idle_started_ns.store(complete_ns, .release);
 
-        worker.exec_histogram.observe(exec_ns);
+        if (timestamps_enabled) {
+            descriptor.complete_ns = complete_ns;
+            const exec_ns = complete_ns - start_ns;
+            _ = worker.busy_ns.fetchAdd(exec_ns, .release);
+            worker.exec_histogram.observe(exec_ns);
+        }
 
         _ = self.counters.active_tasks.fetchSub(1, .monotonic);
         if (descriptor.state.load(.acquire) != .cancelled) {
             descriptor.state.store(.completed, .release);
-            _ = self.counters.completed.fetchAdd(1, .monotonic);
+            _ = worker.completed.fetchAdd(1, .monotonic);
         }
 
         if (descriptor.options.wait_group) |wait_group| {
@@ -570,20 +767,30 @@ const Core = struct {
 
         if (self.state.load(.acquire) != .running) return;
 
-        _ = self.counters.parks.fetchAdd(1, .monotonic);
         _ = worker.parks.fetchAdd(1, .release);
 
-        self.sync.park_mutex.lock();
-        _ = self.counters.parked_workers.fetchAdd(1, .monotonic);
-        if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
-            _ = self.counters.parked_workers.fetchSub(1, .monotonic);
-            self.sync.park_mutex.unlock();
+        worker.park_mutex.lock();
+        // SC total-order handshake:
+        //   submitter:  push → queued_tasks.fetchAdd(.seq_cst) → is_parked.load(.seq_cst)
+        //   worker:     is_parked.store(.seq_cst) → queued_tasks.load(.seq_cst) → wait
+        // Both cross-variable pairs are SC, so either the submitter observes
+        // is_parked == 1 (and signals us) OR our queued_tasks load sees the
+        // submitter's increment. IRIW is excluded. No lost wakeup.
+        //
+        // Note: queued_tasks.fetchAdd on the submit path MUST be .seq_cst (not
+        // .release). Release stores only create HB with SC loads when the load
+        // reads that store's specific value — if the SC load observes an earlier
+        // value, no HB edge forms and the IRIW scenario is permitted.
+        worker.is_parked.store(1, .seq_cst);
+        if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
+            worker.is_parked.store(0, .release);
+            worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
-        self.sync.park_cond.timedWait(&self.sync.park_mutex, self.config.idle_park_after_ns) catch {};
-        _ = self.counters.parked_workers.fetchSub(1, .monotonic);
-        self.sync.park_mutex.unlock();
+        worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
+        worker.is_parked.store(0, .release);
+        worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .release);
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
@@ -607,7 +814,7 @@ const Core = struct {
         }
         if (self.config.scheduler_variant == .work_stealing) {
             for (self.local_queues) |*lq| {
-                while (lq.stealTop()) |descriptor_index| {
+                while (lq.stealOne()) |descriptor_index| {
                     self.decrementQueued();
                     self.cancelDescriptor(descriptor_index);
                 }
@@ -675,7 +882,16 @@ const Core = struct {
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
                 continue;
             }
-            return;
+            break;
+        }
+
+        // Wake one blocked submitter (if any) now that a descriptor is
+        // available. Fast-path: skip the mutex entirely when no submitter
+        // is blocked — the common uncontended case.
+        if (self.sync.backpressure_waiters.load(.monotonic) > 0) {
+            self.sync.backpressure_mutex.lock();
+            self.sync.backpressure_cond.signal();
+            self.sync.backpressure_mutex.unlock();
         }
     }
 
@@ -702,14 +918,18 @@ const Core = struct {
         self.allocator.free(self.free_indices);
         self.recordOwnedFree(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.allocator.free(self.descriptors);
-        self.recordOwnedFree(self.local_queues.len * @sizeOf(WorkDeque(u32)));
+        self.recordOwnedFree(self.local_queues.len * @sizeOf(LocalQueue));
         self.allocator.free(self.local_queues);
         self.recordOwnedFree(self.workers.len * @sizeOf(Worker));
         self.allocator.free(self.workers);
     }
 
     fn incrementQueued(self: *Core) void {
-        const queue_depth = self.counters.queued_tasks.fetchAdd(1, .release) +% 1;
+        // Must be .seq_cst: the submit-path park handshake requires this store
+        // to participate in the SC total order so that the IRIW scenario
+        // (submitter reads is_parked=0 AND worker reads queued_tasks=0) is
+        // excluded. See the comment in idle() for the full argument.
+        const queue_depth = self.counters.queued_tasks.fetchAdd(1, .seq_cst) +% 1;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
     }
 

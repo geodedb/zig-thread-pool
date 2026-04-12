@@ -17,6 +17,7 @@ pub const version = "0.2.0";
 
 pub const Config = types.Config;
 pub const SchedulerVariant = types.SchedulerVariant;
+pub const QueueKind = types.QueueKind;
 pub const TaskLane = types.TaskLane;
 pub const BackpressurePolicy = types.BackpressurePolicy;
 pub const SubmitOptions = types.SubmitOptions;
@@ -30,6 +31,7 @@ pub const ProcessMemoryStats = types.ProcessMemoryStats;
 pub const Stats = types.Stats;
 pub const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
 pub const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
+pub const RingQueue = @import("queue/ring_queue.zig").RingQueue;
 
 test {
     std.testing.refAllDecls(@This());

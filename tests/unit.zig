@@ -333,6 +333,95 @@ test "Stats.wakeups aggregates from per-worker counters" {
     try std.testing.expectEqual(expected, stats.wakeups);
 }
 
+test "Stats.steals/parks aggregate per-worker under work-stealing" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 4,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..256) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+
+    var expected_steals: u64 = 0;
+    var expected_steal_failures: u64 = 0;
+    var expected_parks: u64 = 0;
+    for (stats.worker_stats) |w| {
+        expected_steals += w.steals;
+        expected_steal_failures += w.steal_failures;
+        expected_parks += w.parks;
+    }
+    try std.testing.expectEqual(expected_steals, stats.steals);
+    try std.testing.expectEqual(expected_steal_failures, stats.steal_failures);
+    try std.testing.expectEqual(expected_parks, stats.parks);
+}
+
+test "timestamp_mode disabled zeroes histograms" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .timestamp_mode = .disabled,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..32) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 0), stats.task_exec_ns.count);
+    try std.testing.expectEqual(@as(u64, 32), stats.completed);
+}
+
+test "timestamp_mode disabled still purges scratch on idle" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .worker_scratch_cap_bytes = 1024,
+        .idle_park_after_ns = 100_000, // 0.1ms — immediate park
+        .idle_purge_after_ns = 200_000, // 0.2ms — quick purge trigger
+        .timestamp_mode = .disabled,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var ctx = common.ScratchTaskContext{ .counter = &counter, .bytes = 256 };
+
+    var wg = pool.waitGroup();
+    _ = try pool.submit(common.scratchTask, @ptrCast(&ctx), .{ .wait_group = &wg });
+    wg.wait();
+
+    // Sleep long enough for:
+    // 1. Worker to enter idle path (spin, then park for idle_park_after_ns)
+    // 2. Timeout to fire (idle_park_after_ns)
+    // 3. Purge check to succeed (idle_purge_after_ns since task completion)
+    // Use a generous sleep to account for scheduling delays
+    std.Thread.sleep(100_000_000); // 100ms — very ample time for purge to occur
+
+    const stats = pool.statsSnapshot();
+    // After purge, scratch memory should be released. live_bytes may still include
+    // other allocations (queues, etc.), but scratch_current_bytes should be near 0.
+    if (stats.worker_stats.len > 0) {
+        var total_scratch: u64 = 0;
+        for (stats.worker_stats) |ws| {
+            total_scratch += ws.scratch_current_bytes;
+        }
+        try std.testing.expect(total_scratch == 0);
+    }
+}
+
 test "fuzz BoundedRing push/pop consistency" {
     try std.testing.fuzz({}, struct {
         fn testOne(_: void, input: []const u8) !void {
@@ -387,4 +476,76 @@ test "fuzz Config validation never panics" {
             cfg.validate() catch {};
         }
     }.testOne, .{});
+}
+
+test "per-worker park: submit wakes a parked worker" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 4,
+        .queue_capacity = 128,
+        .idle_park_after_ns = 10_000_000, // 10ms — long enough for workers to park
+    });
+    defer pool.deinit();
+
+    // Let workers park before we submit.
+    std.Thread.sleep(50_000_000); // 50ms
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    wg.wait();
+
+    try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
+    // At least one worker must have woken up.
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.wakeups > 0);
+}
+
+test "Stats.started and .completed aggregate from per-worker counters" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 64), stats.started);
+    try std.testing.expectEqual(@as(u64, 64), stats.completed);
+}
+
+test "runtime_stats omits parked_workers counter after simplification" {
+    // Compile-time assertion: RuntimeStats (types.Stats) must NOT have
+    // a `parked_workers` field after this refactor.
+    comptime std.debug.assert(!@hasField(thread_pool.types.Stats, "parked_workers"));
+}
+
+test "backpressure block policy returns when capacity frees" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 1,
+        .queue_capacity = 4,
+        .local_queue_capacity = 2,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // Fill the descriptor pool with tasks.
+    for (0..4) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    // This one must block (no descriptors available) then succeed once the
+    // worker drains a task and releases a descriptor, which signals the
+    // backpressure condvar.
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{
+        .wait_group = &wg,
+        .backpressure = .block,
+    });
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 5), counter.value.load(.acquire));
 }

@@ -2,9 +2,10 @@ const std = @import("std");
 
 /// Lock-free Chase-Lev work-stealing deque.
 ///
-/// The owner thread calls `tryPushBottom` and `popBottom` (both wait-free).
-/// Any thread may call `stealTop` (lock-free via CAS on `top`).
-/// Buffer size must be a power of 2.
+/// NOTE: kept for `queue_kind = .chase_lev` compatibility. Batch-steal is
+/// not supported here (Chase-Lev's single-item steal proof does not
+/// generalize). The default work-stealing path uses `RingQueue` in
+/// `ring_queue.zig`, which supports a correct `stealHalf`.
 pub fn WorkDeque(comptime T: type) type {
     return struct {
         const Self = @This();

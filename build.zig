@@ -112,6 +112,45 @@ pub fn build(b: *std.Build) void {
     compare_step.dependOn(&run_compare.step);
     b.installArtifact(compare_exe);
 
+    const micro_submit = b.addExecutable(.{
+        .name = "thread-pool-micro-submit",
+        .root_module = importedModule(b, "benchmarks/micro/submit_latency.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_submit = b.addRunArtifact(micro_submit);
+    const micro_submit_step = b.step("bench-micro-submit", "Micro-benchmark: submit latency");
+    micro_submit_step.dependOn(&run_micro_submit.step);
+
+    const micro_steal = b.addExecutable(.{
+        .name = "thread-pool-micro-steal",
+        .root_module = importedModule(b, "benchmarks/micro/steal_throughput.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_steal = b.addRunArtifact(micro_steal);
+    if (b.args) |args| run_micro_steal.addArgs(args);
+    const micro_steal_step = b.step("bench-micro-steal", "Micro-benchmark: steal throughput");
+    micro_steal_step.dependOn(&run_micro_steal.step);
+
+    const micro_wake = b.addExecutable(.{
+        .name = "thread-pool-micro-wake",
+        .root_module = importedModule(b, "benchmarks/micro/wake_latency.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_wake = b.addRunArtifact(micro_wake);
+    const micro_wake_step = b.step("bench-micro-wake", "Micro-benchmark: wake latency");
+    micro_wake_step.dependOn(&run_micro_wake.step);
+
+    const tokio_bench = b.addExecutable(.{
+        .name = "thread-pool-tokio-parity",
+        .root_module = importedModule(b, "benchmarks/bench_tokio_parity.zig", target, .ReleaseFast, module),
+    });
+    const run_tokio_bench = b.addRunArtifact(tokio_bench);
+    const tokio_bench_step = b.step("bench-tokio-parity", "Tokio rt_multi_threaded parity benchmarks");
+    tokio_bench_step.dependOn(&run_tokio_bench.step);
+
+    // Aggregate "bench-micro" step
+    const micro_all_step = b.step("bench-micro", "All micro-benchmarks");
+    micro_all_step.dependOn(&run_micro_submit.step);
+    micro_all_step.dependOn(&run_micro_steal.step);
+    micro_all_step.dependOn(&run_micro_wake.step);
+
     const tools_step = b.step("tools", "Build benchmark tooling");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);

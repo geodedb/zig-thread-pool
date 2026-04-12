@@ -22,6 +22,17 @@ pub const ShutdownMode = enum {
     cancel_pending,
 };
 
+/// Controls per-task timestamp behavior.  `full` records submit/start/complete
+/// timestamps and populates wait/exec histograms — the legacy v0.2.0 mode.
+/// `disabled` skips submit/start clock reads and the histogram observes,
+/// saving ~40–80ns per task on Linux.  The complete-time clock read is kept
+/// because the idle-purge logic in `idle()` depends on
+/// `worker.last_idle_started_ns` to decide when to release scratch buffers.
+pub const TimestampMode = enum {
+    full,
+    disabled,
+};
+
 /// Task lifecycle state machine:
 ///
 ///     free ──> reserved ──> queued ──> running ──> completed
@@ -45,6 +56,13 @@ pub const TaskState = enum(u8) {
     cancelled,
 };
 
+pub const QueueKind = enum {
+    /// Chase-Lev work-stealing deque. Correct for single-item steal only.
+    chase_lev,
+    /// Tokio-style SPMC ring. Supports batch-steal via stealHalf. Default.
+    ring,
+};
+
 pub const Config = struct {
     min_threads: usize = 0,
     max_threads: usize = 0,
@@ -57,12 +75,20 @@ pub const Config = struct {
     spin_before_park_iters: usize = 128,
     deinit_timeout_ns: u64 = 30_000_000_000,
     scheduler_variant: SchedulerVariant = .global_queue,
+    queue_kind: QueueKind = .ring,
     /// Advisory flag indicating the caller intends to submit blocking tasks.
     /// Currently metadata-only: all lanes share the same worker set.
     /// A future lane_extension scheduler may use this to reserve a dedicated
     /// blocking worker subset. Setting this to false does not prevent submitting
     /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
+    timestamp_mode: TimestampMode = .full,
+    /// Maximum number of tasks a stealer takes from a single victim per steal
+    /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
+    /// used and values > 1 are correct. With `queue_kind = .chase_lev`,
+    /// only single-item steal is correct and the runtime forces this to 1
+    /// via `normalized()`.
+    steal_batch_size: usize = 8,
 
     pub fn normalized(self: Config) Config {
         var cfg = self;
@@ -85,6 +111,8 @@ pub const Config = struct {
         if (cfg.queue_capacity != 0) {
             cfg.queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.queue_capacity) catch cfg.queue_capacity;
         }
+        cfg.steal_batch_size = std.math.clamp(cfg.steal_batch_size, 1, 32);
+        if (cfg.queue_kind == .chase_lev) cfg.steal_batch_size = 1;
         return cfg;
     }
 
@@ -190,6 +218,8 @@ pub const WorkerStats = struct {
     wakeups: u64 = 0,
     steals: u64 = 0,
     steal_failures: u64 = 0,
+    started: u64 = 0,
+    completed: u64 = 0,
     scratch_current_bytes: u64 = 0,
     scratch_peak_bytes: u64 = 0,
 };
@@ -207,7 +237,6 @@ pub const Stats = struct {
     completed: u64 = 0,
     cancelled: u64 = 0,
     active_tasks: u64 = 0,
-    parked_workers: u64 = 0,
     queue_depth_current: u64 = 0,
     queue_depth_peak: u64 = 0,
     steals: u64 = 0,
