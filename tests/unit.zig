@@ -478,6 +478,55 @@ test "fuzz Config validation never panics" {
     }.testOne, .{});
 }
 
+test "phase g2: worker returns from idle when lifo slot filled during spin window" {
+    const allocator = std.testing.allocator;
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .scheduler_variant = .work_stealing,
+        .queue_capacity = 256,
+        // Long spin to maximise the window we can race into.
+        .spin_before_park_iters = 1_000_000,
+        // Tight park timeout — if we DO accidentally park, the test
+        // wakes quickly but fails the latency assertion below.
+        .idle_park_after_ns = 500_000_000,
+    });
+    defer pool.deinit();
+
+    // Give workers time to enter idle().
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    const Ctx = struct {
+        ran_at_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        fn run(ctx_ptr: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.ran_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+        }
+    };
+    var ctx = Ctx{};
+
+    const submit_ns: u64 = @intCast(std.time.nanoTimestamp());
+    _ = try pool.submit(Ctx.run, &ctx, .{});
+
+    // Busy-wait up to 50 ms for the task to run.
+    const deadline = submit_ns + 50 * std.time.ns_per_ms;
+    while (ctx.ran_at_ns.load(.acquire) == 0) {
+        if (@as(u64, @intCast(std.time.nanoTimestamp())) > deadline) break;
+        std.atomic.spinLoopHint();
+    }
+
+    const ran_at = ctx.ran_at_ns.load(.acquire);
+    try std.testing.expect(ran_at != 0); // task ran
+    const latency_ns = ran_at - submit_ns;
+    // Assert latency well below the park timeout. If the worker parked
+    // (because the spin didn't re-probe local state), latency would be
+    // dominated by park_cond.signal round-trip (~15 µs) which is still
+    // below 1 ms — so we assert < 1 ms to catch "spin didn't probe at all"
+    // regressions without flapping on ordinary park wakes.
+    try std.testing.expect(latency_ns < 1 * std.time.ns_per_ms);
+}
+
 test "per-worker park: submit wakes a parked worker" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 4,
