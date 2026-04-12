@@ -775,3 +775,62 @@ test "active_spinners: counter stays non-negative under concurrent workers" {
     final_wg.wait();
     try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
 }
+
+test "hot_spinners = 1 executes all submitted tasks" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 8,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+
+    const total: u64 = 10_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
+
+test "hot_spinners = 1 executes follow-up task after quiesce" {
+    // Regression guard: after the initial burst drains, the hot-spinner
+    // must still execute the next submitted task without requiring any
+    // external wake.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 128,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 4,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 500), counter.value.load(.acquire));
+
+    // Brief idle period so the non-hot worker parks.
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // One more task — must execute via the hot-spinner.
+    var solo = common.Counter{};
+    var solo_wg = pool.waitGroup();
+    _ = try pool.submit(common.counterTask, @ptrCast(&solo), .{ .wait_group = &solo_wg });
+    solo_wg.wait();
+    try std.testing.expectEqual(@as(u64, 1), solo.value.load(.acquire));
+}
