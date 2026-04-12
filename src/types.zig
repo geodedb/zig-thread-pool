@@ -65,6 +65,10 @@ pub const QueueKind = enum {
 
 pub const Config = struct {
     min_threads: usize = 0,
+    /// Maximum worker threads. Hard capped at 64 because the steal-scan
+    /// non-empty-workers bitmap uses a single u64. `validate()` rejects
+    /// values > 64 with `error.TooManyWorkers`. 0 means "auto-detect from
+    /// CPU count" in `normalized()`; detected values above 64 are clamped.
     max_threads: usize = 0,
     queue_capacity: usize = 1024,
     local_queue_capacity: usize = 256,
@@ -100,7 +104,7 @@ pub const Config = struct {
         var cfg = self;
         const cpu_guess = @max(std.Thread.getCpuCount() catch 1, 1);
         if (cfg.max_threads == 0) {
-            cfg.max_threads = cpu_guess;
+            cfg.max_threads = @min(cpu_guess, 64);
         }
         if (cfg.min_threads == 0) {
             cfg.min_threads = cfg.max_threads;
@@ -125,6 +129,7 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.max_threads == 0) return error.InvalidMaxThreads;
+        if (self.max_threads > 64) return error.TooManyWorkers;
         if (self.min_threads == 0) return error.InvalidMinThreads;
         if (self.min_threads > self.max_threads) return error.InvalidThreadBounds;
         if (self.queue_capacity == 0 or self.queue_capacity > std.math.maxInt(u32)) return error.InvalidQueueCapacity;

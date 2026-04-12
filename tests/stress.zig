@@ -388,3 +388,36 @@ test "backpressure backoff: 4 submitters, queue=256, 2 workers, deadline-bounded
     try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 }
+
+test "steal-scan bitmap: wide-pool flood with cpu-count workers" {
+    // Exercises the scheduler under high-worker-count pressure:
+    // cpu_count (clamped to 64) workers, single submitter, 200k tasks.
+    // Primary goal: hang/correctness regression guard.
+    const cpu_count = @min(std.Thread.getCpuCount() catch 4, 64);
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = cpu_count,
+        .max_threads = cpu_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    const total: u64 = 200_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(common.counterTask, @ptrCast(&counter), .{
+                .wait_group = &wg,
+            }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
