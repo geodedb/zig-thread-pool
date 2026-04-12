@@ -471,3 +471,40 @@ test "hot_spinners: slow tasks force parked worker recruitment via propagation" 
     // clearly exceed this.
     try std.testing.expect(elapsed_ns < 6 * std.time.ns_per_ms);
 }
+
+test "hot_spinners: wide-pool flood with cpu-count workers, hot_spinners=1" {
+    // High-worker-count stress: cpu_count (clamped to 64) workers,
+    // 1 reserved hot-spinner, 200k tasks, single submitter.
+    // Regression guard for correctness under realistic flood load.
+    const cpu_count = @min(std.Thread.getCpuCount() catch 4, 64);
+    if (cpu_count < 2) return; // need at least 2 workers for hot_spinners=1 to leave a non-hot worker
+
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = cpu_count,
+        .max_threads = cpu_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 64,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    const total: u64 = 200_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(common.counterTask, @ptrCast(&counter), .{
+                .wait_group = &wg,
+            }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
