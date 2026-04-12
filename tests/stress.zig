@@ -340,3 +340,51 @@ test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
 
     try std.testing.expectEqual(outer_total * 4, Nested.inner_counter.load(.acquire));
 }
+
+test "backpressure backoff: 4 submitters, queue=256, 2 workers, deadline-bounded" {
+    // Repro scenario matching the previous coalesced-wake stress test that
+    // hung intermittently. Uses default pool config (no wake_coalesce_batch
+    // override) so it exercises whatever the current backpressure impl is —
+    // today the condvar path, after the lock-free rewrite the spin-backoff
+    // path. In both cases it MUST complete in well under the 30s test
+    // timeout. The 5s per-submit deadline is the functional bound we verify.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const total_per_submitter: u64 = 5_000;
+    const n_submitters: u32 = 4;
+    const total = total_per_submitter * n_submitters;
+
+    const Submitter = struct {
+        fn run(p: *thread_pool.ThreadPool, c: *common.Counter, n: u64) void {
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                _ = p.submit(common.counterTask, @ptrCast(c), .{
+                    .backpressure = .block_with_timeout,
+                    .timeout_ns = 5 * std.time.ns_per_s,
+                }) catch break;
+            }
+        }
+    };
+
+    const start_ns = std.time.nanoTimestamp();
+    var threads: [n_submitters]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total_per_submitter });
+    }
+    for (&threads) |*t| t.join();
+    try pool.shutdown(.drain, null);
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+
+    // Hang detection first: if we exceeded the wall-time bound, that's the
+    // primary signal regardless of counter state.
+    try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}

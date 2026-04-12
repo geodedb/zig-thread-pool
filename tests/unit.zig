@@ -598,3 +598,48 @@ test "LIFO slot: submit-from-worker uses lifo_slot before local ring" {
     try std.testing.expectEqual(@as(u64, 100), Nested.outer_counter.load(.acquire));
     try std.testing.expectEqual(@as(u64, 100), Nested.inner_counter.load(.acquire));
 }
+
+test "backpressure deadline: returns error.Timeout when queue stays full" {
+    // Queue=2, single worker whose two slots stay occupied by blocking tasks.
+    // A 3rd submit with a tight deadline must return Timeout within ~100 ms,
+    // not hang. Exercises the spin-backoff deadline-clipping path in
+    // waitForCapacity.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 2,
+        .local_queue_capacity = 2,
+    });
+    defer pool.deinit();
+
+    var block_sem = std.Thread.Semaphore{};
+
+    const BlockCtx = struct {
+        sem: *std.Thread.Semaphore,
+        fn run(raw: *anyopaque, rt: *thread_pool.TaskContext) void {
+            _ = rt;
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.sem.wait();
+        }
+    };
+    var bctx = BlockCtx{ .sem = &block_sem };
+
+    // Fill the queue with blocking tasks.
+    _ = try pool.submit(BlockCtx.run, @ptrCast(&bctx), .{});
+    _ = try pool.submit(BlockCtx.run, @ptrCast(&bctx), .{});
+
+    // Third submit must time out within ~100 ms.
+    const start = std.time.nanoTimestamp();
+    const result = pool.submit(BlockCtx.run, @ptrCast(&bctx), .{
+        .backpressure = .block_with_timeout,
+        .timeout_ns = 10 * std.time.ns_per_ms,
+    });
+    const elapsed = std.time.nanoTimestamp() - start;
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed >= 10 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed < 100 * std.time.ns_per_ms); // hang guard
+
+    // Release the blocked tasks so shutdown drains cleanly.
+    block_sem.post();
+    block_sem.post();
+}
