@@ -460,3 +460,12 @@ fn nowNs() u64 {
     const ts = std.time.nanoTimestamp();
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
+
+/// A task that does the absolute minimum — used by micro-benchmarks to
+/// measure pool overhead without task-body noise.  Writes a single u8 to a
+/// volatile marker to prevent the optimizer from eliding the call.
+pub fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const marker: *volatile u8 = @ptrCast(raw_ctx);
+    marker.* +%= 1;
+}
