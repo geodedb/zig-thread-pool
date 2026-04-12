@@ -701,6 +701,36 @@ test "non_empty_workers bitmap invariant under racing push/pop" {
     try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
 }
 
+test "Config validate rejects hot_spinners >= max_threads" {
+    const cfg = thread_pool.Config{ .max_threads = 4, .min_threads = 1, .hot_spinners = 4 };
+    try std.testing.expectError(error.InvalidHotSpinners, cfg.validate());
+}
+
+test "Config validate accepts hot_spinners < max_threads" {
+    const cfg = thread_pool.Config{ .max_threads = 4, .min_threads = 1, .hot_spinners = 1 };
+    try cfg.validate();
+}
+
+test "Config validate rejects hot_spinners > 0 with wake_every_n_tasks == 0" {
+    const cfg = thread_pool.Config{
+        .max_threads = 4,
+        .min_threads = 1,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 0,
+    };
+    try std.testing.expectError(error.InvalidWakeThreshold, cfg.validate());
+}
+
+test "Config validate accepts hot_spinners = 0 with wake_every_n_tasks = 0" {
+    const cfg = thread_pool.Config{
+        .max_threads = 4,
+        .min_threads = 1,
+        .hot_spinners = 0,
+        .wake_every_n_tasks = 0,
+    };
+    try cfg.validate();
+}
+
 test "active_spinners: counter stays non-negative under concurrent workers" {
     // Integration-level sanity: submit a steady stream of tasks to a
     // multi-worker pool, assert total task count matches after quiesce.
