@@ -198,6 +198,47 @@ test "RingQueue: 1 owner + 4 stealers — no duplicates, no losses" {
     for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.acquire));
 }
 
+test "coalesced wake: submitter never stalls forever on backpressure" {
+    // Small queue + 4 submitters + 2 workers: submitters must block
+    // frequently. With wake_coalesce_batch=32 there are more missed
+    // per-release signals, but the timedWait ceiling bounds stalls.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256, // small — force backpressure
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+        .wake_coalesce_batch = 32,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const total_per_submitter: u64 = 5_000;
+    const n_submitters: u32 = 4;
+    const total = total_per_submitter * n_submitters;
+
+    const Submitter = struct {
+        fn run(p: *thread_pool.ThreadPool, c: *common.Counter, n: u64) void {
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                _ = p.submit(common.counterTask, @ptrCast(c), .{
+                    .backpressure = .block_with_timeout,
+                    .timeout_ns = 5 * std.time.ns_per_s,
+                }) catch break;
+            }
+        }
+    };
+
+    var threads: [n_submitters]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total_per_submitter });
+    }
+    for (&threads) |*t| t.join();
+    try pool.shutdown(.drain, null);
+
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
+
 fn runQueueKindScenario(kind: thread_pool.QueueKind, total: u64) !void {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 4,
