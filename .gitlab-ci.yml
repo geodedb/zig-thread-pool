@@ -38,7 +38,7 @@ stages:
 
 zig-format:
   before_script:
-    - apt-get update && apt-get install -y bash curl xz-utils
+    - apt-get update && apt-get install -y bash curl python3 xz-utils
     - *install-zig
 
 build:
