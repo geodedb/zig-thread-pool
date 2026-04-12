@@ -32,6 +32,7 @@ pub const ResultRow = struct {
     local_queue_capacity: usize,
     task_count: usize,
     throughput_ops_per_sec: f64,
+    throughput_stddev_ops_per_sec: f64 = 0,
     submit_latency_p50_ns: u64,
     submit_latency_p95_ns: u64,
     submit_latency_p99_ns: u64,
@@ -110,22 +111,47 @@ pub fn runScenarios(allocator: std.mem.Allocator, specs: []const ScenarioSpec, v
 
     for (specs) |spec| {
         for (variants) |variant| {
-            // Run 3 times and keep median by throughput for statistical stability.
-            var results: [3]ResultRow = undefined;
+            // Run 7 times; discard the first as a warm-up (cold caches, JIT-like effects).
+            // Take the median of the remaining 6 for the reported row, and compute stddev
+            // over the same 6 so compare-bench can gate on measured noise.
+            const RUN_COUNT: usize = 7;
+            const WARMUP_DISCARD: usize = 1;
+            const SAMPLE_COUNT: usize = RUN_COUNT - WARMUP_DISCARD; // 6
+            var results: [RUN_COUNT]ResultRow = undefined;
             for (&results) |*r| {
                 r.* = try runScenario(allocator, spec, variant);
             }
-            std.sort.heap(ResultRow, &results, {}, struct {
+            // Free the discarded warm-up run's allocations.
+            for (results[0..WARMUP_DISCARD]) |r| {
+                allocator.free(r.git_sha);
+                allocator.free(r.cpu);
+            }
+            const samples = results[WARMUP_DISCARD..];
+            std.sort.heap(ResultRow, samples, {}, struct {
                 fn lessThan(_: void, a: ResultRow, b: ResultRow) bool {
                     return a.throughput_ops_per_sec < b.throughput_ops_per_sec;
                 }
             }.lessThan);
-            // Free heap allocations from the non-median results.
-            for ([_]usize{ 0, 2 }) |i| {
-                allocator.free(results[i].git_sha);
-                allocator.free(results[i].cpu);
+            // Compute stddev over the sorted 6 samples before we free the non-median ones.
+            const median_throughput = samples[SAMPLE_COUNT / 2].throughput_ops_per_sec;
+            var stddev_ops_per_sec: f64 = 0;
+            {
+                var sum_sq: f64 = 0;
+                for (samples) |s| {
+                    const d = s.throughput_ops_per_sec - median_throughput;
+                    sum_sq += d * d;
+                }
+                stddev_ops_per_sec = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(SAMPLE_COUNT)));
             }
-            try rows.append(allocator, results[1]); // median
+            // Free allocations from every non-median sample.
+            for (samples, 0..) |r, idx| {
+                if (idx == SAMPLE_COUNT / 2) continue;
+                allocator.free(r.git_sha);
+                allocator.free(r.cpu);
+            }
+            var median_row = samples[SAMPLE_COUNT / 2];
+            median_row.throughput_stddev_ops_per_sec = stddev_ops_per_sec;
+            try rows.append(allocator, median_row);
         }
     }
 
@@ -238,6 +264,7 @@ pub fn runScenario(allocator: std.mem.Allocator, spec: ScenarioSpec, variant: th
         .local_queue_capacity = spec.local_queue_capacity,
         .task_count = spec.task_count,
         .throughput_ops_per_sec = throughput,
+        .throughput_stddev_ops_per_sec = 0,
         .submit_latency_p50_ns = submit_summary.p50_ns,
         .submit_latency_p95_ns = submit_summary.p95_ns,
         .submit_latency_p99_ns = submit_summary.p99_ns,
