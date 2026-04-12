@@ -128,6 +128,20 @@ pub fn build(b: *std.Build) void {
     const micro_steal_step = b.step("bench-micro-steal", "Micro-benchmark: steal throughput");
     micro_steal_step.dependOn(&run_micro_steal.step);
 
+    const micro_wake = b.addExecutable(.{
+        .name = "thread-pool-micro-wake",
+        .root_module = importedModule(b, "benchmarks/micro/wake_latency.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_wake = b.addRunArtifact(micro_wake);
+    const micro_wake_step = b.step("bench-micro-wake", "Micro-benchmark: wake latency");
+    micro_wake_step.dependOn(&run_micro_wake.step);
+
+    // Aggregate "bench-micro" step
+    const micro_all_step = b.step("bench-micro", "All micro-benchmarks");
+    micro_all_step.dependOn(&run_micro_submit.step);
+    micro_all_step.dependOn(&run_micro_steal.step);
+    micro_all_step.dependOn(&run_micro_wake.step);
+
     const tools_step = b.step("tools", "Build benchmark tooling");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);

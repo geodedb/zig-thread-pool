@@ -15,3 +15,9 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Phase | ops/s | steals | steal_failures |
 |-------|-------|--------|----------------|
 | Phase 0 (baseline) | 686840 | 0 | 72154 |
+
+## Micro: wake_latency (samples=5000, 2 workers, quiesce=300us, smp_allocator)
+
+| Phase | p50 (ns) | p95 (ns) | p99 (ns) |
+|-------|---------|----------|----------|
+| Phase 0 (baseline) | 9621 | 15181 | 23591 |
