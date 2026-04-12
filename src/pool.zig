@@ -694,15 +694,19 @@ const Core = struct {
         _ = worker.parks.fetchAdd(1, .release);
 
         worker.park_mutex.lock();
-        if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
+        // Publish "I am parking" before the re-check, with seq_cst ordering so a
+        // concurrent submitter's `push + queued++ + is_parked.load(.seq_cst)`
+        // is totally ordered with our `is_parked.store(.seq_cst) + queued_tasks.load(.seq_cst)`.
+        // Either the submitter observes is_parked == 1 (and will signal), or we
+        // observe the enqueued task in the reload below. One of the two branches
+        // always fires; no lost wakeup.
+        worker.is_parked.store(1, .seq_cst);
+        if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
+            worker.is_parked.store(0, .release);
             worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
-        // Mark parked *before* waiting. The mutex is held, so any submitter
-        // that observes is_parked == 1 will block on park_mutex until we
-        // enter timedWait (which atomically releases the mutex and waits).
-        worker.is_parked.store(1, .release);
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
         worker.is_parked.store(0, .release);
         worker.park_mutex.unlock();
