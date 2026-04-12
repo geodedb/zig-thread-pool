@@ -694,12 +694,17 @@ const Core = struct {
         _ = worker.parks.fetchAdd(1, .release);
 
         worker.park_mutex.lock();
-        // Publish "I am parking" before the re-check, with seq_cst ordering so a
-        // concurrent submitter's `push + queued++ + is_parked.load(.seq_cst)`
-        // is totally ordered with our `is_parked.store(.seq_cst) + queued_tasks.load(.seq_cst)`.
-        // Either the submitter observes is_parked == 1 (and will signal), or we
-        // observe the enqueued task in the reload below. One of the two branches
-        // always fires; no lost wakeup.
+        // SC total-order handshake:
+        //   submitter:  push → queued_tasks.fetchAdd(.seq_cst) → is_parked.load(.seq_cst)
+        //   worker:     is_parked.store(.seq_cst) → queued_tasks.load(.seq_cst) → wait
+        // Both cross-variable pairs are SC, so either the submitter observes
+        // is_parked == 1 (and signals us) OR our queued_tasks load sees the
+        // submitter's increment. IRIW is excluded. No lost wakeup.
+        //
+        // Note: queued_tasks.fetchAdd on the submit path MUST be .seq_cst (not
+        // .release). Release stores only create HB with SC loads when the load
+        // reads that store's specific value — if the SC load observes an earlier
+        // value, no HB edge forms and the IRIW scenario is permitted.
         worker.is_parked.store(1, .seq_cst);
         if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
@@ -844,7 +849,11 @@ const Core = struct {
     }
 
     fn incrementQueued(self: *Core) void {
-        const queue_depth = self.counters.queued_tasks.fetchAdd(1, .release) +% 1;
+        // Must be .seq_cst: the submit-path park handshake requires this store
+        // to participate in the SC total order so that the IRIW scenario
+        // (submitter reads is_parked=0 AND worker reads queued_tasks=0) is
+        // excluded. See the comment in idle() for the full argument.
+        const queue_depth = self.counters.queued_tasks.fetchAdd(1, .seq_cst) +% 1;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
     }
 
