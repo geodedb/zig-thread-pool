@@ -37,7 +37,19 @@ pub fn main() !void {
         });
         // Gate on throughput regression only. RSS varies too much across
         // environments (local vs CI container) for a tight threshold.
-        if (throughput_change < -15.0) failures += 1;
+        // Convert absolute stddev (ops/sec) to percentage relative to the baseline
+        // throughput. If stddev is 0 (older baseline without the field), treat the
+        // noise floor as 0 so the 15% hard floor governs.
+        const stddev_pct = if (baseline.throughput_ops_per_sec != 0)
+            (baseline.throughput_stddev_ops_per_sec / baseline.throughput_ops_per_sec) * 100.0
+        else
+            0.0;
+        const noise_gate = @max(15.0, 3.0 * stddev_pct);
+        std.debug.print("  noise_gate={d:.2}% (stddev_pct={d:.2}%)\n", .{ noise_gate, stddev_pct });
+        if (throughput_change < -noise_gate) {
+            std.debug.print("  FAIL: regression {d:.2}% exceeds noise gate {d:.2}%\n", .{ -throughput_change, noise_gate });
+            failures += 1;
+        }
     }
 
     if (failures != 0) return error.BenchmarkRegression;
