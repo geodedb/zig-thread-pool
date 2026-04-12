@@ -55,7 +55,14 @@ pub fn RingQueue(comptime T: type) type {
         pub fn len(self: *const Self) usize {
             const t = self.tail.load(.acquire);
             const h = self.head.load(.acquire);
-            return t -% h;
+            const diff = t -% h;
+            // Owner's `pop` transiently stores `tail = t-1` before the empty-check;
+            // a stealer reading that intermediate tail with a still-current head
+            // computes `t -% h` as a wrapped value > capacity. Clamp to 0 so
+            // callers (stats peak tracking, empty-victim skip) see a consistent
+            // "empty or near-empty" state rather than ~u32_max.
+            if (diff > @as(u32, @intCast(self.buffer.len))) return 0;
+            return diff;
         }
 
         /// Owner-only. Push an item to the tail. Returns false if full.
