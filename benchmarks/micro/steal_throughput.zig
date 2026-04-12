@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Micro-benchmark: work-stealing throughput.
 //! One worker's local deque is filled by the owner; the other worker steals.
-//! Reports steals/sec and average steal attempt count.
+//! Reports steal counts and task throughput.
 const std = @import("std");
 const thread_pool = @import("thread_pool");
 
@@ -14,9 +14,6 @@ fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 }
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
-    defer arena.deinit();
-
     var marker: u8 = 0;
 
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
