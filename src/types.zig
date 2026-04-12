@@ -22,6 +22,15 @@ pub const ShutdownMode = enum {
     cancel_pending,
 };
 
+/// Controls per-task timestamp behavior.  `full` records submit/start/complete
+/// timestamps and populates wait/exec histograms — the legacy v0.2.0 mode.
+/// `disabled` skips all timestamp reads, zeroing latency metrics but saving
+/// ~60–120ns per task on Linux vDSO `clock_gettime`.
+pub const TimestampMode = enum {
+    full,
+    disabled,
+};
+
 /// Task lifecycle state machine:
 ///
 ///     free ──> reserved ──> queued ──> running ──> completed
@@ -63,6 +72,7 @@ pub const Config = struct {
     /// blocking worker subset. Setting this to false does not prevent submitting
     /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
+    timestamp_mode: TimestampMode = .full,
 
     pub fn normalized(self: Config) Config {
         var cfg = self;

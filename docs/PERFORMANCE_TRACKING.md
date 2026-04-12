@@ -9,6 +9,7 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Phase | p50 (ns) | p95 (ns) | p99 (ns) | Notes |
 |-------|---------|----------|----------|-------|
 | Phase 0 (baseline) | 904 | 1480 | 1793 | pre-optimization |
+| Phase 2 (timestamp_mode default=full, no change expected) | 404 | 561 | 615 | Task 5: knob added, default preserves v0.2.0 behavior |
 
 ## Micro: steal_throughput (tasks=200000, 2 workers, inject_batch=1, smp_allocator)
 

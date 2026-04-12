@@ -333,6 +333,27 @@ test "Stats.wakeups aggregates from per-worker counters" {
     try std.testing.expectEqual(expected, stats.wakeups);
 }
 
+test "timestamp_mode disabled zeroes histograms" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .timestamp_mode = .disabled,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..32) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 0), stats.task_exec_ns.count);
+    try std.testing.expectEqual(@as(u64, 32), stats.completed);
+}
+
 test "fuzz BoundedRing push/pop consistency" {
     try std.testing.fuzz({}, struct {
         fn testOne(_: void, input: []const u8) !void {

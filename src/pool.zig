@@ -385,7 +385,7 @@ const Core = struct {
         descriptor.task_fn = task_fn;
         descriptor.ctx = ctx;
         descriptor.options = options;
-        descriptor.submit_ns = nowNs();
+        descriptor.submit_ns = if (self.config.timestamp_mode == .full) nowNs() else 0;
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
         descriptor.state.store(.queued, .release);
@@ -500,18 +500,23 @@ const Core = struct {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
         descriptor.state.store(.running, .release);
-        descriptor.start_ns = nowNs();
+        const timestamps_enabled = self.config.timestamp_mode == .full;
+        const start_ns = if (timestamps_enabled) nowNs() else 0;
+        descriptor.start_ns = start_ns;
 
-        const wait_ns = descriptor.start_ns - descriptor.submit_ns;
-        worker.wait_histogram.observe(wait_ns);
+        if (timestamps_enabled) {
+            const wait_ns = start_ns - descriptor.submit_ns;
+            worker.wait_histogram.observe(wait_ns);
+        }
 
         _ = self.counters.started.fetchAdd(1, .monotonic);
         _ = self.counters.active_tasks.fetchAdd(1, .monotonic);
 
-        const run_started_ns = descriptor.start_ns;
-        const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
-        if (idle_started_ns != 0 and run_started_ns >= idle_started_ns) {
-            _ = worker.idle_ns.fetchAdd(run_started_ns - idle_started_ns, .release);
+        if (timestamps_enabled) {
+            const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
+            if (idle_started_ns != 0 and start_ns >= idle_started_ns) {
+                _ = worker.idle_ns.fetchAdd(start_ns - idle_started_ns, .release);
+            }
         }
 
         var runtime = TaskContext{
@@ -533,12 +538,14 @@ const Core = struct {
             _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
 
-        descriptor.complete_ns = nowNs();
-        const exec_ns = descriptor.complete_ns - run_started_ns;
-        _ = worker.busy_ns.fetchAdd(exec_ns, .release);
-        worker.last_idle_started_ns.store(descriptor.complete_ns, .release);
-
-        worker.exec_histogram.observe(exec_ns);
+        if (timestamps_enabled) {
+            const complete_ns = nowNs();
+            descriptor.complete_ns = complete_ns;
+            const exec_ns = complete_ns - start_ns;
+            _ = worker.busy_ns.fetchAdd(exec_ns, .release);
+            worker.last_idle_started_ns.store(complete_ns, .release);
+            worker.exec_histogram.observe(exec_ns);
+        }
 
         _ = self.counters.active_tasks.fetchSub(1, .monotonic);
         if (descriptor.state.load(.acquire) != .cancelled) {
