@@ -373,6 +373,53 @@ All four phases eliminated a legitimate hot-path cost. All four measured ~0% wal
 3. **Single-atomic phases work only if they literally remove the atomic from the hot path.** Conditional skips (F1, F1b) produce 0% because the atomic is still contended by the paths that don't skip. Rewrites that eliminate the atomic universally (e.g., replace O(N) scan with O(1) bitmap CTZ) DO realize their A/B lift, as long as the rewrite preserves correctness.
 4. **Inject queue is not the bottleneck at this scale.** The 9.5M number with queue bypassed proves the MPMC ring CAS is sub-µs/op. Further optimization of the queue is not the fast path to parity.
 
+## Phase G1: Sharded Wake Targeting (negative result — REVERTED, bitmap consolidation anti-pattern)
+
+**Hypothesis:** Replace the O(N) is_parked[] scan in wakeOneParkedWorker with an O(1) @ctz on a shared u64 bitmap (`Core.parked_mask`). A/B-verified ceiling: 488K (later re-measured 460K with fresh builds) by stubbing the wake block entirely. See `docs/superpowers/specs/2026-04-12-phase-g1-sharded-wake-design.md` and `docs/superpowers/plans/2026-04-12-phase-g1-sharded-wake.md`.
+
+### Measured (median of 5, ReleaseFast, 56-core host)
+
+| Metric | Baseline | G1 bitmap | A/B stubbed (no wake) |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 331K | **312K** | 460K |
+
+**G1 is net-NEGATIVE** (-7% vs baseline, -47% vs the stubbed A/B ceiling). Rollback triggered.
+
+### Root cause: consolidation anti-pattern under high-writer contention
+
+The bitmap replaced N per-worker `is_parked` cachelines with ONE shared `parked_mask` cacheline. Under flood_1m:
+
+- 56 workers park/unpark frequently (73% parked time per earlier profile).
+- Every park writes `parked_mask.fetchOr(.seq_cst)`; every unpark writes `parked_mask.fetchAnd(.release)`.
+- The submitter's `parked_mask.load(.seq_cst)` lands on a cacheline being actively bounced across 56 cores.
+
+The original per-worker `is_parked[]` scan was O(N) loads, but those loads hit **N distinct cachelines**, each receiving 1/N of the writer pressure. The bitmap consolidation inverted this — one reader benefits (O(1) vs O(N)), but N writers contend on one line instead of N lines. Net: more total cacheline traffic.
+
+### Smoke vs fresh-build measurement: the 493K illusion
+
+Task 3's smoke measurement of 493K flood_1m was produced by a stale binary. `zig build bench-tokio-parity` does not trigger a rebuild if the target is considered up-to-date — subtle source changes can fail to propagate to the actual binary. All Task 6 measurements used explicit `zig build -Doptimize=ReleaseFast` immediately before running the binary, producing the correct 312K number. **Lesson: always force-rebuild between experiments; never trust same-session smoke measurements.**
+
+### Methodology lesson #7
+
+Cumulative profiles and A/B stubs identify WHERE time is spent, but they don't predict whether a specific *mechanism* for reducing that time will work. **A consolidation-style rewrite (O(N)→O(1) on a shared structure) can be NET NEGATIVE if the consolidated resource has higher write-contention than the distributed resource had read-cost.** This is a new failure mode, distinct from F1/F1b's "conditional-skip" failure mode:
+
+- **F1/F1b failure:** the condition for skipping work was rarely true, so the mechanic didn't engage.
+- **G1 failure:** the mechanic engaged on every submit, but consolidating N writes onto one cacheline cost more than the O(N) reads it replaced.
+
+Future phases targeting "make this shared access O(1)" must verify **write contention** of the consolidated structure, not just read cost. Ways to avoid the anti-pattern:
+
+- Sharded structures (per-NUMA, per-core-group) instead of single global.
+- Asymmetric access patterns (many readers, few writers) — suits bitmap-style collapse.
+- When writes are frequent from many threads, keep the distributed structure and add an ORTHOGONAL cheap gate (e.g., a "count of parked workers" counter) that lets the reader fast-exit without touching the distributed data.
+
+### What was kept vs reverted
+
+Reverted: G1 Tasks 1-5 (bitmap field, park-handshake maintenance, wake rewrite, correctness tests). Spec and plan docs retained as historical record.
+
+### Next direction
+
+The wake path target is still real (stubbing gives +47%). Future attempts must use a different mechanism than bitmap consolidation. Moving Phase G work to G2 next.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
