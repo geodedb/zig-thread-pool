@@ -700,3 +700,137 @@ test "non_empty_workers bitmap invariant under racing push/pop" {
     final_wg.wait();
     try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
 }
+
+test "Config validate rejects hot_spinners >= max_threads" {
+    const cfg = thread_pool.Config{ .max_threads = 4, .min_threads = 1, .hot_spinners = 4 };
+    try std.testing.expectError(error.InvalidHotSpinners, cfg.validate());
+}
+
+test "Config validate accepts hot_spinners < max_threads" {
+    const cfg = thread_pool.Config{ .max_threads = 4, .min_threads = 1, .hot_spinners = 1 };
+    try cfg.validate();
+}
+
+test "Config validate rejects hot_spinners > 0 with wake_every_n_tasks == 0" {
+    const cfg = thread_pool.Config{
+        .max_threads = 4,
+        .min_threads = 1,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 0,
+    };
+    try std.testing.expectError(error.InvalidWakeThreshold, cfg.validate());
+}
+
+test "Config validate accepts hot_spinners = 0 with wake_every_n_tasks = 0" {
+    const cfg = thread_pool.Config{
+        .max_threads = 4,
+        .min_threads = 1,
+        .hot_spinners = 0,
+        .wake_every_n_tasks = 0,
+    };
+    try cfg.validate();
+}
+
+test "active_spinners: counter stays non-negative under concurrent workers" {
+    // Integration-level sanity: submit a steady stream of tasks to a
+    // multi-worker pool, assert total task count matches after quiesce.
+    // If the active_spinners fetchAdd/fetchSub pairing is broken (e.g.,
+    // missing a decrement on some exit path), the counter drifts and
+    // the submitter either skips all wakes (tasks never picked up) or
+    // always wakes (no perf benefit but still correct). This test
+    // catches the first failure mode — a stuck pool.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        // Short spin to force rapid spin→park→wake cycles, exercising
+        // every exit path from idle().
+        .spin_before_park_iters = 8,
+        .idle_park_after_ns = 50_000,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+
+    const total: u64 = 40_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+
+    // Brief quiesce so workers drain any stragglers and return to idle.
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    // Submit one more task; must execute. If active_spinners is stuck >0
+    // with all workers parked, the submitter skips the wake and this
+    // task starves (test timeout via wg.wait semantics on single task).
+    var final_counter = common.Counter{};
+    var final_wg = pool.waitGroup();
+    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg });
+    final_wg.wait();
+    try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
+}
+
+test "hot_spinners = 1 executes all submitted tasks" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 8,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+
+    const total: u64 = 10_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
+
+test "hot_spinners = 1 executes follow-up task after quiesce" {
+    // Regression guard: after the initial burst drains, the hot-spinner
+    // must still execute the next submitted task without requiring any
+    // external wake.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 128,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 4,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 500), counter.value.load(.acquire));
+
+    // Brief idle period so the non-hot worker parks.
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // One more task — must execute via the hot-spinner.
+    var solo = common.Counter{};
+    var solo_wg = pool.waitGroup();
+    _ = try pool.submit(common.counterTask, @ptrCast(&solo), .{ .wait_group = &solo_wg });
+    solo_wg.wait();
+    try std.testing.expectEqual(@as(u64, 1), solo.value.load(.acquire));
+}

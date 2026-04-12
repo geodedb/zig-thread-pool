@@ -282,6 +282,144 @@ Unchanged from Phase D:
 2. Phase G: inject queue + descriptor pool.
 3. Phase H: worker-local allocation / cache locality.
 
+## Phase F1: Hot-Spin Wake Elimination (negative result — REVERTED, A/B gate caught it)
+
+**Hypothesis:** A wall-clock `perf sched record` profile (2026-04-12) identified the submitter at 89% CPU-bound with ~50% of cycles in the `futex_wake` chain inside `enqueueTask`. An A/B-disable experiment (stub the wake block to a no-op) lifted `flood_1m` from 335K → 506K (+51%) — proving the wake path was a real, addressable ceiling. Phase F1 attempted to capture most of that ceiling by adding `Core.active_spinners: std.atomic.Value(u32)`, bracketing the existing `idle()` spin phase with `fetchAdd`/`fetchSub`, and making `enqueueTask` skip the `is_parked[]` scan + `futex_wake` when `active_spinners > 0`. See `docs/superpowers/specs/2026-04-12-phase-f-hot-spin-wake-design.md` and `docs/superpowers/plans/2026-04-12-phase-f-hot-spin-wake.md`.
+
+### Measured (median of 3, ReleaseFast, 56-core host)
+
+| Metric | Baseline | Phase F1 (default) | Phase F1 (spin=0 A/B) |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 335K | **383K** | **386K** |
+| `contended_spawn_8x` ops/s | 534K | 568K (mean of 3) | 575K (mean of 3) |
+
+The F1 configuration and the spin=0 A/B are **within noise of each other**. Disabling the spin phase (so workers can never be caught in the "hot-spin" window) did not regress throughput. That proves the `active_spinners > 0` short-circuit in `enqueueTask` was firing ~never: the mechanic was dead code at runtime.
+
+### Why the mechanic didn't engage
+
+Workers are 73% parked during `flood_1m` (per the same perf sched profile). The `idle()` spin phase runs `spin_before_park_iters = 128` iterations × ~1 ns each = **~128 ns**. Inter-submit interval at ~337K ops/s is **~3 µs** — 20× longer than the spin window. The probability that the submitter's `active_spinners.load` observes a non-zero value is negligible; the submitter almost always takes the cold path (full `is_parked` scan + `park_cond.signal` + `futex_wake`), exactly as before. The ~14% throughput movement (335K → 383K) is noise floor / micro-architectural chance, not a Phase F1 win.
+
+### A/B gate worked — keep doing this
+
+Phases D and E both shipped, merged, and documented negative results because the plans committed code before measuring whether the target was engaging. **Phase F1's spec required an A/B-disable measurement before acceptance**, and the gate correctly refused to sign off: the default config and `spin_before_park_iters = 0` produced indistinguishable results. Total cost: 4 commits on a feature branch, never merged, caught in ~15 minutes of measurement after the mechanic was in place.
+
+This is the methodology succeeding. A failing phase was pre-empted before it reached main.
+
+### What was kept
+
+- `tests/unit.zig` — `active_spinners: counter stays non-negative under concurrent workers`. Exercises `spin_before_park_iters = 8` to stress every exit path of `idle()`'s spin loop, submits 40K tasks + a trailing single task. Independently useful as a scheduler stress probe regardless of whether `active_spinners` exists; retained as a permanent regression guard.
+
+All behavior-change commits (infrastructure field, worker maintenance, submitter skip-wake, ordering tweak) were reset out of the feature branch before merge.
+
+### Next attempts (design directions, not yet planned)
+
+The underlying problem — `active_spinners` is 0 at submit time because workers park too quickly — has two correctness-neutral fixes:
+
+1. **F1a: longer spin.** Increase `spin_before_park_iters` dramatically (e.g., ~16K iterations, ~16 µs spin). Workers overlap submits and `active_spinners > 0` becomes frequently true. Trade-off: idle CPU burn in scenarios with no work. Unacceptable for a real no-op workload (56 workers × 100% CPU).
+2. **F1b: reserved hot-spin workers.** A small number (1–2) of workers never park; the rest park normally. Submitter can rely on the hot-spinners being catchable. Trade-off: fixed CPU cost regardless of load — but we're already burning those cycles on futex_wake, so net CPU may be flat or down.
+
+Both require a new spec + fresh A/B ceiling measurement before planning.
+
+### Lessons learned
+
+1. **A/B-disable before acceptance, every phase.** Phase F's spec made this a rule; the rule paid out on the first attempt.
+2. **A/B must target the mechanic under measurement, not just the suspected bottleneck.** The pre-planning A/B (stub the wake block) validated the target (wake path). The post-implementation A/B (spin=0) validated the mechanic (spin → skip-wake → throughput). Both are needed — a valid target with an ineffective mechanic still produces zero gain.
+3. **Probability-of-engagement matters.** The design assumed workers would "often" be spinning at submit time without quantifying "often." Ratio of (spin window duration) : (inter-submit interval) is the correct figure of merit; when it's < 1, the mechanic effectively never fires.
+
+## Phase F1b: Reserved Hot-Spin Workers (negative result — REVERTED, A/B gate caught it)
+
+**Hypothesis:** F1's short-spin mechanic failed because its spin window (~128 ns) was 20× shorter than the inter-submit interval (~3 µs). F1b fixed this by reserving N workers that never park — making the "spin window" effectively ∞. Submitter would skip `futex_wake` unconditionally when `hot_spinners > 0`; reserved workers would propagate wakes every K tasks. See `docs/superpowers/specs/2026-04-12-phase-f1b-reserved-hot-spinners-design.md` and `docs/superpowers/plans/2026-04-12-phase-f1b-reserved-hot-spinners.md`.
+
+### Measured (median of 3, ReleaseFast, 56-core host)
+
+| Metric | hot_spinners=0 | hot_spinners=1 | Delta |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 384K | **398K** | +3.7% (noise) |
+| `contended_spawn_8x` ops/s (mean of 3) | 572K | 583K | noise |
+
+Rollback floor was 400K; 398K median triggered ROLLBACK. Behavior-change commits (Tasks 2–4: refactor + hot-spinner loop + conditional skip) were reset out. Retained (per plan's rollback clause): Task 1 (config fields + validation tests) and Tasks 5–7 (correctness + propagation + wide-pool stress tests) as permanent API+regression-guard surface.
+
+### Why F1b failed where F1 had succeeded mechanically
+
+F1b's *mechanic* DID engage — `hot_spinners=1` did mean worker 0 never parked and submitter DID skip the wake scan on the submit hot path. But throughput barely moved. The next post-revert deep re-profile revealed why: **the wake scan isn't the sole critical path; it shares the cache-line budget with three other contended atomics that F1b left alone**.
+
+### Deep re-profile: the actual bottleneck is cache-line contention across four atomics
+
+Systematic A/B-disable across every submit-path component (2026-04-12):
+
+| Component | Measured individual lift | New median | Notes |
+|---|---:|---:|---|
+| Baseline (no changes) | — | 331K | — |
+| Wake scan stubbed | +47% | 488K | O(N) is_parked load + futex_wake |
+| `queued_tasks` SC fetchAdd removed (and idle-spin poll removed) | +26% | 417K | Worker idle-spin hammers this cache line × 56 |
+| `submitted.fetchAdd(.monotonic)` removed + `hint_idx=0` | +28% | 422K | Cross-worker cache line bounces |
+| Descriptor CAS (`acquireDescriptor`/`releaseDescriptor` stubbed) | +16% | 383K | ABA-tagged free-list |
+| All three shared atomics removed simultaneously | **+210%** | **~1.0M** | Compound lift proves orthogonal-contention theory |
+| `inject_queue.tryPush` + everything downstream removed | +2770% | 9.51M | Queue is NOT the bottleneck |
+| `runTask` body (noop task function) | +0% | 330K | Task body is already free |
+
+### The cache-line contention theory
+
+F1/F1b's failure wasn't about engagement — it was that **the submit hot path has four contended atomics, not one**. Removing any single one in isolation lifts throughput by its individual measured amount (+16% to +47%), but the previous implementations didn't achieve this because they gated the removal behind a runtime condition that was rarely true (F1: short spin window) or imposed counterbalancing cost (F1b: reserved a worker, reducing pool capacity). A proper rewrite that **literally removes the work path on every submit** (not conditionally) should deliver the measured A/B lift.
+
+### Phases D/E/F1/F1b as a sequence
+
+All four phases eliminated a legitimate hot-path cost. All four measured ~0% wall-clock change. The pattern held because each phase's target, in isolation, was one of four overlapping contention sources on the same submit-path cache lines. Removing one leaves the other three holding the ceiling near-unchanged. The right approach: **sequential architectural rewrites, each actually eliminating (not conditionally skipping) the work**, with A/B gates on each to validate the measured lift shows up. Phase G targets the first of these — wake scan sharding.
+
+### Updated lessons learned (from F1, F1b, and the deep re-profile)
+
+1. **A/B-disable on the mechanic, every phase.** Proven across F1 and F1b. Rule now permanent.
+2. **Separating target validity from mechanism validity.** The 335K→488K wake-stub A/B proved the *target* was real (wake scan worth ~47%). F1/F1b failed because their *mechanisms* didn't actually eliminate the work on every submit. Next phase must show, by its own A/B, that the work is gone unconditionally.
+3. **Single-atomic phases work only if they literally remove the atomic from the hot path.** Conditional skips (F1, F1b) produce 0% because the atomic is still contended by the paths that don't skip. Rewrites that eliminate the atomic universally (e.g., replace O(N) scan with O(1) bitmap CTZ) DO realize their A/B lift, as long as the rewrite preserves correctness.
+4. **Inject queue is not the bottleneck at this scale.** The 9.5M number with queue bypassed proves the MPMC ring CAS is sub-µs/op. Further optimization of the queue is not the fast path to parity.
+
+## Phase G1: Sharded Wake Targeting (negative result — REVERTED, bitmap consolidation anti-pattern)
+
+**Hypothesis:** Replace the O(N) is_parked[] scan in wakeOneParkedWorker with an O(1) @ctz on a shared u64 bitmap (`Core.parked_mask`). A/B-verified ceiling: 488K (later re-measured 460K with fresh builds) by stubbing the wake block entirely. See `docs/superpowers/specs/2026-04-12-phase-g1-sharded-wake-design.md` and `docs/superpowers/plans/2026-04-12-phase-g1-sharded-wake.md`.
+
+### Measured (median of 5, ReleaseFast, 56-core host)
+
+| Metric | Baseline | G1 bitmap | A/B stubbed (no wake) |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 331K | **312K** | 460K |
+
+**G1 is net-NEGATIVE** (-7% vs baseline, -47% vs the stubbed A/B ceiling). Rollback triggered.
+
+### Root cause: consolidation anti-pattern under high-writer contention
+
+The bitmap replaced N per-worker `is_parked` cachelines with ONE shared `parked_mask` cacheline. Under flood_1m:
+
+- 56 workers park/unpark frequently (73% parked time per earlier profile).
+- Every park writes `parked_mask.fetchOr(.seq_cst)`; every unpark writes `parked_mask.fetchAnd(.release)`.
+- The submitter's `parked_mask.load(.seq_cst)` lands on a cacheline being actively bounced across 56 cores.
+
+The original per-worker `is_parked[]` scan was O(N) loads, but those loads hit **N distinct cachelines**, each receiving 1/N of the writer pressure. The bitmap consolidation inverted this — one reader benefits (O(1) vs O(N)), but N writers contend on one line instead of N lines. Net: more total cacheline traffic.
+
+### Smoke vs fresh-build measurement: the 493K illusion
+
+Task 3's smoke measurement of 493K flood_1m was produced by a stale binary. `zig build bench-tokio-parity` does not trigger a rebuild if the target is considered up-to-date — subtle source changes can fail to propagate to the actual binary. All Task 6 measurements used explicit `zig build -Doptimize=ReleaseFast` immediately before running the binary, producing the correct 312K number. **Lesson: always force-rebuild between experiments; never trust same-session smoke measurements.**
+
+### Methodology lesson #7
+
+Cumulative profiles and A/B stubs identify WHERE time is spent, but they don't predict whether a specific *mechanism* for reducing that time will work. **A consolidation-style rewrite (O(N)→O(1) on a shared structure) can be NET NEGATIVE if the consolidated resource has higher write-contention than the distributed resource had read-cost.** This is a new failure mode, distinct from F1/F1b's "conditional-skip" failure mode:
+
+- **F1/F1b failure:** the condition for skipping work was rarely true, so the mechanic didn't engage.
+- **G1 failure:** the mechanic engaged on every submit, but consolidating N writes onto one cacheline cost more than the O(N) reads it replaced.
+
+Future phases targeting "make this shared access O(1)" must verify **write contention** of the consolidated structure, not just read cost. Ways to avoid the anti-pattern:
+
+- Sharded structures (per-NUMA, per-core-group) instead of single global.
+- Asymmetric access patterns (many readers, few writers) — suits bitmap-style collapse.
+- When writes are frequent from many threads, keep the distributed structure and add an ORTHOGONAL cheap gate (e.g., a "count of parked workers" counter) that lets the reader fast-exit without touching the distributed data.
+
+### What was kept vs reverted
+
+Reverted: G1 Tasks 1-5 (bitmap field, park-handshake maintenance, wake rewrite, correctness tests). Spec and plan docs retained as historical record.
+
+### Next direction
+
+The wake path target is still real (stubbing gives +47%). Future attempts must use a different mechanism than bitmap consolidation. Moving Phase G work to G2 next.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per

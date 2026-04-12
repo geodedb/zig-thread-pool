@@ -79,6 +79,26 @@ pub const Config = struct {
     /// The submitter's `timedWait` on `backpressure_cond` bounds worst-case
     /// missed-signal latency.
     wake_coalesce_batch: u32 = 32,
+    /// Number of workers reserved as always-spinning hot workers.
+    /// These workers never park; they consume 1 core each at 100% CPU
+    /// but catch submits without requiring a futex wake. When > 0, the
+    /// submitter skips the wake scan entirely — hot-spinners propagate
+    /// wakes themselves every `wake_every_n_tasks` tasks executed.
+    ///
+    /// Default 0 disables the feature (preserves current behavior).
+    /// Must be strictly less than `max_threads` — at least one
+    /// non-hot worker is required for the parked-worker fallback.
+    /// See docs/superpowers/specs/2026-04-12-phase-f1b-reserved-hot-spinners-design.md.
+    hot_spinners: u32 = 0,
+
+    /// Hot-spinner wake propagation threshold. After executing this
+    /// many tasks, a hot-spinner issues one `futex_wake` to recruit a
+    /// parked worker. Amortizes wake cost across many submits while
+    /// bounding worst-case wake latency to ~K × per-task duration.
+    /// Ignored when `hot_spinners == 0`. Setting this to 0 while
+    /// `hot_spinners > 0` is rejected by `validate()` — would starve
+    /// parked workers on long-running tasks.
+    wake_every_n_tasks: u32 = 64,
     worker_scratch_cap_bytes: usize = 64 * 1024,
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
@@ -138,6 +158,8 @@ pub const Config = struct {
         }
         if (self.scheduler_variant == .lane_extension) return error.UnsupportedSchedulerVariant;
         if (self.inject_batch_size == 0) return error.InvalidInjectBatchSize;
+        if (self.hot_spinners >= self.max_threads) return error.InvalidHotSpinners;
+        if (self.hot_spinners > 0 and self.wake_every_n_tasks == 0) return error.InvalidWakeThreshold;
     }
 };
 

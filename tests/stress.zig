@@ -421,3 +421,90 @@ test "steal-scan bitmap: wide-pool flood with cpu-count workers" {
     wg.wait();
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 }
+
+test "hot_spinners: slow tasks force parked worker recruitment via propagation" {
+    // hot_spinners=1 with slow tasks (100µs each). After the first
+    // wake_every_n_tasks=4 tasks complete, the spinner must wake a
+    // parked worker. If propagation is broken, all work stays on the
+    // single hot-spinner and the test takes ~N × 100µs instead of
+    // running in parallel.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 2048,
+        .local_queue_capacity = 128,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 4,
+        .idle_park_after_ns = 50_000,
+    });
+    defer pool.deinit();
+
+    const SlowCtx = struct {
+        counter: *common.Counter,
+        sleep_ns: u64,
+        fn run(raw: *anyopaque, rt: *thread_pool.TaskContext) void {
+            _ = rt;
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            std.Thread.sleep(ctx.sleep_ns);
+            _ = ctx.counter.value.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var counter = common.Counter{};
+    var slow = SlowCtx{ .counter = &counter, .sleep_ns = 100_000 };
+    var wg = pool.waitGroup();
+    const total: u64 = 80;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        _ = try pool.submit(SlowCtx.run, @ptrCast(&slow), .{ .wait_group = &wg });
+    }
+    const start_ns = std.time.nanoTimestamp();
+    wg.wait();
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+
+    // Serial execution on 1 hot-spinner: 80 * 100µs = 8ms.
+    // With propagation recruiting 3 parked workers: ~80/4 * 100µs ≈ 2ms.
+    // Allow generous 6ms ceiling to absorb noise; serial behavior would
+    // clearly exceed this.
+    try std.testing.expect(elapsed_ns < 6 * std.time.ns_per_ms);
+}
+
+test "hot_spinners: wide-pool flood with cpu-count workers, hot_spinners=1" {
+    // High-worker-count stress: cpu_count (clamped to 64) workers,
+    // 1 reserved hot-spinner, 200k tasks, single submitter.
+    // Regression guard for correctness under realistic flood load.
+    const cpu_count = @min(std.Thread.getCpuCount() catch 4, 64);
+    if (cpu_count < 2) return; // need at least 2 workers for hot_spinners=1 to leave a non-hot worker
+
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = cpu_count,
+        .max_threads = cpu_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .hot_spinners = 1,
+        .wake_every_n_tasks = 64,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+    const total: u64 = 200_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(common.counterTask, @ptrCast(&counter), .{
+                .wait_group = &wg,
+            }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
