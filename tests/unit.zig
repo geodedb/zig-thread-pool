@@ -615,3 +615,45 @@ test "Config validate: explicit max_threads > 64 still rejected after normalized
     const cfg = (thread_pool.Config{ .max_threads = 65, .min_threads = 1 }).normalized();
     try std.testing.expectError(error.TooManyWorkers, cfg.validate());
 }
+
+test "non_empty_workers bitmap invariant under racing push/pop" {
+    // 8 workers pushing/popping 80k tasks; after quiesce, counter must
+    // equal total, queued/active must be 0, and a follow-up submit must
+    // still execute. Smoke test that the bitmap protocol doesn't break
+    // correctness under concurrent push (set), pop-to-empty (clear+recheck),
+    // and steal drain (clear+recheck).
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 8,
+        .max_threads = 8,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var wg = pool.waitGroup();
+
+    const total: u64 = 80_000;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+
+    // Give workers a brief window to drain late stragglers so counters settle.
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.queue_depth_current);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_tasks);
+
+    // Follow-up submit confirms end-to-end wakeup path still functions
+    // post-quiesce. If the bitmap were stuck-empty for a non-empty worker,
+    // this would either time out or execute via inject-queue fallback.
+    var final_counter = common.Counter{};
+    var final_wg = pool.waitGroup();
+    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg });
+    final_wg.wait();
+    try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
+}
