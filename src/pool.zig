@@ -190,10 +190,6 @@ const Sync = struct {
     backpressure_mutex: std.Thread.Mutex = .{},
     backpressure_cond: std.Thread.Condition = .{},
     backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Counter of descriptor releases since the last backpressure wake.
-    /// When it hits `config.wake_coalesce_batch`, `releaseDescriptor` signals
-    /// and resets the counter.
-    releases_since_signal: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
@@ -415,8 +411,8 @@ const Core = struct {
     }
 
     /// Wait for descriptor/queue capacity to free up, bounded by `deadline`
-    /// (absolute nanoseconds; 0 = no deadline). Cap each wait at 1ms so that
-    /// a missed coalesced signal can stall a submitter for at most ~1ms.
+    /// (absolute nanoseconds; 0 = no deadline). Cap each wait at 10ms so we
+    /// re-check state periodically even if a signal is missed.
     fn waitForCapacity(self: *Core, deadline: u64) void {
         _ = self.sync.backpressure_waiters.fetchAdd(1, .monotonic);
         defer _ = self.sync.backpressure_waiters.fetchSub(1, .monotonic);
@@ -426,8 +422,8 @@ const Core = struct {
 
         const wait_ns: u64 = if (deadline != 0) blk: {
             const now = nowNs();
-            break :blk if (now >= deadline) 0 else @min(deadline - now, 1_000_000);
-        } else 1_000_000;
+            break :blk if (now >= deadline) 0 else @min(deadline - now, 10_000_000);
+        } else 10_000_000;
 
         if (wait_ns > 0) {
             self.sync.backpressure_cond.timedWait(&self.sync.backpressure_mutex, wait_ns) catch {};
@@ -928,26 +924,10 @@ const Core = struct {
         // Wake one blocked submitter (if any) now that a descriptor is
         // available. Fast-path: skip the mutex entirely when no submitter
         // is blocked — the common uncontended case.
-        // Coalesce signals: only signal every wake_coalesce_batch releases
-        // to avoid ~1M mutex+futex round-trips on flood scenarios. The
-        // waiter's timedWait ceiling bounds worst-case missed-signal latency.
         if (self.sync.backpressure_waiters.load(.monotonic) > 0) {
-            const batch = self.config.wake_coalesce_batch;
-            const should_signal = if (batch == 0) true else blk: {
-                // Coalesce: only signal when this release crosses the batch boundary.
-                // Use fetchAdd and check if the new count >= batch.
-                const prev = self.sync.releases_since_signal.fetchAdd(1, .monotonic);
-                if (prev + 1 >= batch) {
-                    self.sync.releases_since_signal.store(0, .monotonic);
-                    break :blk true;
-                }
-                break :blk false;
-            };
-            if (should_signal) {
-                self.sync.backpressure_mutex.lock();
-                self.sync.backpressure_cond.signal();
-                self.sync.backpressure_mutex.unlock();
-            }
+            self.sync.backpressure_mutex.lock();
+            self.sync.backpressure_cond.signal();
+            self.sync.backpressure_mutex.unlock();
         }
     }
 
