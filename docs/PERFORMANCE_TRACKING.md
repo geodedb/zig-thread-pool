@@ -326,6 +326,53 @@ Both require a new spec + fresh A/B ceiling measurement before planning.
 2. **A/B must target the mechanic under measurement, not just the suspected bottleneck.** The pre-planning A/B (stub the wake block) validated the target (wake path). The post-implementation A/B (spin=0) validated the mechanic (spin → skip-wake → throughput). Both are needed — a valid target with an ineffective mechanic still produces zero gain.
 3. **Probability-of-engagement matters.** The design assumed workers would "often" be spinning at submit time without quantifying "often." Ratio of (spin window duration) : (inter-submit interval) is the correct figure of merit; when it's < 1, the mechanic effectively never fires.
 
+## Phase F1b: Reserved Hot-Spin Workers (negative result — REVERTED, A/B gate caught it)
+
+**Hypothesis:** F1's short-spin mechanic failed because its spin window (~128 ns) was 20× shorter than the inter-submit interval (~3 µs). F1b fixed this by reserving N workers that never park — making the "spin window" effectively ∞. Submitter would skip `futex_wake` unconditionally when `hot_spinners > 0`; reserved workers would propagate wakes every K tasks. See `docs/superpowers/specs/2026-04-12-phase-f1b-reserved-hot-spinners-design.md` and `docs/superpowers/plans/2026-04-12-phase-f1b-reserved-hot-spinners.md`.
+
+### Measured (median of 3, ReleaseFast, 56-core host)
+
+| Metric | hot_spinners=0 | hot_spinners=1 | Delta |
+|---|---:|---:|---:|
+| `flood_1m` ops/s | 384K | **398K** | +3.7% (noise) |
+| `contended_spawn_8x` ops/s (mean of 3) | 572K | 583K | noise |
+
+Rollback floor was 400K; 398K median triggered ROLLBACK. Behavior-change commits (Tasks 2–4: refactor + hot-spinner loop + conditional skip) were reset out. Retained (per plan's rollback clause): Task 1 (config fields + validation tests) and Tasks 5–7 (correctness + propagation + wide-pool stress tests) as permanent API+regression-guard surface.
+
+### Why F1b failed where F1 had succeeded mechanically
+
+F1b's *mechanic* DID engage — `hot_spinners=1` did mean worker 0 never parked and submitter DID skip the wake scan on the submit hot path. But throughput barely moved. The next post-revert deep re-profile revealed why: **the wake scan isn't the sole critical path; it shares the cache-line budget with three other contended atomics that F1b left alone**.
+
+### Deep re-profile: the actual bottleneck is cache-line contention across four atomics
+
+Systematic A/B-disable across every submit-path component (2026-04-12):
+
+| Component | Measured individual lift | New median | Notes |
+|---|---:|---:|---|
+| Baseline (no changes) | — | 331K | — |
+| Wake scan stubbed | +47% | 488K | O(N) is_parked load + futex_wake |
+| `queued_tasks` SC fetchAdd removed (and idle-spin poll removed) | +26% | 417K | Worker idle-spin hammers this cache line × 56 |
+| `submitted.fetchAdd(.monotonic)` removed + `hint_idx=0` | +28% | 422K | Cross-worker cache line bounces |
+| Descriptor CAS (`acquireDescriptor`/`releaseDescriptor` stubbed) | +16% | 383K | ABA-tagged free-list |
+| All three shared atomics removed simultaneously | **+210%** | **~1.0M** | Compound lift proves orthogonal-contention theory |
+| `inject_queue.tryPush` + everything downstream removed | +2770% | 9.51M | Queue is NOT the bottleneck |
+| `runTask` body (noop task function) | +0% | 330K | Task body is already free |
+
+### The cache-line contention theory
+
+F1/F1b's failure wasn't about engagement — it was that **the submit hot path has four contended atomics, not one**. Removing any single one in isolation lifts throughput by its individual measured amount (+16% to +47%), but the previous implementations didn't achieve this because they gated the removal behind a runtime condition that was rarely true (F1: short spin window) or imposed counterbalancing cost (F1b: reserved a worker, reducing pool capacity). A proper rewrite that **literally removes the work path on every submit** (not conditionally) should deliver the measured A/B lift.
+
+### Phases D/E/F1/F1b as a sequence
+
+All four phases eliminated a legitimate hot-path cost. All four measured ~0% wall-clock change. The pattern held because each phase's target, in isolation, was one of four overlapping contention sources on the same submit-path cache lines. Removing one leaves the other three holding the ceiling near-unchanged. The right approach: **sequential architectural rewrites, each actually eliminating (not conditionally skipping) the work**, with A/B gates on each to validate the measured lift shows up. Phase G targets the first of these — wake scan sharding.
+
+### Updated lessons learned (from F1, F1b, and the deep re-profile)
+
+1. **A/B-disable on the mechanic, every phase.** Proven across F1 and F1b. Rule now permanent.
+2. **Separating target validity from mechanism validity.** The 335K→488K wake-stub A/B proved the *target* was real (wake scan worth ~47%). F1/F1b failed because their *mechanisms* didn't actually eliminate the work on every submit. Next phase must show, by its own A/B, that the work is gone unconditionally.
+3. **Single-atomic phases work only if they literally remove the atomic from the hot path.** Conditional skips (F1, F1b) produce 0% because the atomic is still contended by the paths that don't skip. Rewrites that eliminate the atomic universally (e.g., replace O(N) scan with O(1) bitmap CTZ) DO realize their A/B lift, as long as the rewrite preserves correctness.
+4. **Inject queue is not the bottleneck at this scale.** The 9.5M number with queue bypassed proves the MPMC ring CAS is sub-µs/op. Further optimization of the queue is not the fast path to parity.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
