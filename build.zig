@@ -136,6 +136,14 @@ pub fn build(b: *std.Build) void {
     const micro_wake_step = b.step("bench-micro-wake", "Micro-benchmark: wake latency");
     micro_wake_step.dependOn(&run_micro_wake.step);
 
+    const tokio_bench = b.addExecutable(.{
+        .name = "thread-pool-tokio-parity",
+        .root_module = importedModule(b, "benchmarks/bench_tokio_parity.zig", target, .ReleaseFast, module),
+    });
+    const run_tokio_bench = b.addRunArtifact(tokio_bench);
+    const tokio_bench_step = b.step("bench-tokio-parity", "Tokio rt_multi_threaded parity benchmarks");
+    tokio_bench_step.dependOn(&run_tokio_bench.step);
+
     // Aggregate "bench-micro" step
     const micro_all_step = b.step("bench-micro", "All micro-benchmarks");
     micro_all_step.dependOn(&run_micro_submit.step);
