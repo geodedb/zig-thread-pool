@@ -26,11 +26,12 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 
 ## Micro: wake_latency (samples=5000, 2 workers, quiesce=300us, smp_allocator)
 
-| Phase | p50 (ns) | p95 (ns) | p99 (ns) |
-|-------|---------|----------|----------|
-| Phase 0 (baseline) | 9621 | 15181 | 23591 |
-| Phase 2 (Task 7: per-worker steal/park counters) | 10649 | 13016 | 16166 |
-| Phase 2 (Task 8: TaskDescriptor hot/cold split) | 9267 | 11026 | 14400 |
+| Phase | p50 (ns) | p95 (ns) | p99 (ns) | Notes |
+|-------|---------|----------|----------|-------|
+| Phase 0 (baseline) | 9621 | 15181 | 23591 | |
+| Phase 2 (Task 7: per-worker steal/park counters) | 10649 | 13016 | 16166 | |
+| Phase 2 (Task 8: TaskDescriptor hot/cold split) | 9267 | 11026 | 14400 | |
+| Phase 3 (Task 12: per-worker park condvar) | 12768 | 17140 | 21321 | median of 8 runs (10515, 12001, 12074, 12665, 12768, 13859, 13870, 14239, 14307 ns p50). Wake-bench is fixed at 2 workers where a shared park_mutex has ~zero contention, so this micro regresses here; the design removes an N-way mutex serialization point on submit and should pay off at higher worker counts — re-validate when macro adds many-worker scenarios. |
 
 ## Macro: conn_churn_seq (bench scenario, workers=2, queue=4096)
 

@@ -81,14 +81,19 @@ const Worker = struct {
     completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_idle_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scratch_init_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    park_mutex: std.Thread.Mutex = .{},
+    park_cond: std.Thread.Condition = .{},
+    /// 1 when this worker is parked, 0 otherwise. Fast-path check before
+    /// acquiring park_mutex during signal — saves a futex syscall when the
+    /// worker isn't actually parked.
+    is_parked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 };
 
-/// Synchronization primitives for task completion and worker parking.
+/// Synchronization primitives for task completion. Worker parking uses
+/// per-Worker park_mutex/park_cond to avoid contention on a shared mutex.
 const Sync = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
-    park_mutex: std.Thread.Mutex = .{},
-    park_cond: std.Thread.Condition = .{},
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
@@ -282,9 +287,12 @@ const Core = struct {
     fn joinAllWorkers(self: *Core) void {
         // Signal all workers to exit
         self.state.store(.stopping, .release);
-        self.sync.park_mutex.lock();
-        self.sync.park_cond.broadcast();
-        self.sync.park_mutex.unlock();
+        // Wake every worker so they observe the state change and exit.
+        for (self.workers) |*w| {
+            w.park_mutex.lock();
+            w.park_cond.broadcast();
+            w.park_mutex.unlock();
+        }
 
         // Join all threads
         for (self.workers) |*worker| {
@@ -434,10 +442,54 @@ const Core = struct {
         _ = self.counters.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
 
+        // Wake one parked worker. Round-robin on submit count to spread load
+        // across workers. Per-worker park primitives avoid the N-way mutex
+        // contention a shared park_mutex would create on the submit path.
+        //
+        // Correctness note: parked_workers is incremented under the target
+        // worker's park_mutex BEFORE the worker re-checks queued_tasks. We
+        // push the task and increment queued_tasks BEFORE loading
+        // parked_workers here. So if submitter observes parked_workers > 0,
+        // either (a) the worker has already finished its re-check and will
+        // enter timedWait without seeing our task — in which case our signal
+        // on its park_mutex/cond will deliver — or (b) the worker is still
+        // holding its park_mutex between parked_workers++ and the re-check,
+        // in which case our lock() will block until it either bails (no
+        // signal needed) or enters timedWait (our signal delivers).
+        //
+        // is_parked is an optimisation: when set we can skip workers that
+        // definitely aren't parked. When we observe parked_workers > 0 but
+        // no is_parked == 1 (worker is mid-transition), fall back to
+        // signalling the hinted worker under its park_mutex — this
+        // guarantees correctness at the cost of one extra futex syscall
+        // in the rare race window.
         if (self.counters.parked_workers.load(.monotonic) > 0) {
-            self.sync.park_mutex.lock();
-            self.sync.park_cond.signal();
-            self.sync.park_mutex.unlock();
+            const submitted = self.counters.submitted.load(.monotonic);
+            const hint_idx: usize = @intCast(submitted % self.workers.len);
+            var off: usize = 0;
+            var signalled = false;
+            while (off < self.workers.len) : (off += 1) {
+                const idx = (hint_idx + off) % self.workers.len;
+                const w = &self.workers[idx];
+                if (w.is_parked.load(.acquire) == 1) {
+                    w.park_mutex.lock();
+                    w.park_cond.signal();
+                    w.park_mutex.unlock();
+                    signalled = true;
+                    break;
+                }
+            }
+            if (!signalled) {
+                // Race-window fallback: broadcast to all workers. This is
+                // rare (only when a worker is between parked_workers++ and
+                // is_parked := 1), and broadcasting is cheap since at most
+                // a handful of workers exist.
+                for (self.workers) |*w| {
+                    w.park_mutex.lock();
+                    w.park_cond.signal();
+                    w.park_mutex.unlock();
+                }
+            }
         }
 
         return if (options.waitable)
@@ -627,17 +679,27 @@ const Core = struct {
 
         _ = worker.parks.fetchAdd(1, .release);
 
-        self.sync.park_mutex.lock();
+        worker.park_mutex.lock();
         _ = self.counters.parked_workers.fetchAdd(1, .monotonic);
         if (self.counters.queued_tasks.load(.acquire) != 0 or self.state.load(.acquire) != .running) {
             _ = self.counters.parked_workers.fetchSub(1, .monotonic);
-            self.sync.park_mutex.unlock();
+            worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
-        self.sync.park_cond.timedWait(&self.sync.park_mutex, self.config.idle_park_after_ns) catch {};
+        // Mark parked *before* waiting. The mutex is held, so any submitter
+        // that observes is_parked == 1 will block on park_mutex until we
+        // enter timedWait (which atomically releases the mutex and waits).
+        // Submitters that arrive before we set is_parked will have already
+        // observed parked_workers == 0 (or a different worker) and signalled
+        // that one; if they observed parked_workers > 0 but no worker has
+        // is_parked == 1 yet, the task is visible via queued_tasks and our
+        // double-check above handled it.
+        worker.is_parked.store(1, .release);
+        worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
+        worker.is_parked.store(0, .release);
         _ = self.counters.parked_workers.fetchSub(1, .monotonic);
-        self.sync.park_mutex.unlock();
+        worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .release);
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
