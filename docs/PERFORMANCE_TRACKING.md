@@ -130,6 +130,74 @@ The single-item steal improvement (+109%) and the recovered submit-latency
 mean the ring queue and park simplification are both net wins and should
 ship. The Tokio-parity 1M ops/s target is out of reach in this pass.
 
+## Phase D: Lock-Free Backpressure (negative result — REVERTED)
+
+**Hypothesis:** The Phase C residual-gap analysis named the backpressure
+condvar path as the flood_1m bottleneck (submitter blocks ~244× per 1M
+tasks, each paying a full mutex+futex round-trip). Phase D rewrote
+`waitForCapacity` as a lock-free spin→yield→sleep backoff and removed
+`backpressure_mutex` / `backpressure_cond` / `backpressure_waiters` from
+`Sync`. Expected ≥80% flood_1m throughput improvement. See
+`docs/superpowers/plans/2026-04-12-lock-free-backpressure.md`.
+
+**Measured (median of 5 runs, ReleaseFast, same host as Phase C):**
+
+| Metric | Phase C | Phase D (measured) | Delta |
+|---|---:|---:|---:|
+| `bench_tokio_parity/flood_1m` ops/s | 340K | 341K | +0.4% (noise) |
+| `bench_tokio_parity/contended_spawn_8x` ops/s | 534K | 510K | -4.5% |
+| submit p50 | 917 ns | 929 ns | +1.3% (noise) |
+| submit p99 | 1690 ns | 1754 ns | +3.8% |
+| `test-stress` 5× consecutive | pass | pass | no hang |
+
+Phase C rollback floor was flood_1m < 450K → revert. Measured 341K
+triggers the rollback unambiguously. Branch `feat/lock-free-backpressure`
+was reset to preserve only the two incidental test additions (Task 1
+regression guard, Task 6 deadline unit test) as permanent improvements.
+
+### Root-cause profile (perf + flame analysis, commit `850b0b5`)
+
+A post-measurement `perf record --call-graph dwarf -F 999` on flood_1m
+revealed the backpressure path was never the critical path:
+
+| Candidate path | Cumulative % of cycles |
+|---|---:|
+| **Work-stealing victim scan** (`nextTask` calling `LocalQueue.len()` across all siblings, two remote-atomic acquire-loads per victim per scan) | **42.1%** |
+| **Per-task worker park/unpark** (`park_cond.signal` + `timedWait`, ~1M context-switches for 1M tasks) | ~17–18% |
+| Inject queue pop | 7.7% |
+| Submit path total | 6.5% |
+| Descriptor CAS free-list (acquire + release combined) | ~2.7% |
+| Backpressure path | < 1% |
+
+- IPC = 0.19 (severe memory stalls).
+- Cache-miss rate = 34.1%.
+- 56 workers × 55 sibling scans → all-to-all cacheline ping-pong on each
+  local deque's `(top, bottom)` pair. Classic false-sharing topology.
+
+### Lessons learned
+
+1. **The Phase C gap analysis conflated "where the submitter spends its
+   blocked time" with "where the pool spends its total cycles."** The
+   submitter's 244 condvar round-trips are real but negligible as a
+   fraction of total CPU time when 56 workers are burning cycles scanning
+   each other.
+2. **`perf record` before planning, not after.** A 5-minute profile would
+   have redirected the plan to the steal-scan before any code was written.
+3. The lock-free backpressure implementation was correct (passed 5/5
+   stress runs, no regressions beyond noise), just off the critical path.
+
+### Follow-up targets (priority order)
+
+1. **Steal scan cacheline ping-pong** — maintain a global "non-empty
+   workers" bitmap updated lazily on push/pop; idle stealers CLZ-scan the
+   bitmap instead of peeking every sibling's `(top, bottom)` pair.
+   Expected impact: 30–40% of flood_1m cycles reclaimable.
+2. **Per-task park/unpark** — with the scan fixed, workers should find
+   work without parking, but a keep-alive spin window on recent-submit
+   workers is insurance.
+3. Backpressure lock-free rewrite is **not shipped**; revisit only if a
+   future workload actually makes it a bottleneck.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
