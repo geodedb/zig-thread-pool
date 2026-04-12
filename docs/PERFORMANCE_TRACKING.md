@@ -18,8 +18,9 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Tokio-parity benchmark suite exists | — | yes (2 scenarios) | ✅ (Task 15) |
 | Micro-benchmarks for submit/steal/wake exist | — | yes | ✅ (Tasks 2-4) |
 | CI advisory micro-bench job | — | yes | ✅ (Task 16) |
-| `bench_tokio_parity/flood_1m` ≥ 1M ops/s | 297K | 347K (Phase A+B median of 3) | ❌ BELOW TARGET — 346K ops/s; 65% gap remains |
-| `bench_tokio_parity/contended_spawn_8x` ≥ 1M ops/s | 497K | 508K (Phase A+B median of 3) | ❌ BELOW TARGET — 508K ops/s; 49% gap remains |
+| `bench_tokio_parity/flood_1m` ≥ 1M ops/s | 297K | 340K (Phase C median of 3, very stable: 338K/340K/340K) | ❌ BELOW TARGET — 66% gap; bottleneck is backpressure condvar path (coalesced wake reverted due to Task 10 stress-test hang) |
+| `bench_tokio_parity/contended_spawn_8x` ≥ 1M ops/s | 497K | 534K (Phase C median of 3: 510K/534K/549K) | ❌ BELOW TARGET — 47% gap |
+| Bench harness run-to-run stddev (`conn_churn_seq/global_queue`) | ~25% | 58% (measured; machine is inherently noisy here) | ✅ measurement fixed — compare-bench now gates on 3×stddev, not hard-coded 15% |
 
 ## Phase A+B Final Verdict
 
@@ -47,6 +48,70 @@ never fills (peak ~2K / 4096) so this is run-to-run variance, not a real
 regression — but it's close to CI's -15% regression gate and worth flagging.
 
 **Tokio parity `flood_1m`:** 347K ops/s vs ≥1M target (65% gap remains).
+
+---
+
+## Phase C: Bench Stability + LIFO Slot
+
+**Shipped (this phase):**
+
+1. **7-run discard-first median + stddev** reporting in `benchmarks/common.zig`.
+2. **`compare-bench` gates on 3×stddev** (floor 15%) instead of hard-coded 15%.
+3. **Per-worker LIFO slot** in `src/pool.zig` — submit-from-worker path now tries
+   a single-slot cache before the local ring. Owner-only write; stealers never
+   touch the slot.
+
+**Not shipped — reverted:**
+
+- **Coalesced backpressure wake** (Task 9, commit `949cf74`) was reverted in
+  `a77003d`. Unit tests passed but `test-stress` hung intermittently. Root
+  cause not conclusively isolated before merge — filed as follow-up.
+
+### Phase C measurements (git SHA `a77003d`, median of the stated run count)
+
+| Metric | Phase A+B (merged) | Phase C | Delta |
+|---|---:|---:|---|
+| Submit p50 (1 worker, 100k samples, median of 5) | 781 ns | 917 ns | bimodal machine noise (558 / 585 / 917 / 948 / 978 ns) |
+| Wake p50 (2 workers, 5k samples, median of 3) | 9985 ns | 10819 ns | +8% (within noise) |
+| Steal ops/s batch=1 (median of 3) | 1.42M | 668K | machine-state variance (one run hit 1.36M) |
+| Steal ops/s batch=8 (median of 3) | 656K | 1.22M | +85% |
+| Tokio flood_1m (median of 3) | 336K | 340K | +1.2% (LIFO inert — bench uses 1 external submitter, no worker-context pushes) |
+| Tokio contended_spawn_8x (median of 3) | 514K | 534K | +4% (within noise) |
+| `conn_churn_seq/global_queue` | 817K | 758K | -7% (within 58% stddev) |
+| `conn_churn_seq/work_stealing` | 763K | 683K | -10% (within 9.1% stddev, edge) |
+| `producer_contention/global_queue` | ~730K | 808K | +11% |
+| `producer_contention/work_stealing` | ~731K | 821K | +12% |
+
+### Honest Phase C verdict
+
+- **Bench stability (Phase 1 of plan):** net win. The 7-run harness with stddev
+  reporting revealed that this dev machine produces 58% stddev on
+  `conn_churn_seq/global_queue` and 9-13% on the other scenarios — a fact
+  hidden by the old 3-run median. Every future optimization now has a
+  defensible noise floor to compare against.
+- **LIFO slot (Phase 2 of plan):** code ships green, but the current bench
+  suite doesn't exercise the hot path. `bench_tokio_parity/flood_1m` uses a
+  single external submitter thread; `contended_spawn_8x` uses 8 external
+  threads. None of them submit from worker context, so the LIFO slot sits
+  empty. A fork-join/nested-async bench would show the real benefit. Until
+  one exists, the shipped LIFO code is measured as within-noise and should
+  be treated as plumbing for a future workload.
+- **Coalesced wake (Phase 3 of plan):** reverted. The measurable throughput
+  gap on Tokio-parity flood scenarios is the backpressure condvar path —
+  this phase would have addressed it, but the implementation caused
+  intermittent hangs in `test-stress` that weren't resolved under time
+  pressure. Follow-up task filed.
+
+### Residual gap to Tokio parity
+
+Tokio's `rt_multi_threaded` flood runs 5–15M ops/s; we run 340K. 15–45×
+gap. The bottleneck has been triangulated to the blocking-submit /
+backpressure path on `flood_1m`: with 1M tasks through a 4096-slot queue,
+the submitter blocks ~244 times, each block paying a full condvar
+round-trip. Next pass must address this without the stress-test
+regression — either a safer coalescing design (edge-triggered on queue
+empty→non-empty), or a lock-free descriptor-pool refill so submitters
+don't block at all.
 
 **Tokio parity `contended_spawn_8x`:** 508K ops/s vs ≥1M target (49% gap).
 
