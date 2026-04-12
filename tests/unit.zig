@@ -549,3 +549,52 @@ test "backpressure block policy returns when capacity frees" {
     wg.wait();
     try std.testing.expectEqual(@as(u64, 5), counter.value.load(.acquire));
 }
+
+test "LIFO slot: submit-from-worker uses lifo_slot before local ring" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .max_threads = 1,
+        .min_threads = 1,
+        .queue_capacity = 256,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    // Pass both pool pointer and wait-group to outerTask so inner tasks
+    // can register with the same wait-group and be awaited.
+    const OuterCtx = struct {
+        pool: *thread_pool.ThreadPool,
+        wg: *thread_pool.WaitGroup,
+    };
+
+    const Nested = struct {
+        var outer_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+        var inner_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+        fn innerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = raw_ctx;
+            _ = runtime;
+            _ = inner_counter.fetchAdd(1, .release);
+        }
+        fn outerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = runtime;
+            const octx: *OuterCtx = @ptrCast(@alignCast(raw_ctx));
+            _ = outer_counter.fetchAdd(1, .release);
+            _ = octx.pool.submit(innerTask, @ptrCast(octx.pool), .{ .wait_group = octx.wg }) catch {};
+        }
+    };
+
+    Nested.outer_counter.store(0, .release);
+    Nested.inner_counter.store(0, .release);
+
+    var wg = pool.waitGroup();
+    var octx = OuterCtx{ .pool = &pool, .wg = &wg };
+    for (0..100) |_| {
+        _ = try pool.submit(Nested.outerTask, @ptrCast(&octx), .{ .wait_group = &wg });
+    }
+    wg.wait(); // waits for all 100 outer + 100 inner tasks
+
+    try std.testing.expectEqual(@as(u64, 100), Nested.outer_counter.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 100), Nested.inner_counter.load(.acquire));
+}

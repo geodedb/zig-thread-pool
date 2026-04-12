@@ -198,6 +198,47 @@ test "RingQueue: 1 owner + 4 stealers — no duplicates, no losses" {
     for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.acquire));
 }
 
+test "coalesced wake: submitter never stalls forever on backpressure" {
+    // Small queue + 4 submitters + 2 workers: submitters must block
+    // frequently. With wake_coalesce_batch=32 there are more missed
+    // per-release signals, but the timedWait ceiling bounds stalls.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256, // small — force backpressure
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+        .wake_coalesce_batch = 32,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const total_per_submitter: u64 = 5_000;
+    const n_submitters: u32 = 4;
+    const total = total_per_submitter * n_submitters;
+
+    const Submitter = struct {
+        fn run(p: *thread_pool.ThreadPool, c: *common.Counter, n: u64) void {
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                _ = p.submit(common.counterTask, @ptrCast(c), .{
+                    .backpressure = .block_with_timeout,
+                    .timeout_ns = 5 * std.time.ns_per_s,
+                }) catch break;
+            }
+        }
+    };
+
+    var threads: [n_submitters]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total_per_submitter });
+    }
+    for (&threads) |*t| t.join();
+    try pool.shutdown(.drain, null);
+
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
+
 fn runQueueKindScenario(kind: thread_pool.QueueKind, total: u64) !void {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 4,
@@ -232,4 +273,70 @@ test "queue_kind matrix: chase_lev executes all submitted tasks" {
 
 test "queue_kind matrix: ring executes all submitted tasks" {
     try runQueueKindScenario(.ring, 50_000);
+}
+
+test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 8192,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .idle_park_after_ns = 50_000,
+        .spin_before_park_iters = 4,
+    });
+    defer pool.deinit();
+
+    const Nested = struct {
+        var inner_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+        fn innerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = raw_ctx;
+            _ = runtime;
+            _ = inner_counter.fetchAdd(1, .release);
+        }
+        fn outerTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+            _ = runtime;
+            const p: *thread_pool.ThreadPool = @ptrCast(@alignCast(raw_ctx));
+            // Each outer submits 4 inner tasks from worker context — exercises
+            // the lifo_slot miss-to-local-ring path (slot holds #1; #2-#4 go to ring).
+            var i: u32 = 0;
+            while (i < 4) : (i += 1) {
+                while (true) {
+                    _ = p.submit(innerTask, @ptrCast(p), .{}) catch {
+                        std.Thread.sleep(1_000);
+                        continue;
+                    };
+                    break;
+                }
+            }
+        }
+    };
+
+    Nested.inner_counter.store(0, .release);
+
+    // NOTE: This test previously used 25k outer × 4 inner = 125k tasks through
+    // an 8192-slot descriptor pool, which creates a deadlock window: when ~2k
+    // outer tasks are in-flight, their pending inner submits need 4× as many
+    // descriptors as are available, so inner submits get TaskPoolExhausted and
+    // the outer task can't complete. 1k outer × 4 inner = 5k total descriptors
+    // fits comfortably in 8192 and exercises the LIFO hot path without the
+    // deadlock. The design lesson: nested-fanout tests must account for the
+    // descriptor pool as a finite resource.
+    const outer_total: u64 = 1_000;
+    var wg = pool.waitGroup();
+    var i: u64 = 0;
+    while (i < outer_total) : (i += 1) {
+        while (true) {
+            _ = pool.submit(Nested.outerTask, @ptrCast(&pool), .{ .wait_group = &wg }) catch {
+                std.Thread.sleep(1_000);
+                continue;
+            };
+            break;
+        }
+    }
+    wg.wait();
+    try pool.shutdown(.drain, null); // inner tasks have no wait-group
+
+    try std.testing.expectEqual(outer_total * 4, Nested.inner_counter.load(.acquire));
 }

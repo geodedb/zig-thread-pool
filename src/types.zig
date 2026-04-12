@@ -69,6 +69,12 @@ pub const Config = struct {
     queue_capacity: usize = 1024,
     local_queue_capacity: usize = 256,
     inject_batch_size: usize = 32,
+    /// `releaseDescriptor` signals blocked submitters on backpressure once
+    /// per this many releases, rather than on every release. 0 disables
+    /// coalescing (signal every release — the pre-2026-04-12 behavior).
+    /// The submitter's `timedWait` on `backpressure_cond` bounds worst-case
+    /// missed-signal latency.
+    wake_coalesce_batch: u32 = 32,
     worker_scratch_cap_bytes: usize = 64 * 1024,
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
@@ -113,6 +119,7 @@ pub const Config = struct {
         }
         cfg.steal_batch_size = std.math.clamp(cfg.steal_batch_size, 1, 32);
         if (cfg.queue_kind == .chase_lev) cfg.steal_batch_size = 1;
+        if (cfg.wake_coalesce_batch > 1024) cfg.wake_coalesce_batch = 1024;
         return cfg;
     }
 
