@@ -518,3 +518,28 @@ test "Stats.started and .completed aggregate from per-worker counters" {
     try std.testing.expectEqual(@as(u64, 64), stats.started);
     try std.testing.expectEqual(@as(u64, 64), stats.completed);
 }
+
+test "backpressure block policy returns when capacity frees" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 1,
+        .queue_capacity = 4,
+        .local_queue_capacity = 2,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // Fill the descriptor pool with tasks.
+    for (0..4) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    // This one must block (no descriptors available) then succeed once the
+    // worker drains a task and releases a descriptor, which signals the
+    // backpressure condvar.
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{
+        .wait_group = &wg,
+        .backpressure = .block,
+    });
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 5), counter.value.load(.acquire));
+}

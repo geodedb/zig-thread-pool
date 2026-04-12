@@ -94,6 +94,15 @@ const Worker = struct {
 const Sync = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
+    /// Backpressure primitives: blocked submitters (when queue/descriptor
+    /// pool is full) sleep on `backpressure_cond` rather than polling with
+    /// a fixed-interval `Thread.sleep`. `releaseDescriptor` signals the
+    /// condvar when capacity becomes available. `backpressure_waiters` is
+    /// an atomic fast-path counter so the producer path can skip acquiring
+    /// `backpressure_mutex` entirely when nobody is blocked.
+    backpressure_mutex: std.Thread.Mutex = .{},
+    backpressure_cond: std.Thread.Condition = .{},
+    backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
@@ -293,6 +302,12 @@ const Core = struct {
             w.park_cond.broadcast();
             w.park_mutex.unlock();
         }
+        // Wake any submitters blocked on backpressure so they observe the
+        // state change and return error.ShutdownInProgress instead of
+        // sleeping forever.
+        self.sync.backpressure_mutex.lock();
+        self.sync.backpressure_cond.broadcast();
+        self.sync.backpressure_mutex.unlock();
 
         // Join all threads
         for (self.workers) |*worker| {
@@ -302,6 +317,26 @@ const Core = struct {
             }
         }
         self.state.store(.stopped, .release);
+    }
+
+    /// Wait for descriptor/queue capacity to free up, bounded by `deadline`
+    /// (absolute nanoseconds; 0 = no deadline). Cap each wait at 10ms so we
+    /// re-check state periodically even if a signal is missed.
+    fn waitForCapacity(self: *Core, deadline: u64) void {
+        _ = self.sync.backpressure_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.sync.backpressure_waiters.fetchSub(1, .monotonic);
+
+        self.sync.backpressure_mutex.lock();
+        defer self.sync.backpressure_mutex.unlock();
+
+        const wait_ns: u64 = if (deadline != 0) blk: {
+            const now = nowNs();
+            break :blk if (now >= deadline) 0 else @min(deadline - now, 10_000_000);
+        } else 10_000_000;
+
+        if (wait_ns > 0) {
+            self.sync.backpressure_cond.timedWait(&self.sync.backpressure_mutex, wait_ns) catch {};
+        }
     }
 
     pub fn statsSnapshot(self: *Core) types.Stats {
@@ -398,7 +433,7 @@ const Core = struct {
                 error.QueueFull, error.TaskPoolExhausted => {
                     if (!allow_block or options.backpressure == .return_error) return err;
                     if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
-                    std.Thread.sleep(50_000);
+                    self.waitForCapacity(deadline);
                 },
                 else => return err,
             }
@@ -791,7 +826,16 @@ const Core = struct {
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
                 continue;
             }
-            return;
+            break;
+        }
+
+        // Wake one blocked submitter (if any) now that a descriptor is
+        // available. Fast-path: skip the mutex entirely when no submitter
+        // is blocked — the common uncontended case.
+        if (self.sync.backpressure_waiters.load(.monotonic) > 0) {
+            self.sync.backpressure_mutex.lock();
+            self.sync.backpressure_cond.signal();
+            self.sync.backpressure_mutex.unlock();
         }
     }
 

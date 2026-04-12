@@ -40,3 +40,11 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Phase 2 (Task 8: TaskDescriptor hot/cold split) | global_queue | 1731709 | 532 | 813 | |
 | Phase 2 (Task 8: TaskDescriptor hot/cold split) | work_stealing | 1680812 | 554 | 891 | |
 | Phase 3 (Task 11: skip-empty victims in steal scan) | work_stealing | 895954 | 1211 | 2159 | high run-to-run variance (788K–984K across 3 runs); this scenario rarely triggers steals, so the skip-empty change is effectively inert here — the swing is environmental noise |
+
+## Macro: producer_contention (bench scenario, workers=2, submitters=4, queue=4096)
+
+| Phase | scheduler | ops/s | submit p50 (ns) | submit p99 (ns) | completion p50 (ns) | completion p99 (ns) | Notes |
+|-------|-----------|-------|-----------------|-----------------|---------------------|---------------------|-------|
+| Phase 0 (baseline, pre-Phase-4) | work_stealing | — | — | — | ~1460000 | ~1690000 | baseline reference from plan — 50us poll-sleep dominated submit p99 under contention |
+| Phase 4 (Task 13: backpressure condvar) | global_queue | 684493 | 3627 | 10550 | 1765264 | 1985233 | — |
+| Phase 4 (Task 13: backpressure condvar) | work_stealing | 908583 | 2937 | 12791 | 1241252 | 1822769 | queue_peak=2172 < capacity=4096 so the queue-full branch wasn't exercised in this run — backpressure_waiters stays 0, the signal path is skipped entirely, and the change is a wash here. Expected payoff shows in scenarios where submitters actually block (e.g. scale-bench with small queue_capacity). Stress tests pass 10/10. |
