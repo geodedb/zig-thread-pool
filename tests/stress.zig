@@ -105,3 +105,95 @@ test "park handshake: no lost wakeups under submit-while-parking race" {
 
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 }
+
+test "RingQueue: 1 owner + 4 stealers — no duplicates, no losses" {
+    const allocator = std.testing.allocator;
+    const N: u32 = 100_000;
+    const M_stealers: u32 = 4;
+
+    var q = try thread_pool.RingQueue(u32).init(allocator, 1024);
+    defer q.deinit();
+
+    const seen = try allocator.alloc(std.atomic.Value(u8), N);
+    defer allocator.free(seen);
+    for (seen) |*s| s.* = std.atomic.Value(u8).init(0);
+
+    var pushed = std.atomic.Value(u32).init(0);
+    var stolen = std.atomic.Value(u32).init(0);
+    var popped = std.atomic.Value(u32).init(0);
+
+    const Owner = struct {
+        fn run(
+            ptr_q: *thread_pool.RingQueue(u32),
+            pushed_ctr: *std.atomic.Value(u32),
+            popped_ctr: *std.atomic.Value(u32),
+            seen_arr: []std.atomic.Value(u8),
+            total: u32,
+        ) void {
+            var i: u32 = 0;
+            while (i < total) {
+                if (ptr_q.tryPush(i)) {
+                    _ = pushed_ctr.fetchAdd(1, .release);
+                    i += 1;
+                } else {
+                    // Queue full — drain some locally to make room.
+                    while (ptr_q.pop()) |v| {
+                        const old = seen_arr[v].fetchAdd(1, .release);
+                        std.debug.assert(old == 0);
+                        _ = popped_ctr.fetchAdd(1, .release);
+                    }
+                }
+            }
+            // Final drain.
+            while (ptr_q.pop()) |v| {
+                const old = seen_arr[v].fetchAdd(1, .release);
+                std.debug.assert(old == 0);
+                _ = popped_ctr.fetchAdd(1, .release);
+            }
+        }
+    };
+
+    const Stealer = struct {
+        fn run(
+            ptr_q: *thread_pool.RingQueue(u32),
+            stolen_ctr: *std.atomic.Value(u32),
+            seen_arr: []std.atomic.Value(u8),
+            done: *std.atomic.Value(u8),
+        ) void {
+            var buf: [32]u32 = undefined;
+            while (done.load(.acquire) == 0) {
+                const n = ptr_q.stealHalf(buf[0..]);
+                for (buf[0..n]) |v| {
+                    const old = seen_arr[v].fetchAdd(1, .release);
+                    std.debug.assert(old == 0);
+                }
+                _ = stolen_ctr.fetchAdd(@intCast(n), .release);
+            }
+            // Final drain pass after owner signals done.
+            var buf2: [32]u32 = undefined;
+            while (true) {
+                const n = ptr_q.stealHalf(buf2[0..]);
+                if (n == 0) break;
+                for (buf2[0..n]) |v| {
+                    const old = seen_arr[v].fetchAdd(1, .release);
+                    std.debug.assert(old == 0);
+                }
+                _ = stolen_ctr.fetchAdd(@intCast(n), .release);
+            }
+        }
+    };
+
+    var done = std.atomic.Value(u8).init(0);
+    var threads: [M_stealers]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Stealer.run, .{ &q, &stolen, seen, &done });
+    }
+    const owner = try std.Thread.spawn(.{}, Owner.run, .{ &q, &pushed, &popped, seen, N });
+    owner.join();
+    done.store(1, .release);
+    for (&threads) |*t| t.join();
+
+    try std.testing.expectEqual(N, pushed.load(.acquire));
+    try std.testing.expectEqual(N, popped.load(.acquire) + stolen.load(.acquire));
+    for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.acquire));
+}
