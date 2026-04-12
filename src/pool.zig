@@ -100,10 +100,7 @@ const Counters = struct {
 
     // === Diagnostic/cold counters ===
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    parks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queue_depth_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     task_desc_live: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     task_desc_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -293,23 +290,32 @@ const Core = struct {
         var aggregate_wakeups: u64 = 0;
         var aggregate_started: u64 = 0;
         var aggregate_completed: u64 = 0;
+        var aggregate_steals: u64 = 0;
+        var aggregate_steal_failures: u64 = 0;
+        var aggregate_parks: u64 = 0;
         for (self.workers, 0..) |*worker, idx| {
             const w_wakeups = worker.wakeups.load(.acquire);
             const w_started = worker.started.load(.acquire);
             const w_completed = worker.completed.load(.acquire);
+            const w_steals = worker.steals.load(.acquire);
+            const w_steal_failures = worker.steal_failures.load(.acquire);
+            const w_parks = worker.parks.load(.acquire);
             aggregate_wakeups += w_wakeups;
             aggregate_started += w_started;
             aggregate_completed += w_completed;
+            aggregate_steals += w_steals;
+            aggregate_steal_failures += w_steal_failures;
+            aggregate_parks += w_parks;
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
                 .busy_ns = worker.busy_ns.load(.acquire),
                 .idle_ns = worker.idle_ns.load(.acquire),
                 .local_queue_depth = @as(u32, @intCast(self.local_queues[idx].len())),
                 .local_queue_peak = worker.local_queue_peak.load(.acquire),
-                .parks = worker.parks.load(.acquire),
+                .parks = w_parks,
                 .wakeups = w_wakeups,
-                .steals = worker.steals.load(.acquire),
-                .steal_failures = worker.steal_failures.load(.acquire),
+                .steals = w_steals,
+                .steal_failures = w_steal_failures,
                 .started = w_started,
                 .completed = w_completed,
                 .scratch_current_bytes = @as(u64, @intCast(worker.scratch.bytesCurrent())),
@@ -335,10 +341,10 @@ const Core = struct {
             .parked_workers = self.counters.parked_workers.load(.acquire),
             .queue_depth_current = self.counters.queued_tasks.load(.acquire),
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
-            .steals = self.counters.steals.load(.acquire),
-            .steal_failures = self.counters.steal_failures.load(.acquire),
+            .steals = aggregate_steals,
+            .steal_failures = aggregate_steal_failures,
             .wakeups = aggregate_wakeups,
-            .parks = self.counters.parks.load(.acquire),
+            .parks = aggregate_parks,
             .task_desc_live = self.counters.task_desc_live.load(.acquire),
             .task_desc_peak = self.counters.task_desc_peak.load(.acquire),
             .total_alloc_bytes = self.counters.total_alloc_bytes.load(.acquire),
@@ -486,13 +492,11 @@ const Core = struct {
                 if (victim_index == worker_index) continue;
                 if (self.local_queues[victim_index].stealTop()) |descriptor_index| {
                     self.decrementQueued();
-                    _ = self.counters.steals.fetchAdd(1, .monotonic);
                     _ = worker.steals.fetchAdd(1, .release);
                     return descriptor_index;
                 }
             }
 
-            _ = self.counters.steal_failures.fetchAdd(1, .monotonic);
             _ = worker.steal_failures.fetchAdd(1, .release);
             return null;
         }
@@ -588,7 +592,6 @@ const Core = struct {
 
         if (self.state.load(.acquire) != .running) return;
 
-        _ = self.counters.parks.fetchAdd(1, .monotonic);
         _ = worker.parks.fetchAdd(1, .release);
 
         self.sync.park_mutex.lock();

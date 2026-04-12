@@ -333,6 +333,37 @@ test "Stats.wakeups aggregates from per-worker counters" {
     try std.testing.expectEqual(expected, stats.wakeups);
 }
 
+test "Stats.steals/parks aggregate per-worker under work-stealing" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 4,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..256) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+
+    var expected_steals: u64 = 0;
+    var expected_steal_failures: u64 = 0;
+    var expected_parks: u64 = 0;
+    for (stats.worker_stats) |w| {
+        expected_steals += w.steals;
+        expected_steal_failures += w.steal_failures;
+        expected_parks += w.parks;
+    }
+    try std.testing.expectEqual(expected_steals, stats.steals);
+    try std.testing.expectEqual(expected_steal_failures, stats.steal_failures);
+    try std.testing.expectEqual(expected_parks, stats.parks);
+}
+
 test "timestamp_mode disabled zeroes histograms" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 2,
