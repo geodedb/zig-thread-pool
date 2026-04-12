@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .root_module = importedModule(b, "benchmarks/micro/steal_throughput.zig", target, .ReleaseFast, module),
     });
     const run_micro_steal = b.addRunArtifact(micro_steal);
+    if (b.args) |args| run_micro_steal.addArgs(args);
     const micro_steal_step = b.step("bench-micro-steal", "Micro-benchmark: steal throughput");
     micro_steal_step.dependOn(&run_micro_steal.step);
 

@@ -52,6 +52,8 @@ different deque design.
 | Phase 2 (Task 8: TaskDescriptor hot/cold split) | 1437441 | 0 | 120361 | |
 | Phase 3 (Task 10: batch-steal infra, default size=1) | 636735 | 0 | 101621 | wash — batch-steal default disabled due to popBottom race; infra ready for future deque rework |
 | Phase 3 (Task 11: skip-empty victims in steal scan) | 677374 | 0 | 114851 | median of 2 runs (670408, 684341); +6.4% vs Task 10 by skipping seq_cst CAS on victims whose cheap `len()` peek shows empty |
+| Phase B (ring queue, batch=1) | 1417145 | 0 | 141358 | Task B4: RingQueue replaces Chase-Lev; steal_batch_size=1 for apples-to-apples; median of 5 runs (1390204, 1405719, 1417145, 1429080, 1438065) |
+| Phase B (ring queue, batch=8) | 656631 | 0 | 77245 | Task B4: true batch-steal via stealHalf; expected to scale vs batch=1; median of 5 runs (650127, 653360, 656631, 678349, 1427207); one high outlier excluded from interpretation |
 
 ## Micro: wake_latency (samples=5000, 2 workers, quiesce=300us, smp_allocator)
 

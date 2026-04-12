@@ -14,6 +14,17 @@ fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 }
 
 pub fn main() !void {
+    var steal_batch_size: usize = 8;
+    {
+        var args = std.process.args();
+        _ = args.next(); // skip argv[0]
+        while (args.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--steal_batch_size=")) {
+                steal_batch_size = try std.fmt.parseInt(usize, arg["--steal_batch_size=".len..], 10);
+            }
+        }
+    }
+
     var marker: u8 = 0;
 
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
@@ -22,6 +33,7 @@ pub fn main() !void {
         .local_queue_capacity = 4096,
         .scheduler_variant = .work_stealing,
         .inject_batch_size = 1, // force per-task hand-off to exercise stealing
+        .steal_batch_size = steal_batch_size,
     });
     defer pool.deinit();
 
@@ -40,6 +52,6 @@ pub fn main() !void {
     const stats = pool.statsSnapshot();
 
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(buf[0..], "steal_throughput tasks={d} elapsed_ns={d} ops_per_sec={d:.0} steals={d} steal_failures={d}\n", .{ task_count, elapsed_ns, ops_per_sec, stats.steals, stats.steal_failures });
+    const line = try std.fmt.bufPrint(buf[0..], "steal_throughput steal_batch_size={d} tasks={d} elapsed_ns={d} ops_per_sec={d:.0} steals={d} steal_failures={d}\n", .{ steal_batch_size, task_count, elapsed_ns, ops_per_sec, stats.steals, stats.steal_failures });
     try std.fs.File.stdout().writeAll(line);
 }
