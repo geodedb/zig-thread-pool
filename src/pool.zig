@@ -141,6 +141,10 @@ const TaskDescriptor = struct {
     }
 };
 
+/// Sentinel value meaning "the lifo_slot is empty". Chosen as the max u32
+/// so descriptor indices (0..queue_capacity-1) never collide.
+const LIFO_SLOT_EMPTY: u32 = 0xFFFF_FFFF;
+
 const Worker = struct {
     thread: ?std.Thread = null,
     scratch: WorkerScratch,
@@ -163,6 +167,13 @@ const Worker = struct {
     /// acquiring park_mutex during signal — saves a futex syscall when the
     /// worker isn't actually parked.
     is_parked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Tokio-style single-slot LIFO cache. When a task is submitted from this
+    /// worker's thread, it goes here first (single atomic store); `nextTask`
+    /// pops the slot ahead of the local ring. Cross-worker submits never
+    /// touch this slot. Stealers never touch this slot either — only the
+    /// owner writes to it. Sentinel value `LIFO_SLOT_EMPTY` (0xFFFF_FFFF)
+    /// means "no cached task".
+    lifo_slot: std.atomic.Value(u32) = std.atomic.Value(u32).init(LIFO_SLOT_EMPTY),
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
