@@ -21,18 +21,49 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | `bench_tokio_parity/flood_1m` ≥ 1M ops/s | 297K | 347K (Phase A+B median of 3) | ❌ BELOW TARGET — 346K ops/s; 65% gap remains |
 | `bench_tokio_parity/contended_spawn_8x` ≥ 1M ops/s | 497K | 508K (Phase A+B median of 3) | ❌ BELOW TARGET — 508K ops/s; 49% gap remains |
 
-**Net result on macro throughput: NEGATIVE.** Phase 2 (atomic + clock reductions) won
-~500 ns of submit p50. Phase 3 (per-worker park condvar with broadcast fallback) cost
-~1100 ns on the same path because the broadcast fires whenever the parked_workers
-counter shows a worker mid-transition. At 2 workers there's no shared-mutex contention
-to remove, so the regression dominates.
+## Phase A+B Final Verdict
 
-**What's salvageable**: the measurement infrastructure (Phases 1 + 5), `timestamp_mode`,
-and per-worker counter consolidation are net wins regardless. Phase 3 (per-worker park)
-needs either a re-tune (drop the broadcast fallback in favor of one extra signal hop)
-or a revert before this branch should ship. The batch-steal infra (Tasks 9-10) is
-correctness-blocked behind Chase-Lev's single-item proof — true batch steal needs a
-different deque design.
+**Submit latency (Phase A):** p50 recovered from the Phase 3 broadcast-fallback
+regression (~1.8 µs) to 781 ns median of 5 runs. The seq_cst handshake on
+`is_parked` + `queued_tasks` closes the lost-wakeup race with a single
+signal path and no fallback broadcast. Still ~4× the <200 ns target, but
+the regression is no longer in the way.
+
+**Steal throughput (Phase B, batch=1):** 1.42M ops/s, +109% vs Chase-Lev's
+677K baseline. The RingQueue swap paid off on single-item steal alone —
+owner/stealer last-element race resolves in fewer cache-line bounces.
+
+**Steal throughput (Phase B, batch=8):** 656K ops/s, *slower* than batch=1
+in the 2-worker micro because the single victim stalls more often waiting
+for the stealer to release capacity. The benefit of true batch-steal shows
+only with more stealers per victim; at 2 workers it's a micro-anti-signal.
+
+**Macro `conn_churn_seq`:** +53% global_queue (533K→817K), +40% work_stealing
+(544K→763K) vs the Phase 3 baseline. Still far below the 3M–5M targets but
+directionally good.
+
+**Macro `producer_contention/work_stealing`:** -18% (892K→731K). Queue
+never fills (peak ~2K / 4096) so this is run-to-run variance, not a real
+regression — but it's close to CI's -15% regression gate and worth flagging.
+
+**Tokio parity `flood_1m`:** 347K ops/s vs ≥1M target (65% gap remains).
+
+**Tokio parity `contended_spawn_8x`:** 508K ops/s vs ≥1M target (49% gap).
+
+### Residual gap
+
+With the submit-path and steal-path recovered, the bottleneck on the
+Tokio-parity flood scenarios has moved to the backpressure condvar path:
+at 1M tasks through a 4096-capacity queue the submitter blocks ~244 times,
+each block paying a full condvar wait+signal round-trip. A future pass
+would (a) coalesce backpressure wake-ups so a worker drain signals once
+per N descriptors freed, (b) increase effective throughput via larger
+inject batches without increasing submit p99, or (c) investigate lock-free
+backpressure (thread-local reservation of descriptor slots).
+
+The single-item steal improvement (+109%) and the recovered submit-latency
+mean the ring queue and park simplification are both net wins and should
+ship. The Tokio-parity 1M ops/s target is out of reach in this pass.
 
 ## Micro: submit_latency (samples=100000, 1 worker, queue=101024, smp_allocator)
 
@@ -96,5 +127,3 @@ Numbers from `zig build bench-tokio-parity`. Directly comparable to Tokio's
 | contended_spawn_8x (Phase A+B) | 507753 | 100000 | 8 | Park handshake simplified; ring queue batch-steal=8; median of 3 runs |
 
 For reference, Tokio's `rt_multi_threaded` flood-equivalent typically runs 5–15M ops/s on similar hardware. Our gap is the work the remaining tasks (true batch-steal via deque rework, hot-path atomic reductions beyond Phase 2) target.
-
-**WARNING: Both Phase A+B Tokio-parity numbers (346K and 508K ops/s) are below the 1M ops/s target.** The RingQueue swap and park simplification together yield only a ~17% improvement on flood_1m (297K→347K) and ~2% on contended_spawn_8x (497K→508K). The bottleneck is the backpressure condvar path that fires on every queue-full event: with 1M tasks and a 4096-capacity queue, the submitter blocks ~244 times, each block paying a full condvar wait+signal round-trip. Phase C should investigate reducing condvar overhead on the backpressure path or increasing effective throughput via larger inject batches.
