@@ -45,14 +45,24 @@ const PoolState = enum(u8) {
 };
 
 const TaskDescriptor = struct {
-    generation: u64 = 0,
+    // === Hot fields (read on every dispatch and complete) ===
     state: std.atomic.Value(types.TaskState) = std.atomic.Value(types.TaskState).init(.free),
     task_fn: ?TaskFn = null,
     ctx: ?*anyopaque = null,
     options: types.SubmitOptions = .{},
+    generation: u64 = 0,
+
+    // === Cold fields (metrics/observability only) ===
     submit_ns: u64 = 0,
     start_ns: u64 = 0,
     complete_ns: u64 = 0,
+
+    comptime {
+        // Document the intended cache layout: ensure the hot fields fit in
+        // one cache line so dispatch never touches the cold metric fields.
+        const hot_size = @offsetOf(TaskDescriptor, "submit_ns");
+        std.debug.assert(hot_size <= std.atomic.cache_line);
+    }
 };
 
 const Worker = struct {
