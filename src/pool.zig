@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
 const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
+const RingQueue = @import("queue/ring_queue.zig").RingQueue;
 const WorkerScratch = @import("memory/scratch.zig").WorkerScratch;
 const Accounting = @import("memory/scratch.zig").Accounting;
 const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
@@ -42,6 +43,81 @@ const PoolState = enum(u8) {
     shutdown_requested,
     stopping,
     stopped,
+};
+
+/// Tagged-union wrapper over the two per-worker local queue implementations.
+/// Selected per-pool via `Config.queue_kind`. All call sites dispatch through
+/// the unified methods (tryPushBottom, popBottom, steal, stealOne, len,
+/// capacity) so the rest of `Core` is queue-kind agnostic.
+const LocalQueue = union(enum) {
+    chase_lev: WorkDeque(u32),
+    ring: RingQueue(u32),
+
+    fn init(allocator: std.mem.Allocator, size: usize, kind: types.QueueKind) !LocalQueue {
+        return switch (kind) {
+            .chase_lev => .{ .chase_lev = try WorkDeque(u32).init(allocator, size) },
+            .ring => .{ .ring = try RingQueue(u32).init(allocator, size) },
+        };
+    }
+
+    fn deinit(self: *LocalQueue) void {
+        switch (self.*) {
+            .chase_lev => |*q| q.deinit(),
+            .ring => |*q| q.deinit(),
+        }
+    }
+
+    fn tryPushBottom(self: *LocalQueue, value: u32) bool {
+        return switch (self.*) {
+            .chase_lev => |*q| q.tryPushBottom(value),
+            .ring => |*q| q.tryPush(value),
+        };
+    }
+
+    fn popBottom(self: *LocalQueue) ?u32 {
+        return switch (self.*) {
+            .chase_lev => |*q| q.popBottom(),
+            .ring => |*q| q.pop(),
+        };
+    }
+
+    /// Steal up to `out.len` items. For chase_lev returns at most 1; for
+    /// ring returns up to (len+1)/2 items via stealHalf.
+    fn steal(self: *LocalQueue, out: []u32) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| if (q.stealTop()) |v| blk: {
+                out[0] = v;
+                break :blk @as(usize, 1);
+            } else 0,
+            .ring => |*q| q.stealHalf(out),
+        };
+    }
+
+    /// Single-item drain — used by shutdown to cancel pending tasks.
+    fn stealOne(self: *LocalQueue) ?u32 {
+        return switch (self.*) {
+            .chase_lev => |*q| q.stealTop(),
+            .ring => |*q| blk: {
+                var buf: [1]u32 = undefined;
+                if (q.stealHalf(buf[0..]) == 1) break :blk buf[0];
+                break :blk null;
+            },
+        };
+    }
+
+    fn len(self: *LocalQueue) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| q.len(),
+            .ring => |*q| q.len(),
+        };
+    }
+
+    fn capacity(self: *LocalQueue) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| q.capacity(),
+            .ring => |*q| q.capacity(),
+        };
+    }
 };
 
 const TaskDescriptor = struct {
@@ -140,7 +216,7 @@ const Core = struct {
     accounting: Accounting = undefined,
     state: std.atomic.Value(PoolState) = std.atomic.Value(PoolState).init(.running),
     workers: []Worker,
-    local_queues: []WorkDeque(u32),
+    local_queues: []LocalQueue,
     descriptors: []TaskDescriptor,
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -157,7 +233,7 @@ const Core = struct {
             .allocator = allocator,
             .config = normalized,
             .workers = try allocator.alloc(Worker, normalized.max_threads),
-            .local_queues = try allocator.alloc(WorkDeque(u32), normalized.max_threads),
+            .local_queues = try allocator.alloc(LocalQueue, normalized.max_threads),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
@@ -174,7 +250,7 @@ const Core = struct {
         };
 
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
-        self.recordOwnedAlloc(self.local_queues.len * @sizeOf(WorkDeque(u32)));
+        self.recordOwnedAlloc(self.local_queues.len * @sizeOf(LocalQueue));
         self.recordOwnedAlloc(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
@@ -194,7 +270,7 @@ const Core = struct {
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
         for (self.workers, self.local_queues) |*worker, *lq| {
-            lq.* = try WorkDeque(u32).init(allocator, normalized.local_queue_capacity);
+            lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
@@ -573,7 +649,7 @@ const Core = struct {
                 if (self.local_queues[victim_index].len() == 0) continue;
                 var stolen: [32]u32 = undefined;
                 const budget = @min(self.config.steal_batch_size, stolen.len);
-                const n = self.local_queues[victim_index].stealTopBatch(stolen[0..budget]);
+                const n = self.local_queues[victim_index].steal(stolen[0..budget]);
                 if (n > 0) {
                     // Keep the first for ourselves, push the rest to our local deque.
                     // queued_tasks is decremented only for the item being returned for
@@ -738,7 +814,7 @@ const Core = struct {
         }
         if (self.config.scheduler_variant == .work_stealing) {
             for (self.local_queues) |*lq| {
-                while (lq.stealTop()) |descriptor_index| {
+                while (lq.stealOne()) |descriptor_index| {
                     self.decrementQueued();
                     self.cancelDescriptor(descriptor_index);
                 }
@@ -842,7 +918,7 @@ const Core = struct {
         self.allocator.free(self.free_indices);
         self.recordOwnedFree(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.allocator.free(self.descriptors);
-        self.recordOwnedFree(self.local_queues.len * @sizeOf(WorkDeque(u32)));
+        self.recordOwnedFree(self.local_queues.len * @sizeOf(LocalQueue));
         self.allocator.free(self.local_queues);
         self.recordOwnedFree(self.workers.len * @sizeOf(Worker));
         self.allocator.free(self.workers);

@@ -108,6 +108,12 @@ pub fn RingQueue(comptime T: type) type {
                 const t = self.tail.load(.acquire);
                 const avail = t -% h;
                 if (avail == 0) return 0;
+                // Owner's `pop` transiently stores `tail = t-1` before checking
+                // for the empty race; a stealer observing that intermediate
+                // tail alongside an unchanged head sees `avail` wrap past
+                // buffer capacity. Treat it as a transient inconsistent read
+                // and retry rather than trusting the value.
+                if (avail > @as(u32, @intCast(self.buffer.len))) continue;
                 // Steal half (round up) — matches Tokio/Go.
                 var n: u32 = (avail + 1) / 2;
                 if (n > @as(u32, @intCast(dst.len))) n = @intCast(dst.len);
