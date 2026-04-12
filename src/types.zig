@@ -202,6 +202,8 @@ pub const WorkerStats = struct {
     wakeups: u64 = 0,
     steals: u64 = 0,
     steal_failures: u64 = 0,
+    started: u64 = 0,
+    completed: u64 = 0,
     scratch_current_bytes: u64 = 0,
     scratch_peak_bytes: u64 = 0,
 };

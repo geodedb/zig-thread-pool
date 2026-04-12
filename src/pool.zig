@@ -67,6 +67,8 @@ const Worker = struct {
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     steal_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    started: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_idle_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scratch_init_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
@@ -93,10 +95,8 @@ const Counters = struct {
 
     // === Hot write group (worker path) ===
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    started: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     cancelled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    _pad1: [cache_line_size - 4 * field_size]u8 = undefined,
+    _pad1: [cache_line_size - 2 * field_size]u8 = undefined,
 
     // === Diagnostic/cold counters ===
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -291,9 +291,15 @@ const Core = struct {
 
     pub fn statsSnapshot(self: *Core) types.Stats {
         var aggregate_wakeups: u64 = 0;
+        var aggregate_started: u64 = 0;
+        var aggregate_completed: u64 = 0;
         for (self.workers, 0..) |*worker, idx| {
             const w_wakeups = worker.wakeups.load(.acquire);
+            const w_started = worker.started.load(.acquire);
+            const w_completed = worker.completed.load(.acquire);
             aggregate_wakeups += w_wakeups;
+            aggregate_started += w_started;
+            aggregate_completed += w_completed;
             self.worker_stats_buffer[idx] = .{
                 .worker_index = idx,
                 .busy_ns = worker.busy_ns.load(.acquire),
@@ -304,6 +310,8 @@ const Core = struct {
                 .wakeups = w_wakeups,
                 .steals = worker.steals.load(.acquire),
                 .steal_failures = worker.steal_failures.load(.acquire),
+                .started = w_started,
+                .completed = w_completed,
                 .scratch_current_bytes = @as(u64, @intCast(worker.scratch.bytesCurrent())),
                 .scratch_peak_bytes = @as(u64, @intCast(worker.scratch.bytesPeak())),
             };
@@ -320,8 +328,8 @@ const Core = struct {
 
         return .{
             .submitted = self.counters.submitted.load(.acquire),
-            .started = self.counters.started.load(.acquire),
-            .completed = self.counters.completed.load(.acquire),
+            .started = aggregate_started,
+            .completed = aggregate_completed,
             .cancelled = self.counters.cancelled.load(.acquire),
             .active_tasks = self.counters.active_tasks.load(.acquire),
             .parked_workers = self.counters.parked_workers.load(.acquire),
@@ -509,7 +517,7 @@ const Core = struct {
             worker.wait_histogram.observe(wait_ns);
         }
 
-        _ = self.counters.started.fetchAdd(1, .monotonic);
+        _ = worker.started.fetchAdd(1, .monotonic);
         _ = self.counters.active_tasks.fetchAdd(1, .monotonic);
 
         if (timestamps_enabled) {
@@ -553,7 +561,7 @@ const Core = struct {
         _ = self.counters.active_tasks.fetchSub(1, .monotonic);
         if (descriptor.state.load(.acquire) != .cancelled) {
             descriptor.state.store(.completed, .release);
-            _ = self.counters.completed.fetchAdd(1, .monotonic);
+            _ = worker.completed.fetchAdd(1, .monotonic);
         }
 
         if (descriptor.options.wait_group) |wait_group| {

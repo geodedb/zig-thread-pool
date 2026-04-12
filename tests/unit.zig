@@ -446,3 +446,22 @@ test "fuzz Config validation never panics" {
         }
     }.testOne, .{});
 }
+
+test "Stats.started and .completed aggregate from per-worker counters" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 64), stats.started);
+    try std.testing.expectEqual(@as(u64, 64), stats.completed);
+}
