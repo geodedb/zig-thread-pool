@@ -131,6 +131,25 @@ benchmark-regression:
       - benchmarks/results/ci-current.json
   needs: ["build"]
 
+bench-micro:
+  extends: .zig-job
+  stage: performance
+  script:
+    - zig build bench-micro-submit > micro-submit.txt
+    - zig build bench-micro-steal > micro-steal.txt
+    - zig build bench-micro-wake > micro-wake.txt
+    - zig build bench-tokio-parity > tokio-parity.txt
+    - cat micro-submit.txt micro-steal.txt micro-wake.txt tokio-parity.txt
+  artifacts:
+    when: always
+    paths:
+      - micro-submit.txt
+      - micro-steal.txt
+      - micro-wake.txt
+      - tokio-parity.txt
+  needs: ["build"]
+  allow_failure: true # advisory until thresholds are tuned
+
 scale-bench-manual:
   extends: .zig-job
   stage: performance
