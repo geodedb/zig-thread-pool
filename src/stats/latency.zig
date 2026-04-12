@@ -39,8 +39,10 @@ pub const LatencyHistogram = struct {
     /// to be thread-local (e.g. a freshly-initialised accumulator inside
     /// `statsSnapshot()`), but uses atomic ops for field-type consistency.
     pub fn merge(self: *LatencyHistogram, other: *const LatencyHistogram) void {
-        for (&self.counts, other.counts) |*dst, src| {
-            _ = dst.fetchAdd(src.load(.monotonic), .monotonic);
+        var i: usize = 0;
+        while (i < bucket_count) : (i += 1) {
+            const v = other.counts[i].load(.monotonic);
+            _ = self.counts[i].fetchAdd(v, .monotonic);
         }
         const other_count = other.count.load(.monotonic);
         _ = self.count.fetchAdd(other_count, .monotonic);

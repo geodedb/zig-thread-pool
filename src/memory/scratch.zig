@@ -39,6 +39,11 @@ pub const WorkerScratch = struct {
     fba: ?std.heap.FixedBufferAllocator = null,
     current_bytes: usize = 0,
     peak_bytes: usize = 0,
+    /// Serializes purge() and beginTask()/alloc() so that the owning worker
+    /// and a remote caller (e.g. Core.purgeWorkerCaches) cannot race on the
+    /// backing buffer. Without this guard, two concurrent purge() calls would
+    /// double-free the allocation.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, accounting: Accounting, cap_bytes: usize) WorkerScratch {
         return .{
@@ -49,7 +54,9 @@ pub const WorkerScratch = struct {
     }
 
     pub fn beginTask(self: *WorkerScratch) !void {
-        try self.ensureBuffer();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.ensureBufferLocked();
         if (self.buffer) |buf| {
             self.fba = std.heap.FixedBufferAllocator.init(buf);
             self.current_bytes = 0;
@@ -66,7 +73,9 @@ pub const WorkerScratch = struct {
     }
 
     pub fn alloc(self: *WorkerScratch, comptime T: type, count: usize) ![]T {
-        try self.ensureBuffer();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.ensureBufferLocked();
         if (self.fba == null) return error.ScratchUnavailable;
         var fba = &self.fba.?;
         const slice = try fba.allocator().alloc(T, count);
@@ -76,6 +85,8 @@ pub const WorkerScratch = struct {
     }
 
     pub fn purge(self: *WorkerScratch) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.buffer) |buf| {
             self.accounting.recordFree(buf.len);
             self.allocator.free(buf);
@@ -93,7 +104,8 @@ pub const WorkerScratch = struct {
         return self.peak_bytes;
     }
 
-    fn ensureBuffer(self: *WorkerScratch) !void {
+    /// Must be called with self.mutex held.
+    fn ensureBufferLocked(self: *WorkerScratch) !void {
         if (self.cap_bytes == 0 or self.buffer != null) return;
         const buf = try self.allocator.alloc(u8, self.cap_bytes);
         self.accounting.recordAlloc(buf.len);
