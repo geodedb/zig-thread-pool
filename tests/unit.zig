@@ -354,6 +354,43 @@ test "timestamp_mode disabled zeroes histograms" {
     try std.testing.expectEqual(@as(u64, 32), stats.completed);
 }
 
+test "timestamp_mode disabled still purges scratch on idle" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .worker_scratch_cap_bytes = 1024,
+        .idle_park_after_ns = 100_000, // 0.1ms — immediate park
+        .idle_purge_after_ns = 200_000, // 0.2ms — quick purge trigger
+        .timestamp_mode = .disabled,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var ctx = common.ScratchTaskContext{ .counter = &counter, .bytes = 256 };
+
+    var wg = pool.waitGroup();
+    _ = try pool.submit(common.scratchTask, @ptrCast(&ctx), .{ .wait_group = &wg });
+    wg.wait();
+
+    // Sleep long enough for:
+    // 1. Worker to enter idle path (spin, then park for idle_park_after_ns)
+    // 2. Timeout to fire (idle_park_after_ns)
+    // 3. Purge check to succeed (idle_purge_after_ns since task completion)
+    // Use a generous sleep to account for scheduling delays
+    std.Thread.sleep(100_000_000); // 100ms — very ample time for purge to occur
+
+    const stats = pool.statsSnapshot();
+    // After purge, scratch memory should be released. live_bytes may still include
+    // other allocations (queues, etc.), but scratch_current_bytes should be near 0.
+    if (stats.worker_stats.len > 0) {
+        var total_scratch: u64 = 0;
+        for (stats.worker_stats) |ws| {
+            total_scratch += ws.scratch_current_bytes;
+        }
+        try std.testing.expect(total_scratch == 0);
+    }
+}
+
 test "fuzz BoundedRing push/pop consistency" {
     try std.testing.fuzz({}, struct {
         fn testOne(_: void, input: []const u8) !void {

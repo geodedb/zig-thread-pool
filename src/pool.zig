@@ -538,12 +538,15 @@ const Core = struct {
             _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
 
+        // Always update last_idle_started_ns so the idle-purge logic in idle() works
+        // regardless of timestamp_mode. Read the clock once.
+        const complete_ns = nowNs();
+        worker.last_idle_started_ns.store(complete_ns, .release);
+
         if (timestamps_enabled) {
-            const complete_ns = nowNs();
             descriptor.complete_ns = complete_ns;
             const exec_ns = complete_ns - start_ns;
             _ = worker.busy_ns.fetchAdd(exec_ns, .release);
-            worker.last_idle_started_ns.store(complete_ns, .release);
             worker.exec_histogram.observe(exec_ns);
         }
 

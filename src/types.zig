@@ -24,8 +24,10 @@ pub const ShutdownMode = enum {
 
 /// Controls per-task timestamp behavior.  `full` records submit/start/complete
 /// timestamps and populates wait/exec histograms — the legacy v0.2.0 mode.
-/// `disabled` skips all timestamp reads, zeroing latency metrics but saving
-/// ~60–120ns per task on Linux vDSO `clock_gettime`.
+/// `disabled` skips submit/start clock reads and the histogram observes,
+/// saving ~40–80ns per task on Linux.  The complete-time clock read is kept
+/// because the idle-purge logic in `idle()` depends on
+/// `worker.last_idle_started_ns` to decide when to release scratch buffers.
 pub const TimestampMode = enum {
     full,
     disabled,
