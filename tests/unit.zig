@@ -598,3 +598,20 @@ test "LIFO slot: submit-from-worker uses lifo_slot before local ring" {
     try std.testing.expectEqual(@as(u64, 100), Nested.outer_counter.load(.acquire));
     try std.testing.expectEqual(@as(u64, 100), Nested.inner_counter.load(.acquire));
 }
+
+test "Config validate rejects max_threads > 64" {
+    const cfg = thread_pool.Config{ .max_threads = 65, .min_threads = 1 };
+    try std.testing.expectError(error.TooManyWorkers, cfg.validate());
+}
+
+test "Config validate accepts max_threads = 64" {
+    const cfg = thread_pool.Config{ .max_threads = 64, .min_threads = 1 };
+    try cfg.validate();
+}
+
+test "Config validate: explicit max_threads > 64 still rejected after normalized()" {
+    // normalized() only clamps auto-detect (max_threads == 0) to 64.
+    // Explicit over-limit values must still be rejected by validate().
+    const cfg = (thread_pool.Config{ .max_threads = 65, .min_threads = 1 }).normalized();
+    try std.testing.expectError(error.TooManyWorkers, cfg.validate());
+}
