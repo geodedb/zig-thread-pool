@@ -112,6 +112,14 @@ pub fn build(b: *std.Build) void {
     compare_step.dependOn(&run_compare.step);
     b.installArtifact(compare_exe);
 
+    const micro_submit = b.addExecutable(.{
+        .name = "thread-pool-micro-submit",
+        .root_module = importedModule(b, "benchmarks/micro/submit_latency.zig", target, .ReleaseFast, module),
+    });
+    const run_micro_submit = b.addRunArtifact(micro_submit);
+    const micro_submit_step = b.step("bench-micro-submit", "Micro-benchmark: submit latency");
+    micro_submit_step.dependOn(&run_micro_submit.step);
+
     const tools_step = b.step("tools", "Build benchmark tooling");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);
