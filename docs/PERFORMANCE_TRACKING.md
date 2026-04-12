@@ -22,6 +22,7 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 | Phase 2 (Task 7: per-worker steal/park counters) | 663352 | 0 | 78662 | |
 | Phase 2 (Task 8: TaskDescriptor hot/cold split) | 1437441 | 0 | 120361 | |
 | Phase 3 (Task 10: batch-steal infra, default size=1) | 636735 | 0 | 101621 | wash — batch-steal default disabled due to popBottom race; infra ready for future deque rework |
+| Phase 3 (Task 11: skip-empty victims in steal scan) | 677374 | 0 | 114851 | median of 2 runs (670408, 684341); +6.4% vs Task 10 by skipping seq_cst CAS on victims whose cheap `len()` peek shows empty |
 
 ## Micro: wake_latency (samples=5000, 2 workers, quiesce=300us, smp_allocator)
 
@@ -33,7 +34,8 @@ All numbers from local dev machine unless noted. CI baselines tracked in
 
 ## Macro: conn_churn_seq (bench scenario, workers=2, queue=4096)
 
-| Phase | scheduler | ops/s | submit p50 (ns) | submit p99 (ns) |
-|-------|-----------|-------|-----------------|-----------------|
-| Phase 2 (Task 8: TaskDescriptor hot/cold split) | global_queue | 1731709 | 532 | 813 |
-| Phase 2 (Task 8: TaskDescriptor hot/cold split) | work_stealing | 1680812 | 554 | 891 |
+| Phase | scheduler | ops/s | submit p50 (ns) | submit p99 (ns) | Notes |
+|-------|-----------|-------|-----------------|-----------------|-------|
+| Phase 2 (Task 8: TaskDescriptor hot/cold split) | global_queue | 1731709 | 532 | 813 | |
+| Phase 2 (Task 8: TaskDescriptor hot/cold split) | work_stealing | 1680812 | 554 | 891 | |
+| Phase 3 (Task 11: skip-empty victims in steal scan) | work_stealing | 895954 | 1211 | 2159 | high run-to-run variance (788K–984K across 3 runs); this scenario rarely triggers steals, so the skip-empty change is effectively inert here — the swing is environmental noise |

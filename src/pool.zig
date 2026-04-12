@@ -500,6 +500,11 @@ const Core = struct {
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
                 if (victim_index == worker_index) continue;
+                // Cheap peek before paying the seq_cst CAS cost in stealTopBatch.
+                // len() reads bottom and top with acquire loads; under contention it
+                // may return a stale value, but skipping a victim that *appears* empty
+                // just means we move to the next one — correctness is unaffected.
+                if (self.local_queues[victim_index].len() == 0) continue;
                 var stolen: [32]u32 = undefined;
                 const budget = @min(self.config.steal_batch_size, stolen.len);
                 const n = self.local_queues[victim_index].stealTopBatch(stolen[0..budget]);
