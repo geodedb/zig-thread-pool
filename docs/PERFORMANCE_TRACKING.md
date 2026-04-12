@@ -65,6 +65,24 @@ The single-item steal improvement (+109%) and the recovered submit-latency
 mean the ring queue and park simplification are both net wins and should
 ship. The Tokio-parity 1M ops/s target is out of reach in this pass.
 
+## Bench Stability
+
+From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
+scenario, discards the first (warmup), and reports the median of 6 along
+with stddev. Observed stddev as a fraction of median (measured on the
+rebaselined dev machine):
+
+| Scenario | Median ops/s | Stddev ops/s | Stddev % |
+|----------|-------------:|-------------:|---------:|
+| conn_churn_seq/global_queue | 1365079 | 271278 | 19.9% |
+| conn_churn_seq/work_stealing | 1324439 | 310471 | 23.4% |
+| producer_contention/global_queue | 994633 | 90757 | 9.1% |
+| producer_contention/work_stealing | 945187 | 131594 | 13.9% |
+
+`compare-bench`'s regression gate is `throughput_change < -max(15%, 3×stddev%)`.
+Noisy scenarios (high stddev%) widen the gate; stable scenarios stay near
+the 15% floor.
+
 ## Micro: submit_latency (samples=100000, 1 worker, queue=101024, smp_allocator)
 
 | Phase | p50 (ns) | p95 (ns) | p99 (ns) | Notes |
