@@ -287,7 +287,12 @@ const Core = struct {
             const active = self.counters.active_tasks.load(.acquire);
             if (queued == 0 and active == 0) break;
             if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
-            std.Thread.sleep(100_000);
+
+            // Wait on the backpressure condvar, which releaseDescriptor signals on
+            // every completion. Cap at 10ms so we re-check state even if a signal
+            // is lost. Reuse waitForCapacity to avoid code duplication and register
+            // as a waiter so releaseDescriptor takes the signal fast-path.
+            self.waitForCapacity(deadline);
         }
 
         self.joinAllWorkers();
