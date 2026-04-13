@@ -133,6 +133,14 @@ const TaskDescriptor = struct {
     start_ns: u64 = 0,
     complete_ns: u64 = 0,
 
+    /// Debug/ReleaseSafe-only double-dequeue detector. `-1` = unclaimed.
+    /// Worker CAS-acquires from -1 to its index in runTask; a failed CAS
+    /// means two workers are racing for this descriptor — panic.
+    /// Always compiled in (cheap — single i32), but only *used* when
+    /// `std.debug.runtime_safety` is true. Guarded reads/writes mean
+    /// ReleaseFast skips every atomic op.
+    claimed_by: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+
     comptime {
         // Document the intended cache layout: ensure the hot fields fit in
         // one cache line so dispatch never touches the cold metric fields.
@@ -714,6 +722,19 @@ const Core = struct {
     fn runTask(self: *Core, worker_index: usize, descriptor_index: u32) void {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
+        // Debug/ReleaseSafe-only: detect double-dequeue. If two workers
+        // arrive here with the same descriptor_index (scheduler race), the
+        // second CAS will fail and we panic with both worker ids. Compiles
+        // out under ReleaseFast.
+        if (std.debug.runtime_safety) {
+            const wi_i32: i32 = @intCast(worker_index);
+            if (descriptor.claimed_by.cmpxchgStrong(-1, wi_i32, .acq_rel, .acquire)) |other| {
+                std.debug.panic(
+                    "double-dequeue: descriptor {d} claimed by worker {d}, now worker {d} also tried to claim it",
+                    .{ descriptor_index, other, wi_i32 },
+                );
+            }
+        }
         descriptor.state.store(.running, .release);
         const timestamps_enabled = self.config.timestamp_mode == .full;
         const start_ns = if (timestamps_enabled) nowNs() else 0;
@@ -773,6 +794,13 @@ const Core = struct {
 
         if (descriptor.options.wait_group) |wait_group| {
             wait_group.done();
+        }
+
+        // Clear the claim sentinel before wait_group.done() observers can
+        // re-submit / re-acquire this descriptor slot. Paired with the
+        // CAS-acquire at the top of runTask.
+        if (std.debug.runtime_safety) {
+            descriptor.claimed_by.store(-1, .release);
         }
 
         if (descriptor.options.waitable) {
@@ -860,6 +888,9 @@ const Core = struct {
 
     fn cancelDescriptor(self: *Core, descriptor_index: u32) void {
         const descriptor = &self.descriptors[descriptor_index];
+        if (std.debug.runtime_safety) {
+            descriptor.claimed_by.store(-1, .release);
+        }
         descriptor.state.store(.cancelled, .release);
         _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         if (descriptor.options.wait_group) |wait_group| wait_group.done();
@@ -891,6 +922,9 @@ const Core = struct {
             descriptor.* = .{};
             descriptor.generation = prev_generation +% 1;
             if (descriptor.generation == 0) descriptor.generation = 1;
+            if (std.debug.runtime_safety) {
+                descriptor.claimed_by.store(-1, .release);
+            }
             descriptor.state.store(.reserved, .release);
             const live = self.counters.task_desc_live.fetchAdd(1, .monotonic) + 1;
             updatePeak(&self.counters.task_desc_peak, live);
