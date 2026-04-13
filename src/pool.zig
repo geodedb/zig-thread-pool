@@ -786,12 +786,31 @@ const Core = struct {
 
     fn idle(self: *Core, worker_index: usize) void {
         var worker = &self.workers[worker_index];
+        // Phase G2: spin as pure micro-delay. We do NOT poll
+        // `counters.queued_tasks` here — the submit path writes that line
+        // with .seq_cst on every submit, and 56 workers × spin_iters
+        // shared loads per park cycle dominated cross-core traffic on the
+        // line (A/B-measured: removing the poll lifts flood_1m by >15%).
+        // Handshake correctness is unaffected — the mutex-guarded reload
+        // at `worker.is_parked.store(1, .seq_cst)` below is the actual
+        // lost-wakeup guard; the spin-poll was a latency shortcut only.
         var spins: usize = 0;
         while (spins < self.config.spin_before_park_iters) : (spins += 1) {
-            if (self.counters.queued_tasks.load(.acquire) != 0) return;
             if (self.state.load(.acquire) != .running) return;
             std.atomic.spinLoopHint();
         }
+
+        // End-of-spin local-work probe: if work became visible during the
+        // spin window, skip parking. The probe reads only this worker's
+        // local sources plus a single inject_queue length peek — at most
+        // 3 atomic loads, executed once per park cycle (vs 128× on the
+        // removed poll). Restores the "avoid park on rapid arrival" fast
+        // path without the cross-core polling cost.
+        if (self.config.scheduler_variant == .work_stealing) {
+            if (worker.lifo_slot.load(.monotonic) != LIFO_SLOT_EMPTY) return;
+            if (self.local_queues[worker_index].len() != 0) return;
+        }
+        if (self.inject_queue.len() != 0) return;
 
         if (self.state.load(.acquire) != .running) return;
 
