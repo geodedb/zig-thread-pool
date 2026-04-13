@@ -594,7 +594,7 @@ const Core = struct {
             return error.QueueFull;
         }
 
-        _ = self.counters.submitted.fetchAdd(1, .monotonic);
+        // AB-STUB: submitted.fetchAdd removed to measure ceiling. Do not merge.
         self.incrementQueued();
 
         // Wake one parked worker. Scan `is_parked` across workers starting at a
@@ -604,7 +604,7 @@ const Core = struct {
         // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
         // and signal it, OR the worker reloads `queued_tasks` and sees our push —
         // no lost wakeup. No broadcast fallback is needed.
-        const submitted = self.counters.submitted.load(.monotonic);
+        const submitted: u64 = 0; // AB-STUB: submitted reader removed
         const hint_idx: usize = @intCast(submitted % self.workers.len);
         var off: usize = 0;
         while (off < self.workers.len) : (off += 1) {
@@ -697,7 +697,7 @@ const Core = struct {
             // Use worker_index mixed with submitted count for pseudo-random start.
             // Avoids global atomic fetchAdd contention that causes thundering-herd
             // when all idle workers get sequential starting indices.
-            const start = (worker_index +% @as(usize, @truncate(self.counters.submitted.load(.monotonic)))) % self.workers.len;
+            const start = worker_index % self.workers.len; // AB-STUB: submitted mixing removed
             var offset: usize = 0;
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
