@@ -32,7 +32,7 @@ fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 fn benchFlood(out_writer: anytype) !void {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .max_threads = 0, // CPU count
-        .queue_capacity = 4096,
+        .queue_capacity = 2_000_000,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
     });
