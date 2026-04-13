@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
         .name = "thread-pool-tokio-parity",
         .root_module = importedModule(b, "benchmarks/bench_tokio_parity.zig", target, .ReleaseFast, module),
     });
+    b.installArtifact(tokio_bench);
     const run_tokio_bench = b.addRunArtifact(tokio_bench);
     const tokio_bench_step = b.step("bench-tokio-parity", "Tokio rt_multi_threaded parity benchmarks");
     tokio_bench_step.dependOn(&run_tokio_bench.step);

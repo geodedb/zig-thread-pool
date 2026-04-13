@@ -114,8 +114,8 @@ Expected: 10 runs, each printing an `ops/s` line for `flood_1m`. Median ops/s sh
 - [ ] **Step 3: Compute n=10 median and record**
 
 ```bash
-grep -Eo 'flood_1m[^0-9]*[0-9]+' docs/performance/reprofile-2026-04-13/baseline.txt \
-  | grep -Eo '[0-9]+' | sort -n | awk '
+grep 'scenario=flood_1m' docs/performance/reprofile-2026-04-13/baseline.txt \
+  | grep -Eo 'ops_per_sec=[0-9]+' | grep -Eo '[0-9]+' | sort -n | awk '
       {a[NR]=$1}
       END {
         n=NR;
@@ -323,8 +323,8 @@ Expected: `pass=20 fail=0`. If any failures, this stub is unsafe — the A/B mea
     ./zig-out/bin/thread-pool-tokio-parity flood_1m
   done
 } | tee docs/performance/reprofile-2026-04-13/ab-submitted-raw.txt
-grep -Eo 'flood_1m[^0-9]*[0-9]+' docs/performance/reprofile-2026-04-13/ab-submitted-raw.txt \
-  | grep -Eo '[0-9]+' | sort -n | awk '
+grep 'scenario=flood_1m' docs/performance/reprofile-2026-04-13/ab-submitted-raw.txt \
+  | grep -Eo 'ops_per_sec=[0-9]+' | grep -Eo '[0-9]+' | sort -n | awk '
       {a[NR]=$1}
       END {
         if (NR%2) print "median:", a[(NR+1)/2];
