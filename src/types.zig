@@ -102,7 +102,14 @@ pub const Config = struct {
     worker_scratch_cap_bytes: usize = 64 * 1024,
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
-    spin_before_park_iters: usize = 128,
+    /// Phase G2 (re-land 2026-04-13): default 0. Once the spin's
+    /// `queued_tasks` poll was removed (the dominant cross-core read on
+    /// that cacheline), the spin body became pure CPU burn. Setting this
+    /// to a non-zero value forces a `spinLoopHint` delay loop with only
+    /// a per-iter `state` check — useful for stress tests that need to
+    /// reproduce the polless-spin handshake (see tests/stress.zig:516,
+    /// :75, :290) but not for normal workloads.
+    spin_before_park_iters: usize = 0,
     deinit_timeout_ns: u64 = 30_000_000_000,
     scheduler_variant: SchedulerVariant = .global_queue,
     queue_kind: QueueKind = .ring,

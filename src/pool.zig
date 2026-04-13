@@ -855,9 +855,33 @@ const Core = struct {
 
     fn idle(self: *Core, worker_index: usize) void {
         var worker = &self.workers[worker_index];
+        // Phase G2 (re-land 2026-04-13): no `counters.queued_tasks` poll.
+        // The submit path writes that line with .seq_cst on every submit;
+        // 56 workers × spin_iters shared loads per park cycle dominated
+        // cross-core traffic on the line. Removing the poll lifted
+        // flood_1m ~9% in the original G2 (commit c335189 / 60ad076).
+        //
+        // Handshake correctness is unaffected: the mutex-guarded SC
+        // reload at `worker.is_parked.store(1, .seq_cst)` below is the
+        // actual lost-wakeup guard (see comment block at the park site).
+        // The spin-poll was a latency shortcut, not a correctness mechanism.
+        //
+        // The original G2 also added an end-of-spin local-work probe
+        // (lifo_slot, local_queue.len, inject_queue.len). Post-impl A/B
+        // (commit 60ad076) showed the probe was inert — same probability-
+        // of-engagement failure as Phase F1's short-spin. Re-land omits
+        // the probe and drops `spin_before_park_iters` default to 0
+        // (in src/types.zig); a polless spin is pure CPU burn so the
+        // default-off knob preserves the spin only for explicit opt-ins
+        // (e.g. the existing stress tests at tests/stress.zig:75,290,528).
+        //
+        // Phase H's `runTask` state-CAS gate (pool.zig:763) defends
+        // against the duplicate-emission race that the original G2
+        // timing change unmasked — see docs/PERFORMANCE_TRACKING.md
+        // § Phase H. Path-agnostic defense; this re-land cannot revive
+        // the SIGSEGV that forced the original revert.
         var spins: usize = 0;
         while (spins < self.config.spin_before_park_iters) : (spins += 1) {
-            if (self.counters.queued_tasks.load(.acquire) != 0) return;
             if (self.state.load(.acquire) != .running) return;
             std.atomic.spinLoopHint();
         }

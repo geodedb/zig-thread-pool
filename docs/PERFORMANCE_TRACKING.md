@@ -665,7 +665,77 @@ With the cherry-picked G2 poll-removal dropped and the branch tip matching produ
 
 ### Unblocks
 
-- Phase G2 re-land (poll removal for +9% throughput)
+- Phase G2 re-land (poll removal for +9% throughput) — shipped 2026-04-13, see § Phase G2 Re-Land below
 - Phase G3 (submitted fetchAdd) — +28%
 - Wake-scan redesign — +47%
 - Descriptor CAS — +16%
+
+---
+
+## Phase G2 Re-Land: Idle-Spin Poll Removal (shipped 2026-04-13)
+
+**Status:** Shipped. Original Phase G2 (commits `c335189` + cleanup `60ad076`) was reverted because the timing change unmasked a latent double-dequeue race in `nextTask`. Phase H (merge `a75ed98`) closed that race via state-CAS at `runTask`, unblocking the re-land.
+
+**Change:**
+
+- `src/pool.zig:Core.idle()` no longer polls `counters.queued_tasks.load(.acquire)` inside the spin loop. The submit path writes that cacheline `.seq_cst` on every submit; 56 workers × spin_iters shared loads per park cycle dominated cross-core traffic on the line.
+- `src/types.zig` default `spin_before_park_iters` drops from `128` to `0` — with the poll gone, the spin body is pure CPU burn at default config. Non-zero values remain available as an explicit opt-in for stress tests that exercise the polless-spin handshake (e.g. `tests/stress.zig:516` at `4096`, `tests/stress.zig:75,290` at `4`).
+
+**Commit:** `1351e0b perf: phase g2 re-land - remove idle-spin queued_tasks poll`
+
+### Hypothesis (validated)
+
+Idle-spin polled `counters.queued_tasks.load(.acquire)` `spin_before_park_iters` times per park cycle per worker on a cacheline the submitter writes `.seq_cst` on every submit. Removing the poll eliminates the dominant cross-core read traffic. The SC `is_parked.store(.seq_cst)` + `queued_tasks.load(.seq_cst)` reload at `pool.zig:881-887` is the actual lost-wakeup guard; the spin-poll was a latency shortcut, not a correctness mechanism.
+
+### Methodology refinements applied (vs. original G2)
+
+| Aspect | Original G2 (reverted) | Re-Land |
+|---|---|---|
+| Spin body mechanism | Poll removed + end-of-spin probe (`lifo_slot`, `local_queue.len`, `inject_queue.len`) | Poll removed, **no probe** (A/B-inert in `60ad076` — probability-of-engagement failure) |
+| `spin_before_park_iters` default | 128, dropped to 0 in cleanup commit | Drops to 0 directly |
+| Stress gate | 5× `test-stress` (default optimize) | **20× ReleaseFast** (correctness) + **100× ReleaseFast** (pre-merge) — methodology lesson #9 |
+| Race defense | None — exposed latent double-dequeue; ~5% SIGSEGV rate slipped through 5× sample | Phase H state-CAS gate at `runTask` is path-agnostic upstream defense |
+
+### Measured (ReleaseFast, 56-core host, 2026-04-13)
+
+**Baseline (main tip `a75ed98`, Phase H):**
+
+| Benchmark | Samples | Median (ops/s) | Range (min–max) |
+|---|---:|---:|---:|
+| `flood_1m` | n=5 | **346,492** | 336,670 – 351,714 |
+| `contended_spawn_8x` | n=10 | **471,188** | 413,459 – 501,867 |
+
+**Re-Land default (spin=0):**
+
+| Benchmark | Samples | Median (ops/s) | Δ vs baseline |
+|---|---:|---:|---:|
+| `flood_1m` | n=5 | **461,705** | **+33.3%** |
+| `contended_spawn_8x` | n=10 | 459,524 | −2.5% (within noise floor; IQR width ~30K on ~460K medians) |
+
+**Spin=128 A/B (poll-removed, Task 7):**
+
+| Benchmark | Samples | Median (ops/s) | Δ vs spin=0 |
+|---|---:|---:|---:|
+| `flood_1m` | n=5 | 460,598 | −0.2% (flat) |
+| `contended_spawn_8x` | n=10 | 473,603 | +3.1% (within noise of spin=0) |
+
+**Flood_1m A/B (Task 2, poll stubbed, spin=128):** median **479,205 ops/s** (n=5), confirming the poll-removal is the load-bearing mechanism — spin default doesn't move flood_1m. Stubbed and production configs are statistically identical on the hot workload.
+
+### Correctness validation
+
+- Unit suite: 39/39 pass (debug + ReleaseFast).
+- Stress 20× ReleaseFast: **20/20 pass** in 73s. Includes `tests/stress.zig:516` ("phase g2: aggressive spin flood") driving 16 workers at `spin_before_park_iters = 4096` — explicitly exercises the polless-spin SC handshake under load.
+- Stress 100× ReleaseFast: **100/100 pass** in ~360s. Methodology lesson #9 threshold.
+- Phase H `runTask` state-CAS gate (`pool.zig:763`) defends against duplicate-emission regardless of which queue path emits the duplicate; the G2 timing change cannot revive the SIGSEGV path that forced the original revert.
+
+### Why contended_spawn_8x is flat (not regressed)
+
+Task 1 baseline captured `contended_spawn_8x` at n=3 (498,767 median, spread 60K). Task 6 re-land measurement at n=3 showed 433,669, triggering a regression alarm. Re-measuring both on Phase H main and on the re-land branch at **n=10** showed the true distributions: main median 471K (IQR 451K–489K), re-land spin=0 median 459K (IQR 452K–481K). The distributions overlap substantially. The "−13% regression" was a thin-sample artifact. Controller-level re-measurement documented in `/tmp/phase-g2-reland-baseline.txt` § Task 7C.
+
+**Takeaway:** future phases must measure **every** benchmark at **n=10 minimum** when evaluating gates, not just the primary metric. Thin-N baselines misread noise as signal.
+
+### Verdict
+
+Ship. `flood_1m` +33.3%; `contended_spawn_8x` statistically unchanged; 20/20 + 100/100 ReleaseFast stress clean; Phase H CAS gate defends against the race that forced the original revert.
+
+See `docs/superpowers/plans/2026-04-13-phase-g2-reland.md` for the execution plan and full task-by-task record.
