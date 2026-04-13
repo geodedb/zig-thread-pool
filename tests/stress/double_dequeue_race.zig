@@ -5,29 +5,39 @@ fn noop(_: *anyopaque, _: *thread_pool.TaskContext) void {}
 
 test "phase h: double-dequeue race reproducer" {
     // Submit-flood harness targeting the nextTask double-dequeue race window
-    // (src/pool.zig:632-712). Uses 16 workers with an aggressive spin count
-    // so many workers are mid-spin when wakes arrive, and a minimal noop
-    // task body to maximise the rate of descriptor churn through the
-    // inject_queue drain + stealHalf overflow path.
+    // (src/pool.zig:632-712). Uses 16 workers with a minimal noop task body
+    // to maximise the rate of descriptor churn through the inject_queue
+    // drain + stealHalf overflow path.
     //
-    // Baseline: passes on main (race is either masked by the queued_tasks
-    // poll or silently produces a duplicate claim). Becomes diagnostic
-    // once the Task 2 descriptor sentinel lands — at that point the
-    // duplicate claim panics deterministically within this window.
+    // Strategy (Task 1 amended): spin_before_park_iters=0 forces immediate
+    // park, mimicking the Phase G2 poll-removed condition where the race
+    // actually fires. The original spin=4096 kept the queued_tasks poll in
+    // src/pool.zig:790-794 catching all submits before workers parked,
+    // which prevented the double-dequeue path from being entered at all
+    // (not just masking the symptom). idle_park_after_ns=10us keeps park
+    // churn high so workers cycle park->wake->claim repeatedly inside the
+    // submit flood, maximising the race window. Default is 250us per
+    // src/types.zig:103.
+    //
+    // Baseline: passes on main (race silently produces a duplicate claim
+    // when reached). Becomes diagnostic once the Task 2 descriptor
+    // sentinel lands — at that point the duplicate claim panics
+    // deterministically within this window.
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 16,
         .max_threads = 16,
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
-        .spin_before_park_iters = 4096,
+        .spin_before_park_iters = 0,
+        .idle_park_after_ns = 10_000, // 10us — wake fast so park churn is high
     });
     defer pool.deinit();
 
     // Let workers reach their park/spin steady state before the flood.
     std.Thread.sleep(5 * std.time.ns_per_ms);
 
-    const per_producer: u64 = 100_000;
+    const per_producer: u64 = 500_000;
     var wg = pool.waitGroup();
 
     const Submitter = struct {
