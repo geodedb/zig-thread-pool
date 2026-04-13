@@ -788,26 +788,39 @@ const Core = struct {
         var worker = &self.workers[worker_index];
         // Phase G2: spin as pure micro-delay. We do NOT poll
         // `counters.queued_tasks` here — the submit path writes that line
-        // with .seq_cst on every submit, and N workers × spin_iters shared
-        // loads per park cycle dominated cross-core traffic on the line
-        // (A/B-measured: removing the poll lifts flood_1m by +6–9%).
+        // with .seq_cst on every submit, and 56 workers × spin_iters
+        // shared loads per park cycle dominated cross-core traffic on the
+        // line (A/B-measured: removing the poll lifts flood_1m by >15%).
         // Handshake correctness is unaffected — the SC store/reload
         // at `worker.is_parked.store(1, .seq_cst)` below is the actual
         // lost-wakeup guard; the spin-poll was a latency shortcut only.
-        //
-        // An end-of-spin local-work probe (lifo_slot / local_queue /
-        // inject_queue) was tried but measured inert: 128-iter spin is
-        // too short to race with realistic inter-submit intervals
-        // (probability-of-engagement ~0, same failure mode as F1's
-        // short-spin active_spinners). `spin_before_park_iters` default
-        // is now 0; users who configure a non-zero spin get a pure
-        // state-check + pause delay (no counter load, no probe).
         var spins: usize = 0;
         while (spins < self.config.spin_before_park_iters) : (spins += 1) {
             if (self.state.load(.acquire) != .running) return;
             std.atomic.spinLoopHint();
         }
 
+        // End-of-spin local-work probe: if work became visible during the
+        // spin window, skip parking. The probe reads only this worker's
+        // local sources plus a single inject_queue length peek — a small
+        // number of atomic loads (2 under global_queue, up to 4 under
+        // work_stealing), executed once per park cycle (vs 128× on the
+        // removed poll). Restores the "avoid park on rapid arrival" fast
+        // path without the cross-core polling cost.
+        if (self.config.scheduler_variant == .work_stealing) {
+            // .monotonic is sufficient: this worker is the owner of
+            // lifo_slot and local_queues[worker_index]; program-order
+            // vs the owner's own prior .release store already guarantees
+            // visibility, so no cross-core acquire fence is needed here.
+            // A missed observation would be recovered by the SC park
+            // handshake below.
+            if (worker.lifo_slot.load(.monotonic) != LIFO_SLOT_EMPTY) return;
+            if (self.local_queues[worker_index].len() != 0) return;
+        }
+        if (self.inject_queue.len() != 0) return;
+
+        // Check shutdown after the work probe: workers should help drain
+        // queued tasks on their way to exit rather than prematurely park.
         if (self.state.load(.acquire) != .running) return;
 
         _ = worker.parks.fetchAdd(1, .release);

@@ -102,11 +102,7 @@ pub const Config = struct {
     worker_scratch_cap_bytes: usize = 64 * 1024,
     idle_park_after_ns: u64 = 250_000,
     idle_purge_after_ns: u64 = 5_000_000,
-    // Default 0: the spin is off by default because A/B measurement on
-    // flood_1m showed no benefit vs immediate-park under this crate's
-    // park/wake design. Set non-zero to introduce a pause delay before
-    // paying park cost (no counter polling).
-    spin_before_park_iters: usize = 0,
+    spin_before_park_iters: usize = 128,
     deinit_timeout_ns: u64 = 30_000_000_000,
     scheduler_variant: SchedulerVariant = .global_queue,
     queue_kind: QueueKind = .ring,
