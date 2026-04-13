@@ -420,6 +420,75 @@ Reverted: G1 Tasks 1-5 (bitmap field, park-handshake maintenance, wake rewrite, 
 
 The wake path target is still real (stubbing gives +47%). Future attempts must use a different mechanism than bitmap consolidation. Moving Phase G work to G2 next.
 
+## Phase G2: Idle-Spin Poll Removal (negative result — REVERTED, exposes pre-existing scheduler race)
+
+**Hypothesis:** Worker idle-spin polls `counters.queued_tasks.load(.acquire)` spin_before_park_iters × worker_count times per park cycle. A/B-measured ceiling: 331K → 417K ops/s (+26%). Phase G2 removed the poll (keeping the SC park handshake intact). See `docs/superpowers/plans/2026-04-12-phase-g2-queued-tasks-poll.md`.
+
+### Measured (median of 5, ReleaseFast, 56-core host)
+
+| Config | flood_1m ops/s | Δ vs 328K baseline |
+|---|---:|---:|
+| Baseline (c1425a4, poll present) | 328K | — |
+| G2 (poll removed, spin=128 + end-of-spin probe) | 349K | +6.5% |
+| G2 (poll removed, spin=0, probe vestigial) | 357K | +8.9% |
+
+The default G2 config measured **-2.4% BELOW spin=0**, proving the end-of-spin local-work probe was inert — same probability-of-engagement failure mode as Phase F1's short-spin active_spinners mechanic (128-iter spin ~128ns vs ~3µs inter-submit interval). The poll-removal itself was the sole source of lift.
+
+### Stress-test failure exposes a pre-existing race
+
+Bisecting stress-test stability (`zig build test-stress -Doptimize=ReleaseFast`, 50–100 run samples per commit):
+
+| Commit | stress failure rate |
+|---|---:|
+| `c1425a4` main tip | 0/50 |
+| `a7f1dc6` (tests added, poll still present) | 0/30 |
+| `c335189` (poll removed) | 1/30 |
+| `cad50f1` (probe variant) | 5/100 |
+| `60ad076` (simplified variant) | 2/40 |
+
+**Finding:** removing the idle-spin poll changes worker timing such that workers now exit `idle()` synchronously at end of spin window instead of staggered (each worker returning as soon as its poll observed non-zero). Under the aggressive-spin stress scenario (16 workers × spin_before_park_iters=4096 × 200K tasks), the synchronized storm on `nextTask`'s inject_queue drain + stealHalf + local-queue overflow path exposes a latent double-dequeue race.
+
+Core dump analysis (`phase g2: aggressive spin flood` test at commit 60ad076):
+
+- Multiple workers simultaneously run the same `descriptor_index` in `runTask`.
+- Crashing descriptor has `task_fn=null` — it was released (`releaseDescriptor` zeros the fields), returned to the free list, and re-acquired (`acquireDescriptor`) for a new task while the stale index was still present in a secondary queue path.
+- Crash site: `src/pool.zig:749` — `descriptor.task_fn.?(descriptor.ctx.?, &runtime)`.
+- Race location (candidate): `src/pool.zig:650-699` (`nextTask`'s inject_queue batch drain + stealHalf overflow → `self.inject_queue.tryPush(idx)` with discarded return).
+
+The race exists in main (c1425a4) but is masked by the staggered-exit timing the poll provides. Removing the poll makes it observable.
+
+### What was reverted vs kept
+
+**Reverted (three `git revert` commits):** G2 implementation (c335189), documentation comments (427289a), simplified variant (60ad076). Tree is now byte-identical to main for `src/pool.zig` and `src/types.zig`.
+
+**Kept (permanent):**
+
+- `tests/unit.zig` — `"phase g2: worker returns from idle when lifo slot filled during spin window"` — regression guard for the idle-spin fast path (passes against pre-G2 code; will catch regressions in any future re-attempt).
+- `tests/stress.zig` — `"phase g2: aggressive spin flood - no lost wakeups"` — aggressive-spin stress harness (passes against pre-G2 code; will be the primary signal for detecting the scheduler race during the follow-up fix).
+- `cad50f1` unit-test timing fix.
+
+Post-rollback stress stability: 20/20 passing runs at ReleaseFast (confirms the rollback restores the staggered-exit timing).
+
+### Lessons learned
+
+1. **Timing masks races.** A mechanic that changes inter-thread scheduling phase (the poll provided that) can hide an underlying scheduler race. When removing a hot-path load "just to measure," include a wide-N stress sample at each bisect point — 5× was insufficient to catch a 5% failure rate.
+2. **Probability-of-engagement lesson #5 confirmed again.** The end-of-spin probe was dead code for the same reason F1's active_spinners was dead: 128-iter spin (~128ns) vs 3µs inter-submit interval. Any future "skip the expensive thing when workers are spinning" design needs a spin window > event interval.
+3. **Rollback-preserving test commits is the right move.** The stress test added in a7f1dc6 is the most valuable output of this phase — it reliably triggers the latent scheduler race when the poll is absent, giving us a reproducer for the follow-up fix.
+
+### Next direction — new phase to fix the scheduler race
+
+Before any future G2 re-attempt, fix the double-dequeue race in `src/pool.zig:nextTask` (lines 650–699). Steps for a follow-up phase:
+
+1. Write a targeted stress reproducer that deterministically triggers the race (e.g. manually synchronize worker spin-exits via a barrier, maximize inject_queue drain contention).
+2. Add defensive assertions in `runTask` / `acquireDescriptor` / `releaseDescriptor` that catch duplicate descriptor-index dequeue at runtime (only in Debug/ReleaseSafe).
+3. Root-cause the specific ordering in `nextTask` that permits duplicate observation of a descriptor index. Likely culprits:
+   - The `self.inject_queue.tryPush(idx)` call at line 655 inside the batch-drain loop (discards return value — what if push fails AND the idx is still held by something?)
+   - The stealHalf overflow push at line 692 (`_ = self.inject_queue.tryPush(idx);`) — same pattern.
+4. Fix preserving the work-stealing throughput. Any redesign must pass the aggressive-spin stress test at 100/100 (not just 5/5).
+5. Once the race is fixed, re-attempt G2 (poll removal). The data proves the poll is a real ~9% flood_1m cost — the win is waiting.
+
+See `docs/superpowers/plans/2026-04-12-phase-g2-queued-tasks-poll.md` for the original design; see this section for the negative-result record.
+
 ## Bench Stability
 
 From 2026-04-12 forward, `benchmarks/common.zig` runs 7 iterations per
