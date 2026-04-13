@@ -508,3 +508,56 @@ test "hot_spinners: wide-pool flood with cpu-count workers, hot_spinners=1" {
     wg.wait();
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 }
+
+test "phase g2: aggressive spin flood - no lost wakeups" {
+    // Stress the submit→park handshake with an aggressive spin count.
+    // With spin_before_park_iters=4096, many of the 16 workers will be
+    // mid-spin at the moment each submit fires the wake. This validates
+    // that the handshake still guarantees no lost wakeups after the
+    // poll removal in Phase G2.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 16,
+        .max_threads = 16,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .spin_before_park_iters = 4096,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const total: u64 = 200_000;
+
+    const Submitter = struct {
+        fn run(p: *thread_pool.ThreadPool, c: *common.Counter, n: u64) void {
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                // Use blocking submit so queue-full never drops tasks.
+                _ = p.submit(common.counterTask, @ptrCast(c), .{
+                    .backpressure = .block,
+                }) catch |err| switch (err) {
+                    error.ShutdownInProgress => return,
+                    else => return,
+                };
+            }
+        }
+    };
+
+    // Two submitter threads — interleaved submits increase the chance that
+    // workers are mid-spin when a wake arrives.
+    const t1 = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total / 2 });
+    const t2 = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total / 2 });
+    t1.join();
+    t2.join();
+
+    // Wait up to 30s for all tasks to complete. A lost wakeup would cause
+    // the counter to stall below total.
+    const deadline_ns: i128 = 30 * std.time.ns_per_s;
+    const start = std.time.nanoTimestamp();
+    while (std.time.nanoTimestamp() - start < deadline_ns) {
+        if (counter.value.load(.acquire) >= total) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expectEqual(total, counter.value.load(.acquire));
+}
