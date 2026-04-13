@@ -133,6 +133,15 @@ const TaskDescriptor = struct {
     start_ns: u64 = 0,
     complete_ns: u64 = 0,
 
+    /// Debug/ReleaseSafe-only double-dequeue detector. `-1` = unclaimed.
+    /// Worker CAS-acquires from -1 to its index in runTask; a failed CAS
+    /// means two workers are racing for this descriptor — panic.
+    /// Always compiled in (cheap — single i32). Guarded reads/writes are
+    /// controlled by `claim_sentinel_enabled` (defined above) — currently
+    /// always-on for the Phase H race investigation; revert to
+    /// `std.debug.runtime_safety` after Task 4 fix lands.
+    claimed_by: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+
     comptime {
         // Document the intended cache layout: ensure the hot fields fit in
         // one cache line so dispatch never touches the cold metric fields.
@@ -144,6 +153,18 @@ const TaskDescriptor = struct {
 /// Sentinel value meaning "the lifo_slot is empty". Chosen as the max u32
 /// so descriptor indices (0..queue_capacity-1) never collide.
 const LIFO_SLOT_EMPTY: u32 = 0xFFFF_FFFF;
+
+/// Phase H investigation flag — when true, the per-descriptor `claimed_by`
+/// sentinel is always active (catches double-dequeue races in ReleaseFast
+/// where the race actually reproduces). When false, the sentinel only
+/// runs under `std.debug.runtime_safety` (Debug/ReleaseSafe), where the
+/// race is masked by safety-check overhead and rarely fires.
+///
+/// TODO(phase-h): once the double-dequeue race is root-caused and fixed
+/// (Task 4 of docs/superpowers/plans/2026-04-13-phase-h-fix-double-dequeue-race.md),
+/// flip this back to `std.debug.runtime_safety` or remove the sentinel
+/// entirely.
+const claim_sentinel_enabled: bool = true;
 
 const Worker = struct {
     thread: ?std.Thread = null,
@@ -633,17 +654,29 @@ const Core = struct {
         var worker = &self.workers[worker_index];
         var lq = &self.local_queues[worker_index];
 
+        // Phase H (Task 4b): decrementQueued() is NOT called here. It moved to
+        // runTask's CAS-success path so that a ghost duplicate index emitted
+        // by any queue path (the upstream race tracked in Task 3 diagnosis)
+        // does not cause an unbalanced decrement. Without this move, a
+        // single duplicate emission causes queued_tasks to go net-negative
+        // by 1; at steady state the race churns millions of duplicates and
+        // underflows queued_tasks to a huge u64, which deadlocks shutdown
+        // (shouldExit requires queued_tasks == 0).
+        //
+        // Semantics: queued_tasks now counts "items the scheduler believes
+        // are still pending execution" across {submitted, not-yet-claimed}
+        // PLUS {popped-by-nextTask, not-yet-claimed-by-runTask-CAS}. Park
+        // handshake and shutdown's drain loop both still see 0 iff every
+        // submitted item has been claimed (real) or discarded (duplicate).
         if (self.config.scheduler_variant == .work_stealing) {
             // LIFO slot first: owner-only swap-to-empty. Most-recently-submitted
             // task runs next. This is the hot path for "task spawns task".
             const cached = worker.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
             if (cached != LIFO_SLOT_EMPTY) {
-                self.decrementQueued();
                 return cached;
             }
 
             if (lq.popBottom()) |descriptor_index| {
-                self.decrementQueued();
                 return descriptor_index;
             }
 
@@ -658,7 +691,6 @@ const Core = struct {
                 }
                 const local_len = @as(u32, @intCast(lq.len()));
                 updatePeakU32(&worker.local_queue_peak, local_len);
-                self.decrementQueued();
                 return descriptor_index;
             }
 
@@ -680,11 +712,9 @@ const Core = struct {
                 const n = self.local_queues[victim_index].steal(stolen[0..budget]);
                 if (n > 0) {
                     // Keep the first for ourselves, push the rest to our local deque.
-                    // queued_tasks is decremented only for the item being returned for
-                    // immediate execution; items moved into the local deque remain queued
-                    // and decrement when later popped (matches the inject-queue drain
-                    // pattern above). Decrementing by `n` here would double-decrement
-                    // those items and cause queued_tasks to underflow, breaking shutdown.
+                    // No decrement here — runTask's CAS-success path decrements for
+                    // `first`; items pushed to lq will decrement when their eventual
+                    // runTask CAS succeeds (or be silently skipped if duplicate).
                     const first = stolen[0];
                     for (stolen[1..n]) |idx| {
                         if (!lq.tryPushBottom(idx)) {
@@ -692,7 +722,6 @@ const Core = struct {
                             _ = self.inject_queue.tryPush(idx);
                         }
                     }
-                    self.decrementQueued();
                     _ = worker.steals.fetchAdd(n, .release);
                     const local_len: u32 = @intCast(lq.len());
                     updatePeakU32(&worker.local_queue_peak, local_len);
@@ -705,7 +734,6 @@ const Core = struct {
         }
 
         if (self.inject_queue.pop()) |descriptor_index| {
-            self.decrementQueued();
             return descriptor_index;
         }
         return null;
@@ -714,7 +742,41 @@ const Core = struct {
     fn runTask(self: *Core, worker_index: usize, descriptor_index: u32) void {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
-        descriptor.state.store(.running, .release);
+
+        // Phase H fix: atomically transition .queued → .running. Any other
+        // state means the descriptor was already claimed, already completed,
+        // or has been recycled — drop this dispatch. This closes the wide-
+        // overlap race where a duplicate descriptor_index emitted by a queue
+        // path arrives after the first claimant already ran and released.
+        // The CAS failure branch is a silent skip — duplicate emissions are
+        // not an error in this layer; the upstream queue-path root cause is
+        // tracked as residual Phase H work.
+        //
+        // Task 4b: on a successful CAS we also decrementQueued. nextTask
+        // intentionally does NOT decrement (see the big comment there),
+        // because a duplicate emission would otherwise unbalance the
+        // counter and deadlock shutdown. Ghost duplicates fail this CAS
+        // and silently return without decrementing — so queued_tasks stays
+        // equal to "submissions minus successful dispatches plus dropped
+        // ghosts' original double-count cancellation", i.e. it reaches 0
+        // iff every real submission has been dispatched or cancelled.
+        if (descriptor.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire)) |_| {
+            return;
+        }
+        self.decrementQueued();
+
+        // Task 2 sentinel: catches tight-overlap sibling where two workers
+        // both pass the state CAS (shouldn't happen — CAS is serializing —
+        // but the sentinel remains as a defense-in-depth assertion).
+        if (claim_sentinel_enabled) {
+            const wi_i32: i32 = @intCast(worker_index);
+            if (descriptor.claimed_by.cmpxchgStrong(-1, wi_i32, .acq_rel, .acquire)) |other| {
+                std.debug.panic(
+                    "double-dequeue: descriptor {d} claimed by worker {d}, now worker {d} also tried to claim it",
+                    .{ descriptor_index, other, wi_i32 },
+                );
+            }
+        }
         const timestamps_enabled = self.config.timestamp_mode == .full;
         const start_ns = if (timestamps_enabled) nowNs() else 0;
         descriptor.start_ns = start_ns;
@@ -773,6 +835,13 @@ const Core = struct {
 
         if (descriptor.options.wait_group) |wait_group| {
             wait_group.done();
+        }
+
+        // Clear the claim sentinel before wait_group.done() observers can
+        // re-submit / re-acquire this descriptor slot. Paired with the
+        // CAS-acquire at the top of runTask.
+        if (claim_sentinel_enabled) {
+            descriptor.claimed_by.store(-1, .release);
         }
 
         if (descriptor.options.waitable) {
@@ -836,8 +905,12 @@ const Core = struct {
     }
 
     fn cancelQueuedTasks(self: *Core) !void {
+        // Task 4b: no decrementQueued here — it moved into cancelDescriptor's
+        // CAS-success path. Matches the nextTask/runTask split so a ghost
+        // duplicate index popped during cancellation drains doesn't
+        // double-decrement (which would underflow queued_tasks and
+        // deadlock shouldExit).
         while (self.inject_queue.pop()) |descriptor_index| {
-            self.decrementQueued();
             self.cancelDescriptor(descriptor_index);
         }
         if (self.config.scheduler_variant == .work_stealing) {
@@ -845,13 +918,11 @@ const Core = struct {
             for (self.workers) |*w| {
                 const cached = w.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
                 if (cached != LIFO_SLOT_EMPTY) {
-                    self.decrementQueued();
                     self.cancelDescriptor(cached);
                 }
             }
             for (self.local_queues) |*lq| {
                 while (lq.stealOne()) |descriptor_index| {
-                    self.decrementQueued();
                     self.cancelDescriptor(descriptor_index);
                 }
             }
@@ -860,7 +931,17 @@ const Core = struct {
 
     fn cancelDescriptor(self: *Core, descriptor_index: u32) void {
         const descriptor = &self.descriptors[descriptor_index];
-        descriptor.state.store(.cancelled, .release);
+        // Gate with the same state CAS pattern runTask uses. A duplicate
+        // index emitted by a queue path will find state != .queued (already
+        // cancelled, running, completed, or free) and silently return.
+        // Only the first valid cancellation decrements queued_tasks.
+        if (descriptor.state.cmpxchgStrong(.queued, .cancelled, .acq_rel, .acquire)) |_| {
+            return;
+        }
+        self.decrementQueued();
+        if (claim_sentinel_enabled) {
+            descriptor.claimed_by.store(-1, .release);
+        }
         _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         if (descriptor.options.wait_group) |wait_group| wait_group.done();
         // Only broadcast for waitable tasks (matches runTask pattern)
@@ -891,6 +972,9 @@ const Core = struct {
             descriptor.* = .{};
             descriptor.generation = prev_generation +% 1;
             if (descriptor.generation == 0) descriptor.generation = 1;
+            if (claim_sentinel_enabled) {
+                descriptor.claimed_by.store(-1, .release);
+            }
             descriptor.state.store(.reserved, .release);
             const live = self.counters.task_desc_live.fetchAdd(1, .monotonic) + 1;
             updatePeak(&self.counters.task_desc_peak, live);

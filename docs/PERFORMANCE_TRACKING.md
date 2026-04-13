@@ -569,3 +569,103 @@ Numbers from `zig build bench-tokio-parity`. Directly comparable to Tokio's
 | contended_spawn_8x (Phase A+B) | 507753 | 100000 | 8 | Park handshake simplified; ring queue batch-steal=8; median of 3 runs |
 
 For reference, Tokio's `rt_multi_threaded` flood-equivalent typically runs 5–15M ops/s on similar hardware. Our gap is the work the remaining tasks (true batch-steal via deque rework, hot-path atomic reductions beyond Phase 2) target.
+
+## Phase H — nextTask Scheduler Race (2026-04-13)
+
+**Symptom.** ~14% SIGSEGV rate on Phase G2 stress test (`tests/stress.zig::"phase g2: aggressive spin flood - no lost wakeups"`) at ReleaseFast on 56-core hardware. The crash is a NULL function-pointer call at `src/pool.zig:783` (`descriptor.task_fn.?(descriptor.ctx.?, &runtime)`). Reproduces under `zig build test-stress` with the cherry-picked Phase G2 poll removal at `5f5b0f5`. The Task 2 claim sentinel **does** fire — but only sometimes (visible in a parallel run of the deterministic reproducer test from Task 1, e.g. `panic: double-dequeue: descriptor 12 claimed by worker 10, now worker 13 also tried to claim it`). In the dominant SIGSEGV case the sentinel is silent because the second worker reaches the CAS only AFTER the first worker has finished and cleared `claimed_by` back to `-1` (`runTask` line 816), so its CAS-`-1`→`worker_index` succeeds against an already-released descriptor.
+
+**Reproducer.** `zig build test-stress` in a loop (random seed). Crashes one in five-to-ten iterations. The deterministic Task 1 reproducer (`tests/stress/double_dequeue_race.zig`) trips the sentinel directly when the race fires; the spin-flood test usually races into the NULL-deref symptom because both arms (sentinel-trip OR NULL-deref) are downstream of the same root cause. Seed `0x6adae8d8` reproduces but is not deterministic across runs because thread interleaving dominates.
+
+**Reproduction method.** Bash loop running `zig build test-stress`; coredumps captured via `ulimit -c unlimited` + `kernel.core_pattern=/tmp/phase-h-hunt/cores/core.%p`. ReleaseFast core (`core.574634`) yielded the smoking-gun stack via `gdb -batch -ex "thread apply all bt"`. Confirmation pass added two instrumentation panics (post-CAS state assertion + pre-call NULL-fn assertion) inside `runTask`; both fired across multiple runs with consistent shapes.
+
+**Stack trace excerpt (Thread 1, crashing).**
+
+```text
+#0  0x0000000000000000 in ?? ()
+#1  0x0000000001013174 in pool.Core.runTask (self=0x7f334f6a0000, worker_index=9, descriptor_index=85)
+                        at src/pool.zig:783
+#2                       pool.Core.workerMain (self=..., worker_index=9) at src/pool.zig:649
+#3                       Thread.callFn__anon_7478 () at .../Thread.zig:509
+#4                       Thread.LinuxThreadImpl.spawn__anon_4652.Instance.entryFn (...) at .../Thread.zig:1381
+```
+
+Frame-1 locals from the same core:
+
+```text
+descriptor = 0x7f334f6e2fe0
+*descriptor = {task_fn = 0x0, ctx = 0x0, options = {wait_group = 0x0, ..., backpressure = return_error},
+               generation = 587, submit_ns = 0, start_ns = 1776083542787660655, complete_ns = 0,
+               claimed_by = {raw = 9}, state = {raw = running}}
+```
+
+- `task_fn = 0x0` and `ctx = 0x0`: written by `releaseDescriptor` (lines 969–970), not by any submitter.
+- `submit_ns = 0` with `timestamp_mode == .full`: also written by `releaseDescriptor` (line 972). A live submission would have a non-zero timestamp.
+- `options = .{}`: also written by `releaseDescriptor` (line 971). The test always submits with `.backpressure = .block` — so this descriptor is NOT the live-test submission worker 9 thinks it claimed.
+- `state = running` and `claimed_by = 9`: written by worker 9 itself at lines 744 and 751 AFTER its CAS succeeded.
+
+**Source site.** `src/pool.zig:783` (the symptom). Root cause is upstream — see below.
+
+**Root cause.** The scheduler is delivering the same `descriptor_index` to two distinct `runTask` invocations across worker threads. The Task 2 claim sentinel proved this directly when both racers reach `runTask` while the first still owns the slot (`panic: double-dequeue: descriptor 27 claimed by worker 1, now worker 11 also tried to claim it`). When the racers are slightly more spread out — first claimer wins CAS, runs to completion, clears the sentinel at line 816, and starts `releaseDescriptor` (lines 967–998) — the second claimer arrives, finds `claimed_by == -1`, wins its own CAS, and then dereferences fields that the first claimer's `releaseDescriptor` has already nulled. The instrumented post-CAS panic confirmed the descriptor's `state` field at the moment of the second CAS is one of `.free` (most common — released by the first claimer), `.completed` (first claimer mid-cleanup, post-line-816), or `.reserved` (a third path — submitter mid-`acquireDescriptor`/`enqueueTask` having already re-acquired the slot after the first claimer freed it). In all cases the descriptor is NOT in state `.queued` as it would be for a valid live dispatch.
+
+Where the duplicate dispatch comes from: the Task 1 reproducer is configured to push exclusively through `inject_queue` (external submitters → `tls_worker_index == null` → no LIFO/local-queue traffic), so the duplication originates either inside the `inject_queue` (`src/queue/bounded_ring.zig`) MPMC pop path or in the `nextTask` plumbing around it (`src/pool.zig:728`–`732`, also reachable as the `inject_queue.pop()` branch at `src/pool.zig:671`–`684` plus its inject-batch-drain re-push at line 676). The bounded ring's Vyukov sequence-number protocol is internally sound under code review, so the operative suspect is the `inject_queue.pop()` interaction with `decrementQueued()` ordering, or — more likely — a memory-ordering gap between the submitter's plain stores to descriptor fields (`descriptor.task_fn = task_fn` at line 563, etc.) and the visibility guarantee provided by the queue push's release. We could not narrow it tighter inside the time budget without much heavier instrumentation. For Task 4, the highest-leverage fix is structural: gate `runTask` entry on a state CAS (`descriptor.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire)`) so a freed/reserved descriptor cannot be claimed even when `claimed_by == -1`, and have the second arrival treat CAS failure as "already stolen by another worker" and discard the index without entering the task body.
+
+**Mechanism (narrative).** Workers A and B both end up holding the same `descriptor_index` (say 85) returned from their respective `nextTask` calls. Worker A wins the `claimed_by` CAS, sets `state=.running`, runs the task body, runs the cleanup down to line 816 (`claimed_by.store(-1)`), and starts `releaseDescriptor` (line 824). At line 969 it writes `task_fn = null`. Worker B, meanwhile, has been doing instruction-cache / scheduler-pause delays inside its `nextTask`→`runTask` transition; it now enters `runTask(85)`, succeeds the `claimed_by` CAS against `-1` (because A cleared it), writes `state=.running` over A's `state=.completed`/`.free`, writes `start_ns`, and then dereferences `descriptor.task_fn.?` — which A nulled — and SIGSEGVs jumping to PC=0. The whole sequence is ~50 instructions; the only thing required is for A's cleanup tail (lines 816→969) to interleave with B's `nextTask`-return → `runTask`-CAS path. On a 56-core machine this happens often enough to produce ~14% crash rate.
+
+**Why the sentinel didn't fire (in the SIGSEGV cases).** The sentinel only catches "two workers racing INSIDE `runTask` with both still holding the claim". As soon as worker A reaches line 816 (`claimed_by.store(-1, .release)`) — which happens BEFORE the descriptor's fields are nulled by `releaseDescriptor` — the sentinel is reset. Any second worker arriving after that point will pass the CAS and proceed into the body of `runTask` reading already-nulled / about-to-be-nulled fields. The sentinel is sufficient for tight races (and does fire ~10–20% of repros, particularly in the deterministic Task 1 reproducer that interleaves more aggressively), but not for the loosely-coupled common case.
+
+**Fix shape (input to Task 4).** The narrowest correct fix is a state-CAS gate in `runTask` that replaces / augments the claim-sentinel CAS:
+
+```zig
+// At src/pool.zig:744 (inside runTask, replacing or wrapping the claimed_by CAS):
+if (descriptor.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire)) |observed| {
+    // Descriptor was not in .queued state — this index is stale.
+    // Counter-decrement was already done in nextTask; just bail.
+    // Bumping a stat counter (e.g. self.counters.stale_dispatch) is recommended
+    // so the rate is observable post-fix.
+    return;
+}
+// Then drop or simplify the claimed_by sentinel — the state CAS subsumes it.
+```
+
+This is correct because `enqueueTask` publishes `state.store(.queued, .release)` at line 569 BEFORE the queue push (line 590), and `releaseDescriptor` writes `state.store(.free, .release)` at line 975 BEFORE the freelist push (lines 978–987). The state field is the canonical "this descriptor is dispatchable" signal; gating dispatch on a CAS from `.queued` makes the dispatch idempotent and immune to whatever path delivered the duplicate index.
+
+A separate, deeper investigation should still try to identify WHICH path delivers the duplicate index (likely candidates: `inject_queue.pop()` returning a stale slot under wrap, or `nextTask`'s `decrementQueued` ordering vs. the queue's CAS). But the state-CAS gate makes the system safe regardless, and matches the pattern Tokio uses (`Schedule::release` checks state before run).
+
+**Confidence.** High that the proximate cause is the NULL `task_fn` deref at line 783 caused by descriptor reuse between dispatch and task-body execution — confirmed by core-dump field inspection AND by the post-CAS state-assertion instrumentation firing across multiple independent runs with consistent shapes (`state=free`, `task_fn_null=true` dominating). Medium-high that the fix shape (state-CAS gate) is correct — the state ordering is well-defined and a state-CAS is the standard remedy. Medium-low on identifying the specific queue-path bug that produces the duplicate index — would be raised by adding per-pop / per-push logging in `bounded_ring.zig` and `nextTask`, which is out of scope for this investigation step.
+
+**Temporary instrumentation in `src/pool.zig`** (must be reverted by Task 4):
+
+- Lines ~750–768: post-CAS state-assertion panic.
+- Lines ~801–818: pre-call NULL-`task_fn` panic with descriptor field dump.
+
+Both are gated by `claim_sentinel_enabled` (lines 750–768) and a plain `if` (lines 801–818) and live alongside the existing Task 2 sentinel.
+
+### Fix (2026-04-13)
+
+**Applied in two commits on `feat/phase-h-fix-double-dequeue-race`:**
+
+- `710a98f fix(phase h): gate runTask dispatch with state CAS` — replaces the bare `descriptor.state.store(.running, .release)` at the top of `runTask` with `cmpxchgStrong(.queued, .running, .acq_rel, .acquire)`. Ghost duplicate-index dispatches from the queue layer fail the CAS and return silently, preventing the NULL `task_fn` SIGSEGV.
+- `daedce6 fix(phase h): balance queued_tasks under ghost-dispatch + cap stealHalf retries` — moves `decrementQueued()` from the five `nextTask` pop sites to the `runTask` CAS-success path. Prevents `queued_tasks` underflow from ghost dispatches (which was causing shutdown hangs). Also caps `ring_queue.stealHalf`'s CAS-retry loop at 256 to prevent livelock on a pathological `head > tail` wrap state.
+
+### Validation (2026-04-13)
+
+With the cherry-picked G2 poll-removal dropped and the branch tip matching production `idle()`:
+
+- `zig build test` — pass
+- `zig build test-stress` — pass (baseline single run)
+- 100/100 ReleaseFast stress-suite iterations — 0 crashes, 0 hangs (validates both the Phase G2 `aggressive spin flood` test and the new Phase H `double-dequeue race reproducer`)
+
+**Status:** fix landed. Unblocks Phase G2 re-land, G3 (submitted fetchAdd), wake-scan redesign, and descriptor CAS.
+
+### Residual concerns (tracked for future phases)
+
+1. **Duplicate-emission root cause not pinpointed.** Some queue path (ring, chase-lev, LIFO-slot re-submit, or inject-batch drain) still emits the same descriptor index twice. The CAS gate + accounting rebalance make this safe (no crash, no leak, no hang), but the duplicate churn wastes a small amount of work per dispatch. Worth investigating in a follow-up phase if benchmarks show the CAS-fail rate is material.
+2. **`head > tail` persistent wrap in `ring_queue`** — a stress condition can leave the ring queue in an unsigned-wrapped state that `stealHalf`'s CAS-retry loop would spin on forever. Capped at 256 retries to prevent livelock, but the wrap itself is unexplained. Strong suspicion: same upstream bug as #1.
+3. **`stealOne` wrap-livelock audit** — `stealOne` has a similar CAS-retry shape to `stealHalf` but was not audited for the same wrap-livelock. No observed failures in 100/100 validation, but worth an audit pass.
+
+### Unblocks
+
+- Phase G2 re-land (poll removal for +9% throughput)
+- Phase G3 (submitted fetchAdd) — +28%
+- Wake-scan redesign — +47%
+- Descriptor CAS — +16%

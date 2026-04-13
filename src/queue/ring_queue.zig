@@ -109,7 +109,18 @@ pub fn RingQueue(comptime T: type) type {
         /// monotonically increasing within the u32 range we actually use.
         pub fn stealHalf(self: *Self, dst: []T) usize {
             if (dst.len == 0) return 0;
+            // Retry budget. The transient `avail > capacity` window (owner
+            // mid-pop) and CAS-contention retries should resolve within a
+            // handful of iterations; anything longer signals either a genuine
+            // livelock (e.g. pre-existing head-past-tail wrap state reached
+            // via a still-uncharacterized race in pop/steal) or a degenerate
+            // contention pattern that's better served by moving to the next
+            // victim. Cap rather than spin forever so shutdown cannot stall
+            // waiting for a livelocked worker to leave stealHalf.
+            var retries: u32 = 0;
             while (true) {
+                if (retries >= 256) return 0;
+                retries += 1;
                 const h = self.head.load(.acquire);
                 // Acquire on tail pairs with the owner's release on push.
                 const t = self.tail.load(.acquire);

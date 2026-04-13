@@ -2,6 +2,10 @@ const std = @import("std");
 const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
+comptime {
+    _ = @import("stress/double_dequeue_race.zig");
+}
+
 test "stress high-volume small-task increments in bounded waves" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 4,

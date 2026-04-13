@@ -886,3 +886,67 @@ test "hot_spinners = 1 executes follow-up task after quiesce" {
     solo_wg.wait();
     try std.testing.expectEqual(@as(u64, 1), solo.value.load(.acquire));
 }
+
+test "phase h regression: state CAS gate rejects duplicate descriptor dispatch" {
+    // Regression guard for the Phase H state-CAS fix in runTask. The wider
+    // reproducer lives in tests/stress/double_dequeue_race.zig; this is a
+    // smaller/faster unit test intended to exercise the same race window
+    // (spin=0 + tight idle park + 16-worker submit flood) on every unit
+    // test run so a future refactor that drops the state CAS surfaces here
+    // rather than only in the stress suite.
+    //
+    // The state CAS at the top of runTask transitions .queued → .running;
+    // any duplicate descriptor_index emission from some queue path arrives
+    // after the first claimant already released the descriptor (task_fn is
+    // null, state is .free or recycled), fails the CAS, and returns
+    // silently. Pre-fix, the same race would SIGSEGV on a NULL task_fn call.
+    const noop = struct {
+        fn run(_: *anyopaque, _: *thread_pool.TaskContext) void {}
+    }.run;
+
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 16,
+        .max_threads = 16,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+        .spin_before_park_iters = 0,
+        .idle_park_after_ns = 10_000, // 10us — high park churn
+    });
+    defer pool.deinit();
+
+    // Let workers reach steady state before the flood.
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    const per_producer: u64 = 200_000;
+    var wg = pool.waitGroup();
+
+    const Submitter = struct {
+        fn run(p: *thread_pool.ThreadPool, g: *thread_pool.WaitGroup, n: u64) void {
+            var dummy: u8 = 0;
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                _ = p.submit(noop, @ptrCast(&dummy), .{
+                    .backpressure = .block,
+                    .wait_group = g,
+                }) catch return;
+            }
+        }
+    };
+
+    const t1 = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &wg, per_producer });
+    const t2 = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &wg, per_producer });
+    t1.join();
+    t2.join();
+
+    // Deadline-based polling so a lost wakeup surfaces as a test failure
+    // with a clear pendingCount rather than a process-level hang.
+    const deadline_ns: i128 = 60 * std.time.ns_per_s;
+    const start = std.time.nanoTimestamp();
+    while (std.time.nanoTimestamp() - start < deadline_ns) {
+        if (wg.pendingCount() == 0) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
+}
