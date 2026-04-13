@@ -639,3 +639,33 @@ A separate, deeper investigation should still try to identify WHICH path deliver
 - Lines ~801–818: pre-call NULL-`task_fn` panic with descriptor field dump.
 
 Both are gated by `claim_sentinel_enabled` (lines 750–768) and a plain `if` (lines 801–818) and live alongside the existing Task 2 sentinel.
+
+### Fix (2026-04-13)
+
+**Applied in two commits on `feat/phase-h-fix-double-dequeue-race`:**
+
+- `710a98f fix(phase h): gate runTask dispatch with state CAS` — replaces the bare `descriptor.state.store(.running, .release)` at the top of `runTask` with `cmpxchgStrong(.queued, .running, .acq_rel, .acquire)`. Ghost duplicate-index dispatches from the queue layer fail the CAS and return silently, preventing the NULL `task_fn` SIGSEGV.
+- `daedce6 fix(phase h): balance queued_tasks under ghost-dispatch + cap stealHalf retries` — moves `decrementQueued()` from the five `nextTask` pop sites to the `runTask` CAS-success path. Prevents `queued_tasks` underflow from ghost dispatches (which was causing shutdown hangs). Also caps `ring_queue.stealHalf`'s CAS-retry loop at 256 to prevent livelock on a pathological `head > tail` wrap state.
+
+### Validation (2026-04-13)
+
+With the cherry-picked G2 poll-removal dropped and the branch tip matching production `idle()`:
+
+- `zig build test` — pass
+- `zig build test-stress` — pass (baseline single run)
+- 100/100 ReleaseFast stress-suite iterations — 0 crashes, 0 hangs (validates both the Phase G2 `aggressive spin flood` test and the new Phase H `double-dequeue race reproducer`)
+
+**Status:** fix landed. Unblocks Phase G2 re-land, G3 (submitted fetchAdd), wake-scan redesign, and descriptor CAS.
+
+### Residual concerns (tracked for future phases)
+
+1. **Duplicate-emission root cause not pinpointed.** Some queue path (ring, chase-lev, LIFO-slot re-submit, or inject-batch drain) still emits the same descriptor index twice. The CAS gate + accounting rebalance make this safe (no crash, no leak, no hang), but the duplicate churn wastes a small amount of work per dispatch. Worth investigating in a follow-up phase if benchmarks show the CAS-fail rate is material.
+2. **`head > tail` persistent wrap in `ring_queue`** — a stress condition can leave the ring queue in an unsigned-wrapped state that `stealHalf`'s CAS-retry loop would spin on forever. Capped at 256 retries to prevent livelock, but the wrap itself is unexplained. Strong suspicion: same upstream bug as #1.
+3. **`stealOne` wrap-livelock audit** — `stealOne` has a similar CAS-retry shape to `stealHalf` but was not audited for the same wrap-livelock. No observed failures in 100/100 validation, but worth an audit pass.
+
+### Unblocks
+
+- Phase G2 re-land (poll removal for +9% throughput)
+- Phase G3 (submitted fetchAdd) — +28%
+- Wake-scan redesign — +47%
+- Descriptor CAS — +16%
