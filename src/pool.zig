@@ -791,7 +791,7 @@ const Core = struct {
         // with .seq_cst on every submit, and 56 workers × spin_iters
         // shared loads per park cycle dominated cross-core traffic on the
         // line (A/B-measured: removing the poll lifts flood_1m by >15%).
-        // Handshake correctness is unaffected — the mutex-guarded reload
+        // Handshake correctness is unaffected — the SC store/reload
         // at `worker.is_parked.store(1, .seq_cst)` below is the actual
         // lost-wakeup guard; the spin-poll was a latency shortcut only.
         var spins: usize = 0;
@@ -802,16 +802,25 @@ const Core = struct {
 
         // End-of-spin local-work probe: if work became visible during the
         // spin window, skip parking. The probe reads only this worker's
-        // local sources plus a single inject_queue length peek — at most
-        // 3 atomic loads, executed once per park cycle (vs 128× on the
+        // local sources plus a single inject_queue length peek — a small
+        // number of atomic loads (2 under global_queue, up to 4 under
+        // work_stealing), executed once per park cycle (vs 128× on the
         // removed poll). Restores the "avoid park on rapid arrival" fast
         // path without the cross-core polling cost.
         if (self.config.scheduler_variant == .work_stealing) {
+            // .monotonic is sufficient: this worker is the owner of
+            // lifo_slot and local_queues[worker_index]; program-order
+            // vs the owner's own prior .release store already guarantees
+            // visibility, so no cross-core acquire fence is needed here.
+            // A missed observation would be recovered by the SC park
+            // handshake below.
             if (worker.lifo_slot.load(.monotonic) != LIFO_SLOT_EMPTY) return;
             if (self.local_queues[worker_index].len() != 0) return;
         }
         if (self.inject_queue.len() != 0) return;
 
+        // Check shutdown after the work probe: workers should help drain
+        // queued tasks on their way to exit rather than prematurely park.
         if (self.state.load(.acquire) != .running) return;
 
         _ = worker.parks.fetchAdd(1, .release);
