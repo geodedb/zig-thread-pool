@@ -256,6 +256,8 @@ const Core = struct {
     sync: Sync = .{},
     counters: Counters = .{},
     worker_stats_buffer: []types.WorkerStats,
+    ab_bump_mutex: std.Thread.Mutex = .{},
+    ab_bump_next: u32 = 0,
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -981,29 +983,21 @@ const Core = struct {
     const free_sentinel: u32 = 0xFFFFFFFF;
 
     fn acquireDescriptor(self: *Core) ?u32 {
-        while (true) {
-            const tagged = self.free_top_tagged.load(.acquire);
-            const head = @as(u32, @truncate(tagged));
-            if (head == free_sentinel) return null;
-            const aba = @as(u32, @truncate(tagged >> 32));
-            const next = self.free_indices[head];
-            const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, next);
-            if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
-                continue;
-            }
-            var descriptor = &self.descriptors[head];
-            const prev_generation = descriptor.generation;
-            descriptor.* = .{};
-            descriptor.generation = prev_generation +% 1;
-            if (descriptor.generation == 0) descriptor.generation = 1;
-            if (claim_sentinel_enabled) {
-                descriptor.claimed_by.store(-1, .release);
-            }
-            descriptor.state.store(.reserved, .release);
-            const live = self.counters.task_desc_live.fetchAdd(1, .monotonic) + 1;
-            updatePeak(&self.counters.task_desc_peak, live);
-            return head;
-        }
+        self.ab_bump_mutex.lock();
+        defer self.ab_bump_mutex.unlock();
+        if (self.ab_bump_next >= self.descriptors.len) return null;
+        const head = self.ab_bump_next;
+        self.ab_bump_next += 1;
+        var descriptor = &self.descriptors[head];
+        const prev_generation = descriptor.generation;
+        descriptor.* = .{};
+        descriptor.generation = prev_generation +% 1;
+        if (descriptor.generation == 0) descriptor.generation = 1;
+        if (claim_sentinel_enabled) descriptor.claimed_by.store(-1, .release);
+        descriptor.state.store(.reserved, .release);
+        const live = self.counters.task_desc_live.fetchAdd(1, .monotonic) + 1;
+        updatePeak(&self.counters.task_desc_peak, live);
+        return head;
     }
 
     fn releaseDescriptor(self: *Core, descriptor_index: u32) void {
