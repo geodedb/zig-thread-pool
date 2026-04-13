@@ -604,24 +604,9 @@ const Core = struct {
         // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
         // and signal it, OR the worker reloads `queued_tasks` and sees our push —
         // no lost wakeup. No broadcast fallback is needed.
-        const submitted = self.counters.submitted.load(.monotonic);
-        const hint_idx: usize = @intCast(submitted % self.workers.len);
-        var off: usize = 0;
-        while (off < self.workers.len) : (off += 1) {
-            const idx = (hint_idx + off) % self.workers.len;
-            const w = &self.workers[idx];
-            if (w.is_parked.load(.seq_cst) == 1) {
-                w.park_mutex.lock();
-                // Re-check under the mutex: the worker may have unparked between our
-                // load and this acquire. The signal is a no-op if it isn't parked —
-                // but we do not want to hold the mutex for a worker that is running.
-                if (w.is_parked.load(.monotonic) == 1) {
-                    w.park_cond.signal();
-                }
-                w.park_mutex.unlock();
-                break;
-            }
-        }
+        // AB-STUB: wake-scan removed. Workers rely on self-wake via spin/park.
+        // Invalid for workloads where workers fully park — only valid for
+        // flood_1m measurement. Do NOT merge.
 
         return if (options.waitable)
             .{
