@@ -735,10 +735,22 @@ const Core = struct {
     fn runTask(self: *Core, worker_index: usize, descriptor_index: u32) void {
         var worker = &self.workers[worker_index];
         var descriptor = &self.descriptors[descriptor_index];
-        // Debug/ReleaseSafe-only: detect double-dequeue. If two workers
-        // arrive here with the same descriptor_index (scheduler race), the
-        // second CAS will fail and we panic with both worker ids. Compiles
-        // out under ReleaseFast.
+
+        // Phase H fix: atomically transition .queued → .running. Any other
+        // state means the descriptor was already claimed, already completed,
+        // or has been recycled — drop this dispatch. This closes the wide-
+        // overlap race where a duplicate descriptor_index emitted by a queue
+        // path arrives after the first claimant already ran and released.
+        // The CAS failure branch is a silent skip — duplicate emissions are
+        // not an error in this layer; the upstream queue-path root cause is
+        // tracked as residual Phase H work.
+        if (descriptor.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire)) |_| {
+            return;
+        }
+
+        // Task 2 sentinel: catches tight-overlap sibling where two workers
+        // both pass the state CAS (shouldn't happen — CAS is serializing —
+        // but the sentinel remains as a defense-in-depth assertion).
         if (claim_sentinel_enabled) {
             const wi_i32: i32 = @intCast(worker_index);
             if (descriptor.claimed_by.cmpxchgStrong(-1, wi_i32, .acq_rel, .acquire)) |other| {
@@ -747,26 +759,7 @@ const Core = struct {
                     .{ descriptor_index, other, wi_i32 },
                 );
             }
-            // Phase H: immediately after winning CAS, snapshot critical fields.
-            // If state != .queued or task_fn is null right here, the descriptor
-            // was reused / freed before our claim took effect. Revert before fix.
-            const post_cas_state = descriptor.state.load(.acquire);
-            const post_cas_task_fn = descriptor.task_fn;
-            if (post_cas_state != .queued or post_cas_task_fn == null) {
-                std.debug.panic(
-                    "phase-h post-CAS bad state: idx={d} worker={d} state={s} task_fn_null={} gen={d} submit_ns={d}",
-                    .{
-                        descriptor_index,
-                        worker_index,
-                        @tagName(post_cas_state),
-                        post_cas_task_fn == null,
-                        descriptor.generation,
-                        descriptor.submit_ns,
-                    },
-                );
-            }
         }
-        descriptor.state.store(.running, .release);
         const timestamps_enabled = self.config.timestamp_mode == .full;
         const start_ns = if (timestamps_enabled) nowNs() else 0;
         descriptor.start_ns = start_ns;
@@ -798,23 +791,6 @@ const Core = struct {
             worker.scratch.beginTask() catch {
                 _ = worker.scratch_init_failures.fetchAdd(1, .release);
             };
-            // Phase H investigation: capture descriptor state if task_fn is null.
-            // Revert this block before Task 4 fix lands.
-            if (descriptor.task_fn == null) {
-                std.debug.panic(
-                    "phase-h null task_fn: idx={d} worker={d} gen={d} state={s} claimed_by={d} submit_ns={d} start_ns={d} ctx={?}",
-                    .{
-                        descriptor_index,
-                        worker_index,
-                        descriptor.generation,
-                        @tagName(descriptor.state.load(.acquire)),
-                        descriptor.claimed_by.load(.acquire),
-                        descriptor.submit_ns,
-                        descriptor.start_ns,
-                        descriptor.ctx,
-                    },
-                );
-            }
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
         } else {
