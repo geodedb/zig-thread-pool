@@ -747,6 +747,24 @@ const Core = struct {
                     .{ descriptor_index, other, wi_i32 },
                 );
             }
+            // Phase H: immediately after winning CAS, snapshot critical fields.
+            // If state != .queued or task_fn is null right here, the descriptor
+            // was reused / freed before our claim took effect. Revert before fix.
+            const post_cas_state = descriptor.state.load(.acquire);
+            const post_cas_task_fn = descriptor.task_fn;
+            if (post_cas_state != .queued or post_cas_task_fn == null) {
+                std.debug.panic(
+                    "phase-h post-CAS bad state: idx={d} worker={d} state={s} task_fn_null={} gen={d} submit_ns={d}",
+                    .{
+                        descriptor_index,
+                        worker_index,
+                        @tagName(post_cas_state),
+                        post_cas_task_fn == null,
+                        descriptor.generation,
+                        descriptor.submit_ns,
+                    },
+                );
+            }
         }
         descriptor.state.store(.running, .release);
         const timestamps_enabled = self.config.timestamp_mode == .full;
@@ -780,6 +798,23 @@ const Core = struct {
             worker.scratch.beginTask() catch {
                 _ = worker.scratch_init_failures.fetchAdd(1, .release);
             };
+            // Phase H investigation: capture descriptor state if task_fn is null.
+            // Revert this block before Task 4 fix lands.
+            if (descriptor.task_fn == null) {
+                std.debug.panic(
+                    "phase-h null task_fn: idx={d} worker={d} gen={d} state={s} claimed_by={d} submit_ns={d} start_ns={d} ctx={?}",
+                    .{
+                        descriptor_index,
+                        worker_index,
+                        descriptor.generation,
+                        @tagName(descriptor.state.load(.acquire)),
+                        descriptor.claimed_by.load(.acquire),
+                        descriptor.submit_ns,
+                        descriptor.start_ns,
+                        descriptor.ctx,
+                    },
+                );
+            }
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
         } else {
