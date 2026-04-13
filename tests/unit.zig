@@ -486,8 +486,11 @@ test "phase g2: worker returns from idle when lifo slot filled during spin windo
         .max_threads = 2,
         .scheduler_variant = .work_stealing,
         .queue_capacity = 256,
-        // Long spin to maximise the window we can race into.
-        .spin_before_park_iters = 1_000_000,
+        // Spin long enough that a submit landing during the spin window
+        // exercises the end-of-spin local-work probe (not the park/wake
+        // path) — but short enough the whole spin fits well inside the
+        // 1 ms latency assertion.
+        .spin_before_park_iters = 10_000,
         // Tight park timeout — if we DO accidentally park, the test
         // wakes quickly but fails the latency assertion below.
         .idle_park_after_ns = 500_000_000,
