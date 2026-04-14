@@ -271,6 +271,11 @@ const Core = struct {
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
+    /// Non-atomic u32 rotation counter for wake-scan start index. Written
+    /// once per spawn(). Races between submitters are tolerated — any start
+    /// index preserves correctness (scan is still full-loop). See Task 2 of
+    /// docs/superpowers/plans/2026-04-13-phase-g3-submitted-replacement.md.
+    wake_hint: u32 = 0,
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -619,8 +624,12 @@ const Core = struct {
         // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
         // and signal it, OR the worker reloads `queued_tasks` and sees our push —
         // no lost wakeup. No broadcast fallback is needed.
-        const submitted = self.counters.submitted.load(.monotonic);
-        const hint_idx: usize = @intCast(submitted % self.workers.len);
+        // G3: plain non-atomic rotation counter. Race between submitters is
+        // tolerated; the hint only picks a scan start index. A lost increment
+        // means two consecutive submits start at the same worker — the scan
+        // still covers all workers, so no lost wakeup.
+        self.wake_hint +%= 1;
+        const hint_idx: usize = @as(usize, self.wake_hint) % self.workers.len;
         var off: usize = 0;
         while (off < self.workers.len) : (off += 1) {
             const idx = (hint_idx + off) % self.workers.len;
