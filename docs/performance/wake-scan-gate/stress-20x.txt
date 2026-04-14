@@ -1,0 +1,25 @@
+# load before stress:
+ 21:52:04 up 4 days,  4:46,  3 users,  load average: 3.92, 3.51, 3.80
+run 1: PASS (4s)
+run 2: PASS (4s)
+run 3: PASS (4s)
+run 4: PASS (4s)
+run 5: PASS (4s)
+run 6: PASS (5s)
+run 7: PASS (4s)
+run 8: PASS (4s)
+run 9: PASS (4s)
+run 10: PASS (5s)
+run 11: PASS (4s)
+run 12: PASS (4s)
+run 13: PASS (4s)
+run 14: PASS (5s)
+run 15: PASS (3s)
+run 16: PASS (4s)
+run 17: PASS (5s)
+run 18: PASS (4s)
+run 19: PASS (4s)
+run 20: PASS (4s)
+=== SUMMARY: pass=20 fail=0 ===
+# load after stress:
+ 21:53:40 up 4 days,  4:47,  3 users,  load average: 8.54, 4.95, 4.27
