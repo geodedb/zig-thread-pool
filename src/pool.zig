@@ -211,6 +211,19 @@ const Sync = struct {
     backpressure_mutex: std.Thread.Mutex = .{},
     backpressure_cond: std.Thread.Condition = .{},
     backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Count of workers currently parked (between `worker.is_parked.store(1, .seq_cst)`
+    /// in idle() and either timedWait return or unpark decrement). Read by the
+    /// submitter with `.acquire` on every spawn to short-circuit the O(N)
+    /// is_parked[] scan when no workers are parked. Written only by workers
+    /// on park entry / park exit paths. The count is an ORTHOGONAL OPTIMIZATION
+    /// GATE — correctness of the submit-before-park lost-wakeup handshake is
+    /// carried by the SC total-order on `queued_tasks` and `is_parked`
+    /// (see idle() comment block). A stale `parked_count == 0` read by the
+    /// submitter after a worker has SC-stored `is_parked = 1` cannot cause a
+    /// lost wakeup because the worker's subsequent SC-load of `queued_tasks`
+    /// observes the submitter's SC-fetchAdd and the worker returns without
+    /// waiting. See docs/superpowers/plans/2026-04-13-wake-scan-parked-count-gate.md.
+    parked_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
