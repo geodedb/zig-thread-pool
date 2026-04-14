@@ -58,6 +58,51 @@ fn benchFlood(out_writer: anytype) !void {
     try out_writer.writeAll(line);
 }
 
+// === Scenario: flood_1m_batched ===
+// Single submitter pushes 1M trivial tasks through submitBatch with batch
+// size 64. Amortizes per-task submitter atomics (counters.submitted,
+// queued_tasks seq_cst fetchAdd, parked-worker wake scan) identified by
+// the 2026-04-14 ceiling A/B as the flood_1m bottleneck.
+const flood_batch_size: usize = 64;
+
+fn benchFloodBatched(out_writer: anytype) !void {
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .max_threads = 0,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var ctx = NoopCtx{};
+    var wg = pool.waitGroup();
+    var batch: [flood_batch_size]thread_pool.BatchTask = undefined;
+    for (&batch) |*b| {
+        b.* = .{ .task_fn = noopTask, .ctx = @ptrCast(&ctx) };
+    }
+
+    const start = std.time.nanoTimestamp();
+    var submitted_total: usize = 0;
+    while (submitted_total < flood_count) {
+        const remaining = flood_count - submitted_total;
+        const this_batch = @min(remaining, flood_batch_size);
+        const result = try pool.submitBatch(batch[0..this_batch], .{
+            .wait_group = &wg,
+            .backpressure = .block,
+        });
+        submitted_total += result.submitted;
+    }
+    wg.wait();
+    const end = std.time.nanoTimestamp();
+
+    const elapsed_ns: u64 = @intCast(end - start);
+    const ops_per_sec = @as(f64, @floatFromInt(flood_count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    var buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=flood_1m_batched tasks={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ flood_count, flood_batch_size, elapsed_ns, ops_per_sec });
+    try out_writer.writeAll(line);
+}
+
 // === Scenario: contended_spawn_8x ===
 // 8 submitter threads each push 100k/8 tasks concurrently.  Targets the
 // producer_contention bottleneck identified in the audit.
@@ -120,5 +165,6 @@ pub fn main() !void {
     const stdout = std.fs.File.stdout();
 
     try benchFlood(stdout);
+    try benchFloodBatched(stdout);
     try benchContended(stdout);
 }
