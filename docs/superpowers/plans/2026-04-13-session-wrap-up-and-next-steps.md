@@ -1,5 +1,9 @@
 # Session Wrap-Up and Next Steps — 2026-04-13
 
+> **2026-04-14 audit correction:** Two of the recommendations below are obsolete. Phase H race fix (cited as a blocker by the untracked `2026-04-13-phase-h-fix-double-dequeue-race.md`) is **SHIPPED** to main — see commits `a75ed98` (merge), `710a98f` (state CAS gate), `daedce6` (queued_tasks balance + stealHalf retry cap), `e7b6703` (close-out validation). **Option 5 (lock-free inject queue) is also obsolete**: `src/queue/bounded_ring.zig` is already a Vyukov MPMC implementation; the linked plan was authored against an older mutex-backed version that was already replaced. **Of the five non-trivial options below, only Option 3 remains shovel-ready, and it needs a fresh plan written.** Brainstorm for Option 3 was added at `docs/superpowers/brainstorms/2026-04-14-option3-worker-local-incoming-queues.md`.
+>
+> **2026-04-14 host-drift finding (correction to this doc's drift hypothesis):** Stopping the `geode` co-tenant service moved the flood_1m mean from ~392K to ~414K — well within noise. **Geode was NOT the dominant drift cause.** The 566K morning baseline does not reproduce by stopping geode alone; remaining suspects are 4-day uptime + long-lived user processes (claude/node sessions). Future sessions: do not assume killing co-tenants will recover the 566K reference. A reboot is the only remaining intervention within agent reach (and was not authorized this session). Paired same-session A/B is the only reliable measurement methodology under these conditions.
+
 ## What this document is
 
 A forward-looking synthesis of the 2026-04-13 autonomous session's learnings for the next engineer / session to pick up from. Covers what was tried, what worked and didn't, and the concrete next-step options ranked by evidence-adjusted expected value.
