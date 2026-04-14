@@ -739,3 +739,18 @@ Task 1 baseline captured `contended_spawn_8x` at n=3 (498,767 median, spread 60K
 Ship. `flood_1m` +33.3%; `contended_spawn_8x` statistically unchanged; 20/20 + 100/100 ReleaseFast stress clean; Phase H CAS gate defends against the race that forced the original revert.
 
 See `docs/superpowers/plans/2026-04-13-phase-g2-reland.md` for the execution plan and full task-by-task record.
+
+## 2026-04-13 Re-Profile (post Phase G2 Re-Land, main tip ce0d56b)
+
+Baseline: 566K ops/s flood_1m n=10 ReleaseFast (Task 1, commit `3506b29`).
+Submitter is 100% CPU-bound post-G2 (was 89% pre-G2); remaining optimization surface is pure on-CPU compute.
+
+Fresh A/B-disable ceilings (566K baseline):
+
+- submitted.fetchAdd (G3): **+42%** → 803K (clean, 20/20 stress, PRIORITIZE)
+- Descriptor CAS: -14% under host-load confound (mechanistic DEPRIORITIZE regardless)
+- Wake scan: **+34.8%** → 763K (under load; conservative; PRIORITIZE after G3)
+
+Full report: `docs/performance/reprofile-2026-04-13/SUMMARY.md`.
+
+Next-phase ordering: 1. G3 (submitted.fetchAdd), 2. Wake-scan redesign (post-G3 re-measure first), 3. Architectural pivot (Chase-Lev deque + event-wake + lock-free inject) once single-atomic ceilings exhausted.
