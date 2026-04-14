@@ -642,16 +642,20 @@ const Core = struct {
         // no lost wakeup. No broadcast fallback is needed.
         // G3-WAKEGATE: short-circuit when no workers are parked. This is the
         // common case during saturated workloads (flood_1m: 56/56 workers
-        // steal-busy, is_parked all 0). The .acquire load pairs with the
-        // worker's .release fetchAdd on parked_count in idle(). Correctness
-        // of the lost-wakeup handshake is carried by the SC total-order on
+        // steal-busy, is_parked all 0). Uses .monotonic — the .acquire
+        // fence was shown unnecessary in Task 3 review: correctness of the
+        // lost-wakeup handshake rests entirely on the SC total-order over
         // `queued_tasks` (.seq_cst fetchAdd via incrementQueued()) and
-        // `is_parked` (.seq_cst store in idle()) — a stale-read of
-        // parked_count == 0 cannot cause a lost wakeup because the
-        // concurrently-parking worker will SC-load queued_tasks AFTER
-        // storing is_parked and see the submitter's increment, then abort
-        // the park. See docs/superpowers/plans/2026-04-13-wake-scan-parked-count-gate.md.
-        if (self.sync.parked_count.load(.acquire) != 0) {
+        // `is_parked` (.seq_cst store in idle()). A stale `parked_count == 0`
+        // read cannot cause a lost wakeup because the concurrently-parking
+        // worker will SC-load queued_tasks AFTER storing is_parked and see
+        // the submitter's increment, then abort the park. The SC chain
+        // carries an HB bridge from worker's fetchAdd(parked_count) to the
+        // submitter's load even without acquire/release pairing — SC ops
+        // are globally ordered and fence-implicit. Attempt 3 of this plan
+        // (attempt 1: no alignment, -11%; attempt 2: aligned, -2.5%;
+        // attempt 3: aligned + monotonic, removes the redundant fence cost).
+        if (self.sync.parked_count.load(.monotonic) != 0) {
             const submitted = self.counters.submitted.load(.monotonic);
             const hint_idx: usize = @intCast(submitted % self.workers.len);
             var off: usize = 0;
