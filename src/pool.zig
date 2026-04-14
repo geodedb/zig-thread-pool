@@ -216,7 +216,7 @@ const Sync = struct {
 /// Atomic counters tracking pool-wide task and worker events.
 /// Fields are grouped by access pattern with cache-line padding
 /// between groups to reduce false sharing between submit and worker paths.
-const Counters = struct {
+const Counters = extern struct {
     const cache_line_size = std.atomic.cache_line;
     const field_size = @sizeOf(std.atomic.Value(u64));
 
@@ -248,6 +248,13 @@ const Counters = struct {
     total_alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peak_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    comptime {
+        // Cacheline isolation invariants: each hot-write counter owns a distinct line.
+        std.debug.assert(@offsetOf(Counters, "queued_tasks") == 0);
+        std.debug.assert(@offsetOf(Counters, "submitted") == cache_line_size);
+        std.debug.assert(@offsetOf(Counters, "active_tasks") == 2 * cache_line_size);
+    }
 };
 
 const Core = struct {
@@ -262,7 +269,7 @@ const Core = struct {
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(u32),
     sync: Sync = .{},
-    counters: Counters = .{},
+    counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
