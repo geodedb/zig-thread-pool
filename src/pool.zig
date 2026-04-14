@@ -223,7 +223,15 @@ const Sync = struct {
     /// lost wakeup because the worker's subsequent SC-load of `queued_tasks`
     /// observes the submitter's SC-fetchAdd and the worker returns without
     /// waiting. See docs/superpowers/plans/2026-04-13-wake-scan-parked-count-gate.md.
-    parked_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    ///
+    /// Cacheline-aligned to prevent false sharing with adjacent Sync fields
+    /// (backpressure_waiters, mutexes). Attempt 1 of this plan landed WITHOUT
+    /// this alignment and regressed flood_1m -11%; attempt 2 isolates
+    /// parked_count onto its own cacheline. Worker park/unpark fetchAdd/Sub
+    /// no longer invalidates the cacheline holding backpressure_waiters or
+    /// the mutex state, and the submitter's .acquire load no longer bounces
+    /// a cacheline shared with worker-side hot atomics.
+    parked_count: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
