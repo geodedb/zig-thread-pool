@@ -930,15 +930,23 @@ const Core = struct {
         // .release). Release stores only create HB with SC loads when the load
         // reads that store's specific value — if the SC load observes an earlier
         // value, no HB edge forms and the IRIW scenario is permitted.
+        // G3-WAKEGATE: increment parked_count BEFORE is_parked.store(.seq_cst).
+        // The .release here synchronizes-with the submitter's .acquire load in
+        // enqueueTask. A stale .acquire read of parked_count == 0 after our
+        // fetchAdd is still safe because our subsequent SC load of queued_tasks
+        // observes the submitter's SC fetchAdd and we abort the park.
+        _ = self.sync.parked_count.fetchAdd(1, .release);
         worker.is_parked.store(1, .seq_cst);
         if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
+            _ = self.sync.parked_count.fetchSub(1, .release);
             worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
         worker.is_parked.store(0, .release);
+        _ = self.sync.parked_count.fetchSub(1, .release);
         worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .release);
 
