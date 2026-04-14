@@ -754,3 +754,16 @@ Fresh A/B-disable ceilings (566K baseline):
 Full report: `docs/performance/reprofile-2026-04-13/SUMMARY.md`.
 
 Next-phase ordering: 1. G3 (submitted.fetchAdd), 2. Wake-scan redesign (post-G3 re-measure first), 3. Architectural pivot (Chase-Lev deque + event-wake + lock-free inject) once single-atomic ceilings exhausted.
+
+## Phase G3 — counters.submitted hot-path replacement (2026-04-13)
+
+Sub-changes (branch `feat/g3-submitted-replacement`):
+
+1. Cacheline split + layout-invariant fix (`16a14cd` + `145e6ea`) — `submitted` moved to its own cacheline; `extern struct` + alignment + comptime asserts fix pre-existing inert-padding latent bug.
+2. `Core.wake_hint` replaces `:607` load (`6444453` + `ad0da23`) — relaxed-atomic u32.
+3. `Worker.steal_hint` replaces `:700` load (`54830a4`) — per-worker non-atomic u64.
+4. `Stats.submitted` observability guard test (`8272987`).
+
+Result: flood_1m 393K ops/s median n=10 (baseline 566K, **-30.6% REGRESSION**), -73.1% of A/B ceiling (803K). Stress 20/20 PASS. Observability preserved. **Recommendation: HOLD — do not land.** Investigation needed; likely layout/coherence cost from cacheline alignment change exceeds load-removal savings.
+
+Full report: `docs/performance/phase-g3-close/SUMMARY.md`.
