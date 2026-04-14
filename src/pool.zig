@@ -1069,6 +1069,14 @@ const Core = struct {
                     self.cancelDescriptor(descriptor_index);
                 }
             }
+            // Option 3 (Task 6): drain per-worker incoming queues. Tasks
+            // pushed by external submitters via Option 3's routing sit
+            // here if shutdown fires before a worker drained them.
+            for (self.workers) |*w| {
+                while (w.incoming.pop()) |descriptor_index| {
+                    self.cancelDescriptor(descriptor_index);
+                }
+            }
         }
     }
 
