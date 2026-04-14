@@ -220,10 +220,18 @@ const Counters = struct {
     const cache_line_size = std.atomic.cache_line;
     const field_size = @sizeOf(std.atomic.Value(u64));
 
-    // === Hot write group (submit path) ===
+    // === Hot write group (submit path, queued_tasks only) ===
+    // `queued_tasks` is read by workers in nextTask; `submitted` was moved to
+    // its own cacheline (below) so submitter writes to `submitted` do not
+    // stall worker reads of `queued_tasks`.
     queued_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    _pad0a: [cache_line_size - field_size]u8 = undefined,
+
+    // === Cumulative submit counter (observability-only, off hot read path) ===
+    // Written at every spawn(); read only by snapshot() (cold path). Isolated
+    // onto its own cacheline to decouple from `queued_tasks` write contention.
     submitted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    _pad0: [cache_line_size - 2 * field_size]u8 = undefined,
+    _pad0b: [cache_line_size - field_size]u8 = undefined,
 
     // === Hot write group (worker path) ===
     active_tasks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
