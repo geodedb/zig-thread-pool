@@ -4,6 +4,7 @@ const common = @import("common.zig");
 
 comptime {
     _ = @import("stress/double_dequeue_race.zig");
+    _ = @import("stress/option3_incoming_saturation.zig");
 }
 
 test "stress high-volume small-task increments in bounded waves" {
