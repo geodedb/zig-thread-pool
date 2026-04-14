@@ -968,3 +968,33 @@ test "g3: Stats.submitted reports exact spawn count" {
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(N, stats.submitted);
 }
+
+test "wake-gate: no lost wakeup under park/submit interleave" {
+    // Force workers to park frequently by using a config that tends toward
+    // parking: minimal spin, short idle window. Then submit tasks with
+    // small inter-submit pauses so some subset of workers park between
+    // tasks. Assert all submitted tasks are eventually executed.
+    var cfg = common.defaultConfig(.work_stealing);
+    cfg.spin_before_park_iters = 0; // no spin; workers try to park immediately
+    cfg.idle_park_after_ns = 10_000_000; // 10ms idle window
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    const N: u64 = 500;
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        // Small yield between submits — increases the probability that some
+        // workers park between submissions, exercising the parked_count
+        // increment/decrement paths.
+        if (i % 10 == 0) std.Thread.yield() catch {};
+    }
+    wg.wait();
+
+    try std.testing.expectEqual(N, counter.value.load(.acquire));
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(N, stats.submitted);
+    try std.testing.expectEqual(N, stats.completed);
+}
