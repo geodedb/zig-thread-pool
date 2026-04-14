@@ -632,22 +632,35 @@ const Core = struct {
         // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
         // and signal it, OR the worker reloads `queued_tasks` and sees our push —
         // no lost wakeup. No broadcast fallback is needed.
-        const submitted = self.counters.submitted.load(.monotonic);
-        const hint_idx: usize = @intCast(submitted % self.workers.len);
-        var off: usize = 0;
-        while (off < self.workers.len) : (off += 1) {
-            const idx = (hint_idx + off) % self.workers.len;
-            const w = &self.workers[idx];
-            if (w.is_parked.load(.seq_cst) == 1) {
-                w.park_mutex.lock();
-                // Re-check under the mutex: the worker may have unparked between our
-                // load and this acquire. The signal is a no-op if it isn't parked —
-                // but we do not want to hold the mutex for a worker that is running.
-                if (w.is_parked.load(.monotonic) == 1) {
-                    w.park_cond.signal();
+        // G3-WAKEGATE: short-circuit when no workers are parked. This is the
+        // common case during saturated workloads (flood_1m: 56/56 workers
+        // steal-busy, is_parked all 0). The .acquire load pairs with the
+        // worker's .release fetchAdd on parked_count in idle(). Correctness
+        // of the lost-wakeup handshake is carried by the SC total-order on
+        // `queued_tasks` (.seq_cst fetchAdd via incrementQueued()) and
+        // `is_parked` (.seq_cst store in idle()) — a stale-read of
+        // parked_count == 0 cannot cause a lost wakeup because the
+        // concurrently-parking worker will SC-load queued_tasks AFTER
+        // storing is_parked and see the submitter's increment, then abort
+        // the park. See docs/superpowers/plans/2026-04-13-wake-scan-parked-count-gate.md.
+        if (self.sync.parked_count.load(.acquire) != 0) {
+            const submitted = self.counters.submitted.load(.monotonic);
+            const hint_idx: usize = @intCast(submitted % self.workers.len);
+            var off: usize = 0;
+            while (off < self.workers.len) : (off += 1) {
+                const idx = (hint_idx + off) % self.workers.len;
+                const w = &self.workers[idx];
+                if (w.is_parked.load(.seq_cst) == 1) {
+                    w.park_mutex.lock();
+                    // Re-check under the mutex: the worker may have unparked between our
+                    // load and this acquire. The signal is a no-op if it isn't parked —
+                    // but we do not want to hold the mutex for a worker that is running.
+                    if (w.is_parked.load(.monotonic) == 1) {
+                        w.park_cond.signal();
+                    }
+                    w.park_mutex.unlock();
+                    break;
                 }
-                w.park_mutex.unlock();
-                break;
             }
         }
 
