@@ -1,0 +1,5 @@
+# attempt3 CPU freq
+# PRE:
+pre: min=2896MHz max=3300MHz mean=2902MHz n=68
+# POST:
+post: min=2896MHz max=3300MHz mean=2907MHz n=74
