@@ -247,6 +247,37 @@ test "local_queue_capacity zero rejected for all scheduler variants" {
     try std.testing.expectError(error.InvalidLocalQueueCapacity, cfg.validate());
 }
 
+test "Config normalized derives incoming_capacity from queue_capacity / max_threads with power-of-2 rounding, min 64" {
+    const Config = thread_pool.types.Config;
+
+    // queue_capacity=1024, max_threads=8 → 128 (already pow2, above 64 floor).
+    const cfg1 = (Config{ .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
+    try std.testing.expectEqual(@as(usize, 128), cfg1.incoming_capacity);
+
+    // queue_capacity=1024, max_threads=56 → 1024/56≈18 → below 64 floor → 64.
+    const cfg2 = (Config{ .queue_capacity = 1024, .max_threads = 56, .min_threads = 56 }).normalized();
+    try std.testing.expectEqual(@as(usize, 64), cfg2.incoming_capacity);
+
+    // queue_capacity=1024, max_threads=6 → 1024/6≈170 → round up to 256.
+    const cfg3 = (Config{ .queue_capacity = 1024, .max_threads = 6, .min_threads = 6 }).normalized();
+    try std.testing.expectEqual(@as(usize, 256), cfg3.incoming_capacity);
+
+    // Explicit user value rounded up to pow2.
+    const cfg4 = (Config{ .incoming_capacity = 100, .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
+    try std.testing.expectEqual(@as(usize, 128), cfg4.incoming_capacity);
+
+    // Explicit already-pow2 passes through.
+    const cfg5 = (Config{ .incoming_capacity = 512, .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
+    try std.testing.expectEqual(@as(usize, 512), cfg5.incoming_capacity);
+}
+
+test "Config validate rejects incoming_capacity > maxInt(u32)" {
+    const Config = thread_pool.types.Config;
+    var cfg = (Config{ .max_threads = 1, .min_threads = 1, .queue_capacity = 64 }).normalized();
+    cfg.incoming_capacity = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.InvalidIncomingCapacity, cfg.validate());
+}
+
 test "concurrent push-pop-steal does not lose or duplicate items" {
     const WorkDeque = @import("thread_pool").WorkDeque;
     const Deque = WorkDeque(u32);

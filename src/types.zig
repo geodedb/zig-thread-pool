@@ -349,26 +349,3 @@ test "Config normalized rounds queue_capacity to power of two" {
     const cfg = (Config{ .queue_capacity = 1000 }).normalized();
     try std.testing.expectEqual(@as(usize, 1024), cfg.queue_capacity);
 }
-
-test "Config normalized derives incoming_capacity from queue_capacity / max_threads with power-of-2 rounding, min 64" {
-    const cfg1 = (Config{ .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
-    try std.testing.expectEqual(@as(usize, 128), cfg1.incoming_capacity);
-
-    const cfg2 = (Config{ .queue_capacity = 1024, .max_threads = 56, .min_threads = 56 }).normalized();
-    try std.testing.expectEqual(@as(usize, 64), cfg2.incoming_capacity);
-
-    const cfg3 = (Config{ .queue_capacity = 1024, .max_threads = 6, .min_threads = 6 }).normalized();
-    try std.testing.expectEqual(@as(usize, 256), cfg3.incoming_capacity);
-
-    const cfg4 = (Config{ .incoming_capacity = 100, .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
-    try std.testing.expectEqual(@as(usize, 128), cfg4.incoming_capacity);
-
-    const cfg5 = (Config{ .incoming_capacity = 512, .queue_capacity = 1024, .max_threads = 8, .min_threads = 8 }).normalized();
-    try std.testing.expectEqual(@as(usize, 512), cfg5.incoming_capacity);
-}
-
-test "Config validate rejects incoming_capacity > maxInt(u32)" {
-    var cfg = (Config{ .max_threads = 1, .min_threads = 1, .queue_capacity = 64 }).normalized();
-    cfg.incoming_capacity = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.InvalidIncomingCapacity, cfg.validate());
-}
