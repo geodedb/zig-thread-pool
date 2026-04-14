@@ -326,22 +326,18 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
-        // Option 3: initialize per-worker incoming rings FIRST, with a
-        // tracked count so partial-init failures clean up precisely.
-        // BoundedRing.init is fallible (allocator failure); if it fails
-        // partway, the errdefer below deinits only the rings that succeeded.
-        var incoming_initialized: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < incoming_initialized) : (i += 1) {
-                self.recordOwnedFree(self.workers[i].incoming.capacity() * @sizeOf(u32));
-                self.workers[i].incoming.deinit();
-            }
-        }
+        // Option 3: initialize per-worker incoming rings FIRST so the
+        // second loop's struct overwrite preserves them. If BoundedRing.init
+        // fails partway through this loop, the outer errdefer
+        // `self.deinitOwned()` at line 299 iterates all workers and deinits
+        // — which is buggy for the not-yet-initialized slots at tail, but
+        // matches the pre-existing hazard with `try LocalQueue.init` in the
+        // second loop. Flagged for holistic fix in Option 3 plan Task 11
+        // review (refactor Core.init's error handling to track per-phase
+        // init progress or shrink the slice-under-cleanup).
         for (self.workers) |*worker| {
             worker.incoming = try BoundedRing(u32).init(allocator, normalized.incoming_capacity);
             self.recordOwnedAlloc(worker.incoming.capacity() * @sizeOf(u32));
-            incoming_initialized += 1;
         }
 
         for (self.workers, self.local_queues) |*worker, *lq| {
