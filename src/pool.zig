@@ -195,6 +195,11 @@ const Worker = struct {
     /// owner writes to it. Sentinel value `LIFO_SLOT_EMPTY` (0xFFFF_FFFF)
     /// means "no cached task".
     lifo_slot: std.atomic.Value(u32) = std.atomic.Value(u32).init(LIFO_SLOT_EMPTY),
+    /// Per-worker MPMC incoming queue. External (non-worker-thread) submits
+    /// rotate across these to amortize cacheline pressure. Owner worker pops
+    /// via nextTask's incoming check (Task 4). Reuses BoundedRing for v1;
+    /// specializing to MPSC is a future optimization.
+    incoming: BoundedRing(u32),
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -268,6 +273,11 @@ const Core = struct {
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(u32),
+    /// Round-robin target cursor for external submits (Task 3). Relaxed
+    /// atomic fetchAdd; the `% workers.len` happens at the use site.
+    /// Values wrap naturally at u32 max. Not referenced in Task 2; wired
+    /// up in Task 3.
+    incoming_cursor: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
@@ -316,11 +326,31 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
+        // Option 3: initialize per-worker incoming rings FIRST, with a
+        // tracked count so partial-init failures clean up precisely.
+        // BoundedRing.init is fallible (allocator failure); if it fails
+        // partway, the errdefer below deinits only the rings that succeeded.
+        var incoming_initialized: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < incoming_initialized) : (i += 1) {
+                self.recordOwnedFree(self.workers[i].incoming.capacity() * @sizeOf(u32));
+                self.workers[i].incoming.deinit();
+            }
+        }
+        for (self.workers) |*worker| {
+            worker.incoming = try BoundedRing(u32).init(allocator, normalized.incoming_capacity);
+            self.recordOwnedAlloc(worker.incoming.capacity() * @sizeOf(u32));
+            incoming_initialized += 1;
+        }
+
         for (self.workers, self.local_queues) |*worker, *lq| {
             lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            const already_initialized_incoming = worker.incoming;
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
+                .incoming = already_initialized_incoming,
             };
             self.recordOwnedAlloc(lq.capacity() * @sizeOf(u32));
         }
@@ -1065,6 +1095,10 @@ const Core = struct {
     fn deinitOwned(self: *Core) void {
         for (self.workers) |*worker| {
             worker.scratch.purge();
+        }
+        for (self.workers) |*w| {
+            self.recordOwnedFree(w.incoming.capacity() * @sizeOf(u32));
+            w.incoming.deinit();
         }
         for (self.local_queues) |*lq| {
             self.recordOwnedFree(lq.capacity() * @sizeOf(u32));
