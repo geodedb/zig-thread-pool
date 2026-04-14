@@ -271,9 +271,14 @@ const Core = struct {
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
-    /// Non-atomic u32 rotation counter for wake-scan start index. Written
-    /// once per spawn(). Races between submitters are tolerated — any start
-    /// index preserves correctness (scan is still full-loop). See Task 2 of
+    /// Relaxed-atomic u32 rotation counter for wake-scan start index.
+    /// Written once per spawn(). Races between submitters are tolerated:
+    /// torn reads and lost increments are both acceptable — a lost
+    /// increment only causes two consecutive submitters to start the
+    /// scan at the same worker, which the full-loop scan covers. Using
+    /// @atomicLoad/@atomicStore with .monotonic for well-defined semantics
+    /// under the memory model; compiles to plain movs on x86_64 (no lock
+    /// prefix). See Task 2 of
     /// docs/superpowers/plans/2026-04-13-phase-g3-submitted-replacement.md.
     wake_hint: u32 = 0,
 
@@ -624,12 +629,16 @@ const Core = struct {
         // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
         // and signal it, OR the worker reloads `queued_tasks` and sees our push —
         // no lost wakeup. No broadcast fallback is needed.
-        // G3: plain non-atomic rotation counter. Race between submitters is
-        // tolerated; the hint only picks a scan start index. A lost increment
-        // means two consecutive submits start at the same worker — the scan
-        // still covers all workers, so no lost wakeup.
-        self.wake_hint +%= 1;
-        const hint_idx: usize = @as(usize, self.wake_hint) % self.workers.len;
+        // G3: relaxed-atomic rotation counter. Lost increments and torn
+        // reads are both tolerated; the hint only picks a scan start index,
+        // and the scan still covers all workers regardless of start. Using
+        // @atomicLoad/@atomicStore with .monotonic produces plain-mov
+        // codegen on x86_64 (no lock prefix) while keeping semantics
+        // well-defined under the memory model.
+        const cur = @atomicLoad(u32, &self.wake_hint, .monotonic);
+        const next = cur +% 1;
+        @atomicStore(u32, &self.wake_hint, next, .monotonic);
+        const hint_idx: usize = @as(usize, next) % self.workers.len;
         var off: usize = 0;
         while (off < self.workers.len) : (off += 1) {
             const idx = (hint_idx + off) % self.workers.len;
