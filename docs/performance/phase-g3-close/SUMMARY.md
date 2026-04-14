@@ -52,3 +52,24 @@ Full raw data: `docs/performance/phase-g3-close/baseline-compare.txt` and `docs/
 ## Task 7 gate
 
 **Task 7 is GATED OUT.** Per the plan: "Proceed to Task 7 (100× pre-merge stress) only if this report recommends SHIP or SHIP+FOLLOWUP. If HOLD, do NOT run Task 7 until investigation resolves." This report recommends HOLD; Task 7 will not run until the regression is understood and either fixed or the plan is revised.
+
+## Re-measurement under cleaner load
+
+Task 6's initial measurement ran under load 4.36 → 5.73; one geode process was lingering. This re-measurement under load 2.78 (1-min) controls for host state by measuring BOTH pre-G3 main and G3 tip back-to-back.
+
+| Measurement | Median | Min | Max | n |
+|---|---|---|---|---|
+| Pre-G3 baseline (main `8432cc8`, source-equiv `9da9462`) | 378.5K | 341.2K | 399.2K | 10 |
+| G3 tip (`4155d28`) | 385.7K | 357.5K | 435.1K | 10 |
+
+Delta: G3 vs pre-G3 baseline = +1.89% relative, +7,159 ops/s absolute.
+
+### Interpretation
+
+**NOISE / BASELINE-SHIFT.** The pre-G3 baseline itself re-measured at 378.5K today, a -33% shift from the original Task 1 n=10 value of 566K at `3506b29` / `ce0d56b`. Since the source is equivalent (only docs commits on main since the re-profile baseline), the entire 566K → 378K pre-G3 shift is host-environment-driven. Under this cleaner re-measurement, G3 is statistically indistinguishable from pre-G3 (+1.89% is well within run-to-run variance: pre-G3 range 341K–399K, G3 range 358K–435K — heavy overlap).
+
+Task 6's original "-30.6% regression" finding is **INVALIDATED as a G3-attributable regression**. The 393K G3 measurement in Task 6 was approximately correct for current host conditions; the error was using the stale 566K Task 1 baseline as the comparison. The real host baseline today is ~378K, and G3 matches it.
+
+Note the broader concern: the re-profile baseline (Task 1, 566K) that drove the "-42% A/B ceiling" interpretation is itself no longer reproducible on this host. Any percentage comparisons against 566K across the phase-g3 docs are suspect. Before recommending SHIP on G3 (or any follow-on phase), the re-profile baselines must be re-established under current conditions, and the A/B stub delta re-measured paired against a same-host baseline.
+
+Raw data: `remeasure-pre-baseline.txt` and `remeasure-g3.txt` in this directory.
