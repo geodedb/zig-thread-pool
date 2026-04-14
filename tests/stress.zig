@@ -73,7 +73,6 @@ test "park handshake: no lost wakeups under submit-while-parking race" {
         .scheduler_variant = .work_stealing,
         .idle_park_after_ns = 50_000,
         .spin_before_park_iters = 4,
-        .wake_strategy = .idle_queue,
     });
     defer pool.deinit();
 
@@ -527,7 +526,6 @@ test "phase g2: aggressive spin flood - no lost wakeups" {
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
         .spin_before_park_iters = 4096,
-        .wake_strategy = .idle_queue,
     });
     defer pool.deinit();
 

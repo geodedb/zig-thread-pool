@@ -33,23 +33,6 @@ pub const TimestampMode = enum {
     disabled,
 };
 
-/// Controls how submitters pick a worker to wake after enqueueing work.
-/// `scan_parked_workers` preserves the legacy O(N) parked-worker scan.
-/// `idle_queue` uses a bounded idle-worker ticket queue to select wake
-/// candidates without reading every worker's `is_parked` flag.
-pub const WakeStrategy = enum {
-    scan_parked_workers,
-    idle_queue,
-};
-
-/// Named runtime presets for benchmark-focused configuration bundles.
-/// Presets intentionally only touch clearly documented knobs; callers can
-/// still override unrelated fields directly in the `Config` literal.
-pub const RuntimePreset = enum {
-    standard,
-    tokio_parity,
-};
-
 /// Task lifecycle state machine:
 ///
 ///     free ──> reserved ──> queued ──> running ──> completed
@@ -137,8 +120,6 @@ pub const Config = struct {
     /// tasks with `.lane = .blocking`.
     allow_blocking_lane: bool = false,
     timestamp_mode: TimestampMode = .full,
-    wake_strategy: WakeStrategy = .scan_parked_workers,
-    runtime_preset: RuntimePreset = .standard,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
     /// used and values > 1 are correct. With `queue_kind = .chase_lev`,
@@ -148,13 +129,6 @@ pub const Config = struct {
 
     pub fn normalized(self: Config) Config {
         var cfg = self;
-        switch (cfg.runtime_preset) {
-            .standard => {},
-            .tokio_parity => {
-                cfg.timestamp_mode = .disabled;
-                cfg.wake_strategy = .idle_queue;
-            },
-        }
         const cpu_guess = @max(std.Thread.getCpuCount() catch 1, 1);
         if (cfg.max_threads == 0) {
             cfg.max_threads = @min(cpu_guess, 64);
@@ -359,10 +333,4 @@ test "Config normalized rounds local_queue_capacity to power of two" {
 test "Config normalized rounds queue_capacity to power of two" {
     const cfg = (Config{ .queue_capacity = 1000 }).normalized();
     try std.testing.expectEqual(@as(usize, 1024), cfg.queue_capacity);
-}
-
-test "Config tokio_parity preset enables idle queue wake and disabled timestamps" {
-    const cfg = (Config{ .runtime_preset = .tokio_parity }).normalized();
-    try std.testing.expectEqual(TimestampMode.disabled, cfg.timestamp_mode);
-    try std.testing.expectEqual(WakeStrategy.idle_queue, cfg.wake_strategy);
 }
