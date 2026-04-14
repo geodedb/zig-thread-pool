@@ -22,6 +22,9 @@ The public API stays stable while scheduler selection, queue topology, and instr
 - `ThreadPool.statsSnapshot() Stats`
 - `ThreadPool.purgeWorkerCaches() !void`
 
+`ThreadPool.purgeWorkerCaches()` is quiescent-only. It returns
+`error.PoolBusy` unless `active_tasks == 0 && queued_tasks == 0`.
+
 ## Scheduler Variants
 
 ### `global_queue`
@@ -34,9 +37,14 @@ The public API stays stable while scheduler selection, queue topology, and instr
 ### `work_stealing`
 
 - One bounded central inject queue for external submitters.
-- One bounded local deque per worker.
-- Local submissions from worker threads prefer the local deque.
+- One owner-local LIFO slot plus one bounded local queue per worker.
+- Local submissions from worker threads prefer the LIFO slot, then the local
+  queue.
 - Idle workers refill from the inject queue, then attempt steals from peer deques.
+- Worker wake selection is configurable:
+  - `scan_parked_workers` keeps the legacy submit-path parked-worker scan.
+  - `idle_queue` uses a bounded idle-worker ticket queue to pick wake
+    candidates without scanning every worker.
 - Included as the low-contention candidate and still benchmarked on every baseline run.
 
 ### `lane_extension`
@@ -49,23 +57,36 @@ The public API stays stable while scheduler selection, queue topology, and instr
 ### Inject Queue
 
 - Bounded ring buffer.
-- Mutex-protected, no unbounded growth.
+- Vyukov-style MPMC sequence queue, no unbounded growth.
 - Backpressure is explicit: `QueueFull`, or blocking retry with timeout.
 
 ### Local Worker Queue
 
-- Bounded deque.
-- Owner pushes and pops from the bottom.
-- Steals happen from the top.
-- The local deque uses a lock-free Chase-Lev design. The owner thread pushes and pops wait-free (no CAS on the fast path). Stealers use a CAS on the top index. Buffer size is constrained to power-of-2 for bitmask wrapping.
+- Bounded owner-local queue with pluggable implementation via `Config.queue_kind`.
+- `queue_kind = .ring` is the default Tokio/Go-style SPMC ring.
+- `queue_kind = .chase_lev` remains available as the classic Chase-Lev deque.
+- Owner pushes and pops from the bottom / tail side; steals happen from the top / head side.
 
 ## Memory Model
 
 - Task descriptors are preallocated from a bounded descriptor array.
 - Descriptor reuse happens only after task completion and, for waitable tasks, after `wait`.
 - Worker scratch allocates one bounded buffer per worker lazily on first use.
+- On the normal owning-worker path, scratch begin/alloc/finish are lock-free.
 - Scratch buffers can be purged explicitly or after configured idle periods.
+- Explicit purge is only legal while the pool is quiescent.
 - All pool-owned allocations are counted in `total_alloc_bytes`, `total_free_bytes`, `live_bytes`, and `peak_live_bytes`.
+
+## Runtime Presets
+
+- `RuntimePreset.standard` preserves the stable defaults.
+- `RuntimePreset.tokio_parity` is an explicit benchmark-focused preset that
+  currently enables:
+  - `timestamp_mode = .disabled`
+  - `wake_strategy = .idle_queue`
+
+The preset exists as an opt-in configuration surface. It is not silently
+forced by the benchmark harness.
 
 ## Task Lifecycle
 

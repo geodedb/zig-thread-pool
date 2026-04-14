@@ -18,3 +18,7 @@ A Zig library for thread-pool
 - [Contributing](../CONTRIBUTING.md)
 - [Security](../SECURITY.md)
 - [Changelog](../CHANGELOG.md)
+- [Current Handoff](HANDOFF-2026-04-14.md)
+- [Performance Tracking](PERFORMANCE_TRACKING.md)
+- [Design](DESIGN.md)
+- [2026-04-14 Codex Review](codex-review-2026-04-14.md)

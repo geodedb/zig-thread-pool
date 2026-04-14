@@ -39,12 +39,16 @@ pub const WorkerScratch = struct {
     fba: ?std.heap.FixedBufferAllocator = null,
     current_bytes: usize = 0,
     peak_bytes: usize = 0,
-    /// Serializes purge() and beginTask()/alloc() so that the owning worker
-    /// and a remote caller (e.g. Core.purgeWorkerCaches) cannot race on the
-    /// backing buffer. Without this guard, two concurrent purge() calls would
-    /// double-free the allocation.
-    mutex: std.Thread.Mutex = .{},
-
+    /// Slow-path serialization for overlapping purge callers. The normal
+    /// owning-worker task path remains lock-free; this only prevents
+    /// external quiescent purge and the worker's own idle-time purge from
+    /// racing each other and double-freeing the backing buffer.
+    purge_mutex: std.Thread.Mutex = .{},
+    /// Invariant: the worker task fast path is single-thread-owned. `purge()`
+    /// is only legal once the pool is quiescent (`active_tasks == 0 &&
+    /// queued_tasks == 0`) or from the owning worker's idle path after it has
+    /// left task execution. That lets `beginTask()`, `alloc()`, and
+    /// `finishTask()` stay lock-free on the normal path.
     pub fn init(allocator: std.mem.Allocator, accounting: Accounting, cap_bytes: usize) WorkerScratch {
         return .{
             .allocator = allocator,
@@ -54,12 +58,11 @@ pub const WorkerScratch = struct {
     }
 
     pub fn beginTask(self: *WorkerScratch) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.ensureBufferLocked();
+        self.current_bytes = 0;
         if (self.buffer) |buf| {
             self.fba = std.heap.FixedBufferAllocator.init(buf);
-            self.current_bytes = 0;
+        } else {
+            self.fba = null;
         }
     }
 
@@ -73,9 +76,7 @@ pub const WorkerScratch = struct {
     }
 
     pub fn alloc(self: *WorkerScratch, comptime T: type, count: usize) ![]T {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.ensureBufferLocked();
+        try self.ensureBuffer();
         if (self.fba == null) return error.ScratchUnavailable;
         var fba = &self.fba.?;
         const slice = try fba.allocator().alloc(T, count);
@@ -85,8 +86,8 @@ pub const WorkerScratch = struct {
     }
 
     pub fn purge(self: *WorkerScratch) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.purge_mutex.lock();
+        defer self.purge_mutex.unlock();
         if (self.buffer) |buf| {
             self.accounting.recordFree(buf.len);
             self.allocator.free(buf);
@@ -104,8 +105,7 @@ pub const WorkerScratch = struct {
         return self.peak_bytes;
     }
 
-    /// Must be called with self.mutex held.
-    fn ensureBufferLocked(self: *WorkerScratch) !void {
+    fn ensureBuffer(self: *WorkerScratch) !void {
         if (self.cap_bytes == 0 or self.buffer != null) return;
         const buf = try self.allocator.alloc(u8, self.cap_bytes);
         self.accounting.recordAlloc(buf.len);
@@ -134,5 +134,83 @@ test "worker scratch respects fixed cap and purge" {
     scratch.finishTask();
     try std.testing.expect(scratch.bytesCurrent() >= 32);
     scratch.purge();
+    try std.testing.expectEqual(@as(usize, 0), scratch.bytesCurrent());
+}
+
+test "worker scratch defers allocation until first alloc and reuses the buffer" {
+    var total_alloc = std.atomic.Value(u64).init(0);
+    var total_free = std.atomic.Value(u64).init(0);
+    var total_count = std.atomic.Value(u64).init(0);
+    var live = std.atomic.Value(u64).init(0);
+    var peak = std.atomic.Value(u64).init(0);
+    const accounting = Accounting{
+        .total_alloc_bytes = &total_alloc,
+        .total_free_bytes = &total_free,
+        .total_alloc_count = &total_count,
+        .live_bytes = &live,
+        .peak_live_bytes = &peak,
+    };
+
+    var scratch = WorkerScratch.init(std.testing.allocator, accounting, 64);
+
+    try scratch.beginTask();
+    scratch.finishTask();
+    try std.testing.expectEqual(@as(u64, 0), total_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), live.load(.acquire));
+
+    try scratch.beginTask();
+    _ = try scratch.alloc(u8, 16);
+    scratch.finishTask();
+    try std.testing.expectEqual(@as(u64, 1), total_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 64), live.load(.acquire));
+
+    try scratch.beginTask();
+    _ = try scratch.alloc(u8, 8);
+    scratch.finishTask();
+    try std.testing.expectEqual(@as(u64, 1), total_count.load(.acquire));
+
+    scratch.purge();
+    try std.testing.expectEqual(@as(u64, 64), total_free.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), live.load(.acquire));
+}
+
+test "worker scratch serializes overlapping purge callers" {
+    var total_alloc = std.atomic.Value(u64).init(0);
+    var total_free = std.atomic.Value(u64).init(0);
+    var total_count = std.atomic.Value(u64).init(0);
+    var live = std.atomic.Value(u64).init(0);
+    var peak = std.atomic.Value(u64).init(0);
+    const accounting = Accounting{
+        .total_alloc_bytes = &total_alloc,
+        .total_free_bytes = &total_free,
+        .total_alloc_count = &total_count,
+        .live_bytes = &live,
+        .peak_live_bytes = &peak,
+    };
+
+    var scratch = WorkerScratch.init(std.testing.allocator, accounting, 64);
+    try scratch.beginTask();
+    _ = try scratch.alloc(u8, 16);
+    scratch.finishTask();
+
+    const Purger = struct {
+        fn run(shared: *WorkerScratch, start: *std.atomic.Value(u8)) void {
+            while (start.load(.acquire) == 0) {
+                std.atomic.spinLoopHint();
+            }
+            shared.purge();
+        }
+    };
+
+    var start = std.atomic.Value(u8).init(0);
+    const t1 = try std.Thread.spawn(.{}, Purger.run, .{ &scratch, &start });
+    const t2 = try std.Thread.spawn(.{}, Purger.run, .{ &scratch, &start });
+    start.store(1, .release);
+    t1.join();
+    t2.join();
+
+    try std.testing.expectEqual(@as(u64, 1), total_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 64), total_free.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), live.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), scratch.bytesCurrent());
 }

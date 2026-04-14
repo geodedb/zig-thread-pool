@@ -165,6 +165,9 @@ const LIFO_SLOT_EMPTY: u32 = 0xFFFF_FFFF;
 /// flip this back to `std.debug.runtime_safety` or remove the sentinel
 /// entirely.
 const claim_sentinel_enabled: bool = true;
+const idle_ticket_none: u8 = 0;
+const idle_ticket_queued: u8 = 1;
+const idle_ticket_consumed: u8 = 2;
 
 const Worker = struct {
     thread: ?std.Thread = null,
@@ -268,6 +271,9 @@ const Core = struct {
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(u32),
+    idle_queues: ?[]BoundedRing(u32) = null,
+    idle_queue_shard_mask: usize = 0,
+    idle_ticket_states: ?[]std.atomic.Value(u8) = null,
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
@@ -275,6 +281,38 @@ const Core = struct {
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
         try normalized.validate();
+        var idle_queues: ?[]BoundedRing(u32) = null;
+        var idle_queue_shard_mask: usize = 0;
+        var idle_ticket_states: ?[]std.atomic.Value(u8) = null;
+        if (normalized.wake_strategy == .idle_queue) {
+            const idle_queue_shards = idleQueueShardCount(normalized.max_threads);
+            const idle_queue_slots = idleQueueCapacity(idleQueueShardSlots(normalized.max_threads, idle_queue_shards));
+            const queues = try allocator.alloc(BoundedRing(u32), idle_queue_shards);
+            var idle_queues_transferred = false;
+            errdefer if (!idle_queues_transferred) allocator.free(queues);
+            var idle_queues_inited: usize = 0;
+            errdefer if (!idle_queues_transferred) {
+                while (idle_queues_inited > 0) {
+                    idle_queues_inited -= 1;
+                    queues[idle_queues_inited].deinit();
+                }
+            };
+            for (queues) |*idle_queue| {
+                idle_queue.* = try BoundedRing(u32).init(allocator, idle_queue_slots);
+                idle_queues_inited += 1;
+            }
+
+            const tickets = try allocator.alloc(std.atomic.Value(u8), normalized.max_threads);
+            errdefer if (!idle_queues_transferred) allocator.free(tickets);
+            for (tickets) |*ticket| {
+                ticket.* = std.atomic.Value(u8).init(idle_ticket_none);
+            }
+
+            idle_queues = queues;
+            idle_queue_shard_mask = queues.len - 1;
+            idle_ticket_states = tickets;
+            idle_queues_transferred = true;
+        }
 
         self.* = .{
             .allocator = allocator,
@@ -284,6 +322,9 @@ const Core = struct {
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
+            .idle_queues = idle_queues,
+            .idle_queue_shard_mask = idle_queue_shard_mask,
+            .idle_ticket_states = idle_ticket_states,
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
         };
         errdefer self.deinitOwned();
@@ -302,6 +343,15 @@ const Core = struct {
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.recordOwnedAlloc(self.inject_queue.capacity() * @sizeOf(u32));
+        if (self.idle_queues) |queues| {
+            self.recordOwnedAlloc(queues.len * @sizeOf(BoundedRing(u32)));
+            for (queues) |*idle_queue| {
+                self.recordOwnedAlloc(idle_queue.capacity() * @sizeOf(u32));
+            }
+        }
+        if (self.idle_ticket_states) |tickets| {
+            self.recordOwnedAlloc(tickets.len * @sizeOf(std.atomic.Value(u8)));
+        }
 
         for (self.descriptors, 0..) |*descriptor, idx| {
             descriptor.* = .{};
@@ -540,8 +590,56 @@ const Core = struct {
 
     pub fn purgeWorkerCaches(self: *Core) !void {
         if (self.counters.active_tasks.load(.acquire) != 0) return error.PoolBusy;
+        if (self.counters.queued_tasks.load(.acquire) != 0) return error.PoolBusy;
         for (self.workers) |*worker| {
             worker.scratch.purge();
+        }
+    }
+
+    fn wakeOneIdleWorkerFromQueue(self: *Core) void {
+        const idle_queues = self.idle_queues orelse return;
+        const idle_ticket_states = self.idle_ticket_states orelse return;
+        const start = @as(usize, @truncate(self.counters.submitted.load(.monotonic))) & self.idle_queue_shard_mask;
+        var shard_off: usize = 0;
+        while (shard_off < idle_queues.len) : (shard_off += 1) {
+            const shard_index = (start + shard_off) & self.idle_queue_shard_mask;
+            var idle_queue = &idle_queues[shard_index];
+            while (idle_queue.pop()) |candidate| {
+                const idx: usize = @intCast(candidate);
+                const worker = &self.workers[idx];
+                idle_ticket_states[idx].store(idle_ticket_consumed, .release);
+
+                if (worker.is_parked.load(.seq_cst) != 1) continue;
+
+                worker.park_mutex.lock();
+                if (worker.is_parked.load(.monotonic) == 1) {
+                    worker.park_cond.signal();
+                    worker.park_mutex.unlock();
+                    return;
+                }
+                worker.park_mutex.unlock();
+            }
+        }
+    }
+
+    fn clearConsumedIdleTicket(self: *Core, worker_index: usize) void {
+        if (self.config.wake_strategy != .idle_queue) return;
+        const idle_ticket_states = self.idle_ticket_states orelse return;
+        if (idle_ticket_states[worker_index].load(.acquire) == idle_ticket_consumed) {
+            idle_ticket_states[worker_index].store(idle_ticket_none, .release);
+        }
+    }
+
+    fn publishIdleWorker(self: *Core, worker_index: usize) void {
+        if (self.config.wake_strategy != .idle_queue) return;
+        const idle_queues = self.idle_queues orelse return;
+        const idle_ticket_states = self.idle_ticket_states orelse return;
+        if (idle_ticket_states[worker_index].cmpxchgStrong(idle_ticket_none, idle_ticket_queued, .acq_rel, .acquire)) |_| {
+            return;
+        }
+        const shard_index = worker_index & self.idle_queue_shard_mask;
+        if (!idle_queues[shard_index].tryPush(@intCast(worker_index))) {
+            idle_ticket_states[worker_index].store(idle_ticket_none, .release);
         }
     }
 
@@ -610,32 +708,35 @@ const Core = struct {
         }
 
         _ = self.counters.submitted.fetchAdd(1, .monotonic);
-        self.incrementQueued();
-
-        // Wake one parked worker. Scan `is_parked` across workers starting at a
-        // round-robin offset so load spreads across the pool. The submit-before-park
-        // handshake (see idle()) guarantees: if any worker is about to miss this
-        // task because it's heading to park, its `is_parked := 1` store is ordered
-        // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
-        // and signal it, OR the worker reloads `queued_tasks` and sees our push —
-        // no lost wakeup. No broadcast fallback is needed.
-        const submitted = self.counters.submitted.load(.monotonic);
-        const hint_idx: usize = @intCast(submitted % self.workers.len);
-        var off: usize = 0;
-        while (off < self.workers.len) : (off += 1) {
-            const idx = (hint_idx + off) % self.workers.len;
-            const w = &self.workers[idx];
-            if (w.is_parked.load(.seq_cst) == 1) {
-                w.park_mutex.lock();
-                // Re-check under the mutex: the worker may have unparked between our
-                // load and this acquire. The signal is a no-op if it isn't parked —
-                // but we do not want to hold the mutex for a worker that is running.
-                if (w.is_parked.load(.monotonic) == 1) {
-                    w.park_cond.signal();
+        _ = self.incrementQueued();
+        if (self.config.wake_strategy == .scan_parked_workers) {
+            // Wake one parked worker. Scan `is_parked` across workers starting at a
+            // round-robin offset so load spreads across the pool. The submit-before-park
+            // handshake (see idle()) guarantees: if any worker is about to miss this
+            // task because it's heading to park, its `is_parked := 1` store is ordered
+            // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
+            // and signal it, OR the worker reloads `queued_tasks` and sees our push —
+            // no lost wakeup. No broadcast fallback is needed.
+            const submitted = self.counters.submitted.load(.monotonic);
+            const hint_idx: usize = @intCast(submitted % self.workers.len);
+            var off: usize = 0;
+            while (off < self.workers.len) : (off += 1) {
+                const idx = (hint_idx + off) % self.workers.len;
+                const w = &self.workers[idx];
+                if (w.is_parked.load(.seq_cst) == 1) {
+                    w.park_mutex.lock();
+                    // Re-check under the mutex: the worker may have unparked between our
+                    // load and this acquire. The signal is a no-op if it isn't parked —
+                    // but we do not want to hold the mutex for a worker that is running.
+                    if (w.is_parked.load(.monotonic) == 1) {
+                        w.park_cond.signal();
+                    }
+                    w.park_mutex.unlock();
+                    break;
                 }
-                w.park_mutex.unlock();
-                break;
             }
+        } else {
+            self.wakeOneIdleWorkerFromQueue();
         }
 
         return if (options.waitable)
@@ -870,6 +971,7 @@ const Core = struct {
 
     fn idle(self: *Core, worker_index: usize) void {
         var worker = &self.workers[worker_index];
+        self.clearConsumedIdleTicket(worker_index);
         // Phase G2 (re-land 2026-04-13): no `counters.queued_tasks` poll.
         // The submit path writes that line with .seq_cst on every submit;
         // 56 workers × spin_iters shared loads per park cycle dominated
@@ -918,6 +1020,14 @@ const Core = struct {
         // reads that store's specific value — if the SC load observes an earlier
         // value, no HB edge forms and the IRIW scenario is permitted.
         worker.is_parked.store(1, .seq_cst);
+        // With the idle-queue wake strategy, publish our wake ticket after
+        // `is_parked := 1` and before the `queued_tasks` SC reload. That keeps
+        // the same lost-wakeup surface as the legacy scan path: after the
+        // submitter's SC fetchAdd, either it dequeues this ticket and signals
+        // under `park_mutex`, or our SC load below sees the queued task and we
+        // skip waiting. Stale queue entries are safe: the submit path validates
+        // `is_parked` under the mutex before signaling.
+        self.publishIdleWorker(worker_index);
         if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
             worker.park_mutex.unlock();
@@ -1071,6 +1181,18 @@ const Core = struct {
             lq.deinit();
         }
         self.inject_queue.deinit();
+        if (self.idle_queues) |queues| {
+            for (queues) |*idle_queue| {
+                self.recordOwnedFree(idle_queue.capacity() * @sizeOf(u32));
+                idle_queue.deinit();
+            }
+            self.recordOwnedFree(queues.len * @sizeOf(BoundedRing(u32)));
+            self.allocator.free(queues);
+        }
+        if (self.idle_ticket_states) |tickets| {
+            self.recordOwnedFree(tickets.len * @sizeOf(std.atomic.Value(u8)));
+            self.allocator.free(tickets);
+        }
         self.recordOwnedFree(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.allocator.free(self.worker_stats_buffer);
         self.recordOwnedFree(self.free_indices.len * @sizeOf(u32));
@@ -1083,13 +1205,14 @@ const Core = struct {
         self.allocator.free(self.workers);
     }
 
-    fn incrementQueued(self: *Core) void {
+    fn incrementQueued(self: *Core) u64 {
         // Must be .seq_cst: the submit-path park handshake requires this store
         // to participate in the SC total order so that the IRIW scenario
         // (submitter reads is_parked=0 AND worker reads queued_tasks=0) is
         // excluded. See the comment in idle() for the full argument.
         const queue_depth = self.counters.queued_tasks.fetchAdd(1, .seq_cst) +% 1;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
+        return queue_depth;
     }
 
     fn decrementQueued(self: *Core) void {
@@ -1180,8 +1303,10 @@ pub const ThreadPool = struct {
     }
 
     /// Release scratch memory held by idle workers. Returns
-    /// `error.PoolBusy` if any tasks are currently active, since
-    /// purging during execution would corrupt scratch allocators.
+    /// `error.PoolBusy` unless the pool is quiescent
+    /// (`active_tasks == 0 && queued_tasks == 0`), since purging during
+    /// execution or with queued work remaining would corrupt scratch
+    /// allocator ownership.
     pub fn purgeWorkerCaches(self: *ThreadPool) !void {
         return self.core.purgeWorkerCaches();
     }
@@ -1201,4 +1326,20 @@ fn updatePeakU32(counter: *std.atomic.Value(u32), value: u32) void {
         if (previous == null) return;
         current = previous.?;
     }
+}
+
+fn idleQueueCapacity(max_threads: usize) usize {
+    const desired = @max(max_threads * 2, 2);
+    return std.math.ceilPowerOfTwo(usize, desired) catch desired;
+}
+
+fn idleQueueShardCount(max_threads: usize) usize {
+    const capped = @min(@max(max_threads, 1), 8);
+    var shards: usize = 1;
+    while ((shards << 1) <= capped) : (shards <<= 1) {}
+    return shards;
+}
+
+fn idleQueueShardSlots(max_threads: usize, shard_count: usize) usize {
+    return std.math.divCeil(usize, max_threads, shard_count) catch max_threads;
 }

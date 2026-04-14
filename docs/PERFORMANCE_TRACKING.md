@@ -4,6 +4,61 @@ Rolling record of micro-benchmark numbers as the Tokio-parity plan progresses.
 All numbers from local dev machine unless noted. CI baselines tracked in
 `benchmarks/results/baseline.json`.
 
+## 2026-04-14 late session — scratch fast path + idle queue attempt
+
+**Status:** implemented in the current working tree only, not on `main`.
+Detailed archive: `docs/performance/2026-04-14-scratch-fastpath-idle-queue/`.
+
+### What changed
+
+- `WorkerScratch.beginTask()`, `alloc()`, and `finishTask()` are now lock-free
+  on the normal owning-worker path.
+- `ThreadPool.purgeWorkerCaches()` / `Core.purgeWorkerCaches()` now reject
+  unless the pool is quiescent: `active_tasks == 0 && queued_tasks == 0`.
+- Added `WakeStrategy` with an opt-in `idle_queue` mode that replaces the
+  submit-path O(N) parked-worker scan with a bounded idle-worker ticket queue.
+- Added `RuntimePreset.tokio_parity`, which currently enables
+  `timestamp_mode = .disabled` and `wake_strategy = .idle_queue`.
+
+### Correctness outcome
+
+The first cut of the scratch fast-path refactor exposed a real race:
+idle-time purge and external quiescent purge could overlap and double-free a
+scratch buffer. That caused an intermittent `SIGSEGV` in
+`stress.test.repeated churn returns to a bounded steady state after purge`.
+
+Final workspace fix:
+
+- keep the task fast path lock-free
+- serialize only overlapping purge callers on a slow-path purge mutex
+
+Validation on the final workspace:
+
+- `zig build test --summary all` PASS
+- `zig build test-integration --summary all` PASS
+- `zig build test-stress --summary all` PASS
+- focused purge/churn stress loop: 30/30 PASS
+- required `ReleaseFast` stress gate: 20/20 PASS
+
+### Same-session A/B (balanced order, n=10 each, ReleaseFast)
+
+Baseline was a clean worktree at `HEAD`; candidate was the final dirty
+workspace. Host load during this measurement was high
+(`load average: 12.89, 13.63, 11.13` with unrelated `geode` processes
+consuming CPU), so treat these as relative same-session numbers only.
+
+| Scenario | Baseline median ops/s | Baseline p95 | Candidate median ops/s | Candidate p95 | Delta |
+|---|---:|---:|---:|---:|---:|
+| `tokio_parity/flood_1m` | 487,840.5 | 537,976 | 465,650.0 | 541,624 | -4.5% median |
+| `tokio_parity/contended_spawn_8x` | 469,570.0 | 510,690 | 411,959.0 | 453,933 | -12.3% median |
+
+### Verdict
+
+This attempt improved the implementation shape and closed a real purge race,
+but it did **not** meet the performance success criteria on this host. Do not
+claim Tokio/Go parity progress from this patch as-is, and do not flip the
+default wake strategy based on these numbers.
+
 ## Verdict vs Targets
 
 | Target | v0.2.0 baseline | After plan | Met? |

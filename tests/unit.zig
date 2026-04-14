@@ -72,6 +72,16 @@ test "worker cache purge resets current scratch usage" {
     }
 }
 
+test "worker cache purge rejects queued work even when no task is active" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.work_stealing));
+    defer pool.deinit();
+
+    pool.core.counters.queued_tasks.store(1, .release);
+    defer pool.core.counters.queued_tasks.store(0, .release);
+
+    try std.testing.expectError(error.PoolBusy, pool.purgeWorkerCaches());
+}
+
 test "waitable handle generation increments across reuses" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
     defer pool.deinit();
@@ -548,6 +558,27 @@ test "per-worker park: submit wakes a parked worker" {
 
     try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
     // At least one worker must have woken up.
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.wakeups > 0);
+}
+
+test "idle queue wake strategy: submit wakes a parked worker" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 4,
+        .queue_capacity = 128,
+        .idle_park_after_ns = 10_000_000,
+        .wake_strategy = .idle_queue,
+    });
+    defer pool.deinit();
+
+    std.Thread.sleep(50_000_000);
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    wg.wait();
+
+    try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
     const stats = pool.statsSnapshot();
     try std.testing.expect(stats.wakeups > 0);
 }
