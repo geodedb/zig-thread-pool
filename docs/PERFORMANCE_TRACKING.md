@@ -754,3 +754,19 @@ Fresh A/B-disable ceilings (566K baseline):
 Full report: `docs/performance/reprofile-2026-04-13/SUMMARY.md`.
 
 Next-phase ordering: 1. G3 (submitted.fetchAdd), 2. Wake-scan redesign (post-G3 re-measure first), 3. Architectural pivot (Chase-Lev deque + event-wake + lock-free inject) once single-atomic ceilings exhausted.
+
+## Wake-Scan Parked-Count Gate — Abandoned (2026-04-13)
+
+Three paired n=10 variants all regressed flood_1m. Branch `feat/wake-scan-parked-count-gate` preserved unmerged.
+
+- Attempt 1 (basic gate): -11.0%
+- Attempt 2 (cacheline-aligned): -2.5%
+- Attempt 3 (aligned + .monotonic load): -8.9%
+
+CPU frequency stable across all attempts (±0.1% mean). Stress 20/20 PASS on all three (no correctness regression). Perf was net-negative due to cacheline false-sharing + atomic RMW contention from 56 workers park/unpark-cycling.
+
+Full write-up with triage, lessons, and suggested alternatives: `docs/performance/wake-scan-gate-abandoned/README.md`.
+
+Re-profile priority update: priority 1 (G3) shipped as correctness-only slice (null perf). Priority 2 (wake-scan redesign) ABANDONED. Priority 3 (architectural pivot — Chase-Lev / event-wake / lock-free inject) was LARGELY ALREADY IMPLEMENTED in prior sessions. Only lock-free-inject-queue (targets contended_spawn_8x multi-submitter) remains as a planned architectural target, but it does not address flood_1m.
+
+**Conclusion:** the single-atomic optimization surface for flood_1m on this pool architecture appears exhausted. Further lift requires structural change (work-distribution model, futex-direct wake, pre-allocated descriptor pools) beyond what this session could validate cleanly under host drift conditions.
