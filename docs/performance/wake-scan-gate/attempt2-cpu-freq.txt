@@ -1,0 +1,5 @@
+# attempt2 CPU freq samples
+# PRE-gate:
+pre: min=2896MHz max=3300MHz mean=2914MHz n=70
+# POST-gate attempt2:
+post: min=2896MHz max=3300MHz mean=2912MHz n=73
