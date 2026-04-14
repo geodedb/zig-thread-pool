@@ -1,0 +1,5 @@
+# CPU frequency samples during paired measurement
+# PRE-gate:
+pre: min=2896MHz max=3300MHz mean=2908MHz n=68
+# POST-gate:
+post: min=2896MHz max=3300MHz mean=2911MHz n=78

@@ -754,3 +754,22 @@ Fresh A/B-disable ceilings (566K baseline):
 Full report: `docs/performance/reprofile-2026-04-13/SUMMARY.md`.
 
 Next-phase ordering: 1. G3 (submitted.fetchAdd), 2. Wake-scan redesign (post-G3 re-measure first), 3. Architectural pivot (Chase-Lev deque + event-wake + lock-free inject) once single-atomic ceilings exhausted.
+
+## Wake-Scan Parked-Count Gate — Attempt 1 (2026-04-13, HOLD)
+
+Orthogonal global `Sync.parked_count` atomic; submitter `.acquire`-loads it in `enqueueTask` and skips the 56-iteration `is_parked[]` scan when count is 0.
+
+Sub-changes (branch `feat/wake-scan-parked-count-gate`):
+
+1. Add `Sync.parked_count` field (`4f7c6fe`).
+2. Worker increment/decrement in `idle()` (`37d32e9`).
+3. Submitter fast-exit in `enqueueTask` (`51183d5`).
+4. Park/submit interleave regression test (`b06e998`).
+
+Result: flood_1m 401.9K → 357.6K (**-11.0%**, -31.6% of A/B ceiling). Stress 20/20 PASS but perf regressed. Decision: **HOLD — do not merge attempt 1**.
+
+CPU frequency stable (pre mean 2908MHz vs post mean 2911MHz, +0.1% drift) — regression is signal, not noise.
+
+Triage candidate: cacheline false-sharing on `Sync.parked_count` (co-located with `backpressure_waiters` and mutex/cond fields). Attempt 2 will add cacheline padding.
+
+Full report: `docs/performance/wake-scan-gate/SUMMARY.md`.
