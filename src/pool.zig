@@ -195,6 +195,14 @@ const Worker = struct {
     /// owner writes to it. Sentinel value `LIFO_SLOT_EMPTY` (0xFFFF_FFFF)
     /// means "no cached task".
     lifo_slot: std.atomic.Value(u32) = std.atomic.Value(u32).init(LIFO_SLOT_EMPTY),
+    /// Per-worker non-atomic u64 rotation counter for this worker's steal
+    /// start index. Only the owner worker reads and writes it (called from
+    /// nextTask on the worker's own thread). Replaces a prior cross-thread
+    /// load of `counters.submitted`. Non-atomic is correct because there is
+    /// no concurrent access — the field is single-writer, single-reader,
+    /// and the reader and writer are the same thread. See Task 3 of
+    /// docs/superpowers/plans/2026-04-13-phase-g3-submitted-replacement.md.
+    steal_hint: u64 = 0,
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -727,10 +735,13 @@ const Core = struct {
                 return descriptor_index;
             }
 
-            // Use worker_index mixed with submitted count for pseudo-random start.
-            // Avoids global atomic fetchAdd contention that causes thundering-herd
-            // when all idle workers get sequential starting indices.
-            const start = (worker_index +% @as(usize, @truncate(self.counters.submitted.load(.monotonic)))) % self.workers.len;
+            // G3: per-worker non-atomic rotation. Only this worker writes
+            // steal_hint; no cross-thread atomic load. Preserves the original
+            // intent (avoid thundering-herd sequential starts) without touching
+            // the submitter-hot `counters.submitted` cacheline.
+            const owner = &self.workers[worker_index];
+            owner.steal_hint +%= 1;
+            const start = (worker_index +% @as(usize, @truncate(owner.steal_hint))) % self.workers.len;
             var offset: usize = 0;
             while (offset < self.workers.len) : (offset += 1) {
                 const victim_index = (start + offset) % self.workers.len;
