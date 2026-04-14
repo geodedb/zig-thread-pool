@@ -135,11 +135,8 @@ const TaskDescriptor = struct {
 
     /// Debug/ReleaseSafe-only double-dequeue detector. `-1` = unclaimed.
     /// Worker CAS-acquires from -1 to its index in runTask; a failed CAS
-    /// means two workers are racing for this descriptor — panic.
-    /// Always compiled in (cheap — single i32). Guarded reads/writes are
-    /// controlled by `claim_sentinel_enabled` (defined above) — currently
-    /// always-on for the Phase H race investigation; revert to
-    /// `std.debug.runtime_safety` after Task 4 fix lands.
+    /// means two workers are racing for this descriptor — panic. Guarded
+    /// reads/writes are gated by `claim_sentinel_enabled` (defined below).
     claimed_by: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 
     comptime {
@@ -154,17 +151,14 @@ const TaskDescriptor = struct {
 /// so descriptor indices (0..queue_capacity-1) never collide.
 const LIFO_SLOT_EMPTY: u32 = 0xFFFF_FFFF;
 
-/// Phase H investigation flag — when true, the per-descriptor `claimed_by`
-/// sentinel is always active (catches double-dequeue races in ReleaseFast
-/// where the race actually reproduces). When false, the sentinel only
-/// runs under `std.debug.runtime_safety` (Debug/ReleaseSafe), where the
-/// race is masked by safety-check overhead and rarely fires.
-///
-/// TODO(phase-h): once the double-dequeue race is root-caused and fixed
-/// (Task 4 of docs/superpowers/plans/2026-04-13-phase-h-fix-double-dequeue-race.md),
-/// flip this back to `std.debug.runtime_safety` or remove the sentinel
-/// entirely.
-const claim_sentinel_enabled: bool = true;
+/// When `true`, the per-descriptor `claimed_by` sentinel is active: every
+/// successful state CAS in `runTask` / `cancelQueuedTasks` also CAS-claims
+/// `claimed_by` from `-1` to the worker index, and a failed claim panics
+/// (catches double-dequeue races). Tied to `std.debug.runtime_safety` so
+/// Debug / ReleaseSafe builds keep the detector; ReleaseFast drops the
+/// extra CAS pair from the dispatch hot path now that the Phase H race is
+/// fixed (see `docs/performance/phase-h/`).
+const claim_sentinel_enabled: bool = std.debug.runtime_safety;
 
 const Worker = struct {
     thread: ?std.Thread = null,
