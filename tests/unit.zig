@@ -950,3 +950,21 @@ test "phase h regression: state CAS gate rejects duplicate descriptor dispatch" 
 
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
 }
+
+test "g3: Stats.submitted reports exact spawn count" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.work_stealing));
+    defer pool.deinit();
+
+    const N: u64 = 1000;
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    try std.testing.expectEqual(N, counter.value.load(.acquire));
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(N, stats.submitted);
+}
