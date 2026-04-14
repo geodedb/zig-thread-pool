@@ -610,11 +610,17 @@ const Core = struct {
         descriptor.state.store(.queued, .release);
 
         var queued = false;
+        // Option 3 (Task 5): `incoming_target` tracks which worker (if any)
+        // received an external submit via its incoming queue. Sentinel
+        // `maxInt(usize)` means "not routed via incoming" (went to
+        // LIFO/local_queue as a worker-thread submit, or fell back to
+        // inject_queue). Drives the tight-wake-coupling path below.
+        var incoming_target: usize = std.math.maxInt(usize);
+
         if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
+            // Worker-thread submit: LIFO then own local_queue. Unchanged
+            // from pre-Option-3.
             const wi = tls_worker_index.?;
-            // Try the LIFO slot first. Owner-only write; if the slot is empty,
-            // a plain store is sufficient — no stealer writes to this slot.
-            // If the slot is full, fall through to the local ring.
             const w = &self.workers[wi];
             if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
                 w.lifo_slot.store(descriptor_index, .release);
@@ -624,6 +630,24 @@ const Core = struct {
                 if (queued) {
                     const local_len = @as(u32, @intCast(self.local_queues[wi].len()));
                     updatePeakU32(&w.local_queue_peak, local_len);
+                }
+            }
+        } else if (self.config.scheduler_variant == .work_stealing) {
+            // Option 3 (Task 3+5): external-thread submit — rotate across
+            // worker incoming queues. Up to `workers.len` probes before
+            // falling back to inject_queue. `incoming_target` tracks which
+            // worker received the push so the wake path below can signal
+            // that worker directly (Task 5 tight wake coupling). Sentinel
+            // `maxInt(usize)` = "not routed via incoming" (inject fallback).
+            const n = self.workers.len;
+            const start = self.incoming_cursor.fetchAdd(1, .monotonic);
+            var probe: usize = 0;
+            while (probe < n) : (probe += 1) {
+                const target = (@as(usize, start) + probe) % n;
+                if (self.workers[target].incoming.tryPush(descriptor_index)) {
+                    queued = true;
+                    incoming_target = target;
+                    break;
                 }
             }
         }
@@ -638,13 +662,58 @@ const Core = struct {
         _ = self.counters.submitted.fetchAdd(1, .monotonic);
         self.incrementQueued();
 
-        // Wake one parked worker. Scan `is_parked` across workers starting at a
-        // round-robin offset so load spreads across the pool. The submit-before-park
-        // handshake (see idle()) guarantees: if any worker is about to miss this
-        // task because it's heading to park, its `is_parked := 1` store is ordered
-        // with its reload of `queued_tasks`. So either we observe `is_parked == 1`
-        // and signal it, OR the worker reloads `queued_tasks` and sees our push —
-        // no lost wakeup. No broadcast fallback is needed.
+        // Option 3 (Task 5) tight wake coupling: if the push landed on a
+        // specific worker's incoming queue AND that worker is parked,
+        // signal it directly — no scan. This turns the common external-
+        // submit wake from O(workers.len) into O(1). If the target is not
+        // parked (busy running or already spinning), fall through to the
+        // generic wake-scan so ANOTHER parked worker is woken — it can't
+        // dispatch target's incoming task directly (single-reader invariant)
+        // but can at least wake target via steal-scan or by other means, and
+        // the task won't sit unnoticed until the next submit.
+        //
+        // Note: when we successfully signal the target, we still DO fall
+        // through to the generic scan because (a) target may have been
+        // parked but no longer is (rare), and (b) other parked workers may
+        // have their own pending work via steals — however under the
+        // current design stealers would wake naturally via steal-scan, so
+        // we actually return early on a successful target signal to avoid
+        // spurious wake cost. Return-early keeps the "O(1) wake for the
+        // common case" property intact.
+        if (incoming_target != std.math.maxInt(usize)) {
+            const target_w = &self.workers[incoming_target];
+            if (target_w.is_parked.load(.seq_cst) == 1) {
+                target_w.park_mutex.lock();
+                if (target_w.is_parked.load(.monotonic) == 1) {
+                    target_w.park_cond.signal();
+                    target_w.park_mutex.unlock();
+                    return if (options.waitable)
+                        .{
+                            .index = descriptor_index,
+                            .generation = descriptor.generation,
+                            .waitable = true,
+                        }
+                    else
+                        types.TaskHandle.invalid();
+                }
+                target_w.park_mutex.unlock();
+            }
+            // Target is not parked — fall through to scan. Another parked
+            // worker may steal from target's local_queue (but not incoming,
+            // by design) OR pick up the task via a later steal-scan cycle
+            // once target processes the incoming item into its local_queue
+            // by pushing-back (future optimization). For now, the task will
+            // be picked up when target next calls nextTask (it's running,
+            // so this is imminent).
+        }
+
+        // Fallback wake-scan. Used by:
+        //   - Worker-thread submits (LIFO/local_queue; `incoming_target` == sentinel)
+        //   - Inject-queue fallback submits (`incoming_target` == sentinel)
+        //   - Tight-coupled submits whose target was not parked (fall-through)
+        //
+        // Scan `is_parked` starting at a round-robin offset. The submit-
+        // before-park handshake (see idle()) guarantees no lost wakeup.
         const submitted = self.counters.submitted.load(.monotonic);
         const hint_idx: usize = @intCast(submitted % self.workers.len);
         var off: usize = 0;
@@ -718,6 +787,15 @@ const Core = struct {
             }
 
             if (lq.popBottom()) |descriptor_index| {
+                return descriptor_index;
+            }
+
+            // Option 3 (Task 4): drain own incoming queue AFTER local_queue
+            // (own-work-first fairness) and BEFORE global inject_queue.
+            // Single-reader invariant: only this worker pops from its own
+            // incoming. Producers are external submit calls via
+            // `incoming.tryPush` — MPMC-safe in BoundedRing.
+            if (worker.incoming.pop()) |descriptor_index| {
                 return descriptor_index;
             }
 

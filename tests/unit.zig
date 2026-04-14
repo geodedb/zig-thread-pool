@@ -2,6 +2,10 @@ const std = @import("std");
 const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
+comptime {
+    _ = @import("unit/option3_round_robin.zig");
+}
+
 test "work-stealing scheduler executes each accepted task exactly once" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.work_stealing));
     defer pool.deinit();
