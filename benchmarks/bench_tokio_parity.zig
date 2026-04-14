@@ -161,10 +161,78 @@ fn benchContended(out_writer: anytype) !void {
     try out_writer.writeAll(line);
 }
 
+// === Scenario: contended_spawn_8x_batched ===
+// 8 submitter threads each push 100k/8 tasks via submitBatch with batch
+// size 64. Measures whether the batched-submit amortization generalizes
+// to the multi-producer case.
+const ContendedBatchedSubmitterCtx = struct {
+    pool: *thread_pool.ThreadPool,
+    wg: *thread_pool.WaitGroup,
+    marker: *NoopCtx,
+    count: usize,
+};
+
+fn contendedBatchedSubmitterThread(ctx: *ContendedBatchedSubmitterCtx) void {
+    var batch: [flood_batch_size]thread_pool.BatchTask = undefined;
+    for (&batch) |*b| {
+        b.* = .{ .task_fn = noopTask, .ctx = @ptrCast(ctx.marker) };
+    }
+    var submitted_total: usize = 0;
+    while (submitted_total < ctx.count) {
+        const remaining = ctx.count - submitted_total;
+        const this_batch = @min(remaining, flood_batch_size);
+        const result = ctx.pool.submitBatch(batch[0..this_batch], .{
+            .wait_group = ctx.wg,
+            .backpressure = .block,
+        }) catch return;
+        submitted_total += result.submitted;
+    }
+}
+
+fn benchContendedBatched(out_writer: anytype) !void {
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .max_threads = 0,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var ctx = NoopCtx{};
+    var wg = pool.waitGroup();
+    const per_submitter = contended_count / contended_submitters;
+
+    var threads: [contended_submitters]std.Thread = undefined;
+    var submitter_ctxs: [contended_submitters]ContendedBatchedSubmitterCtx = undefined;
+
+    const start = std.time.nanoTimestamp();
+    for (0..contended_submitters) |i| {
+        submitter_ctxs[i] = .{
+            .pool = &pool,
+            .wg = &wg,
+            .marker = &ctx,
+            .count = per_submitter,
+        };
+        threads[i] = try std.Thread.spawn(.{}, contendedBatchedSubmitterThread, .{&submitter_ctxs[i]});
+    }
+    for (&threads) |*t| t.join();
+    wg.wait();
+    const end = std.time.nanoTimestamp();
+
+    const elapsed_ns: u64 = @intCast(end - start);
+    const total_tasks = per_submitter * contended_submitters;
+    const ops_per_sec = @as(f64, @floatFromInt(total_tasks)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    var buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=contended_spawn_8x_batched tasks={d} submitters={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ total_tasks, contended_submitters, flood_batch_size, elapsed_ns, ops_per_sec });
+    try out_writer.writeAll(line);
+}
+
 pub fn main() !void {
     const stdout = std.fs.File.stdout();
 
     try benchFlood(stdout);
     try benchFloodBatched(stdout);
     try benchContended(stdout);
+    try benchContendedBatched(stdout);
 }
