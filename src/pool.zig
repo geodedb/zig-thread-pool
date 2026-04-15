@@ -45,18 +45,42 @@ const PoolState = enum(u8) {
     stopped,
 };
 
+/// Queue-slot payload: `{generation_tag: u32 high, index: u32 low}` packed
+/// into a u64. Consumers check `entryGen(entry) == descriptor.generation`
+/// (truncated) before the state CAS in `runTask` / `cancelDescriptor` to
+/// reject stale entries — entries that were enqueued against a prior
+/// generation of the same descriptor slot. Without this tag, a stale
+/// entry emitted by a queue path can succeed at `state.cmpxchg(.queued,
+/// .running)` on the new generation's `.queued` state, producing a
+/// double-dispatch (confirmed under the Option D drain-vs-steal reorder;
+/// also a latent race under the default drain-first order, just with a
+/// much narrower window). See
+/// `docs/superpowers/specs/2026-04-15-option-c-drain-hint-design.md`
+/// "Post-mortem iteration 2" for the diagnosis.
+pub const QueueEntry = u64;
+
+inline fn packEntry(index: u32, generation: u64) QueueEntry {
+    return (@as(u64, @as(u32, @truncate(generation))) << 32) | @as(u64, index);
+}
+inline fn entryIndex(entry: QueueEntry) u32 {
+    return @as(u32, @truncate(entry));
+}
+inline fn entryGen(entry: QueueEntry) u32 {
+    return @as(u32, @truncate(entry >> 32));
+}
+
 /// Tagged-union wrapper over the two per-worker local queue implementations.
 /// Selected per-pool via `Config.queue_kind`. All call sites dispatch through
 /// the unified methods (tryPushBottom, popBottom, steal, stealOne, len,
 /// capacity) so the rest of `Core` is queue-kind agnostic.
 const LocalQueue = union(enum) {
-    chase_lev: WorkDeque(u32),
-    ring: RingQueue(u32),
+    chase_lev: WorkDeque(QueueEntry),
+    ring: RingQueue(QueueEntry),
 
     fn init(allocator: std.mem.Allocator, size: usize, kind: types.QueueKind) !LocalQueue {
         return switch (kind) {
-            .chase_lev => .{ .chase_lev = try WorkDeque(u32).init(allocator, size) },
-            .ring => .{ .ring = try RingQueue(u32).init(allocator, size) },
+            .chase_lev => .{ .chase_lev = try WorkDeque(QueueEntry).init(allocator, size) },
+            .ring => .{ .ring = try RingQueue(QueueEntry).init(allocator, size) },
         };
     }
 
@@ -67,14 +91,14 @@ const LocalQueue = union(enum) {
         }
     }
 
-    fn tryPushBottom(self: *LocalQueue, value: u32) bool {
+    fn tryPushBottom(self: *LocalQueue, value: QueueEntry) bool {
         return switch (self.*) {
             .chase_lev => |*q| q.tryPushBottom(value),
             .ring => |*q| q.tryPush(value),
         };
     }
 
-    fn popBottom(self: *LocalQueue) ?u32 {
+    fn popBottom(self: *LocalQueue) ?QueueEntry {
         return switch (self.*) {
             .chase_lev => |*q| q.popBottom(),
             .ring => |*q| q.pop(),
@@ -83,7 +107,7 @@ const LocalQueue = union(enum) {
 
     /// Steal up to `out.len` items. For chase_lev returns at most 1; for
     /// ring returns up to (len+1)/2 items via stealHalf.
-    fn steal(self: *LocalQueue, out: []u32) usize {
+    fn steal(self: *LocalQueue, out: []QueueEntry) usize {
         return switch (self.*) {
             .chase_lev => |*q| if (q.stealTop()) |v| blk: {
                 out[0] = v;
@@ -94,11 +118,11 @@ const LocalQueue = union(enum) {
     }
 
     /// Single-item drain — used by shutdown to cancel pending tasks.
-    fn stealOne(self: *LocalQueue) ?u32 {
+    fn stealOne(self: *LocalQueue) ?QueueEntry {
         return switch (self.*) {
             .chase_lev => |*q| q.stealTop(),
             .ring => |*q| blk: {
-                var buf: [1]u32 = undefined;
+                var buf: [1]QueueEntry = undefined;
                 if (q.stealHalf(buf[0..]) == 1) break :blk buf[0];
                 break :blk null;
             },
@@ -147,9 +171,10 @@ const TaskDescriptor = struct {
     }
 };
 
-/// Sentinel value meaning "the lifo_slot is empty". Chosen as the max u32
-/// so descriptor indices (0..queue_capacity-1) never collide.
-const LIFO_SLOT_EMPTY: u32 = 0xFFFF_FFFF;
+/// Sentinel value meaning "the lifo_slot is empty". Chosen as the max u64
+/// so packed {gen, index} entries (low 32 bits are index) never collide —
+/// widened from u32 to carry the generation tag.
+const LIFO_SLOT_EMPTY: QueueEntry = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// When `true`, the per-descriptor `claimed_by` sentinel is active: every
 /// successful state CAS in `runTask` / `cancelQueuedTasks` also CAS-claims
@@ -195,7 +220,7 @@ const Worker = struct {
     /// touch this slot. Stealers never touch this slot either — only the
     /// owner writes to it. Sentinel value `LIFO_SLOT_EMPTY` (0xFFFF_FFFF)
     /// means "no cached task".
-    lifo_slot: std.atomic.Value(u32) = std.atomic.Value(u32).init(LIFO_SLOT_EMPTY),
+    lifo_slot: std.atomic.Value(QueueEntry) = std.atomic.Value(QueueEntry).init(LIFO_SLOT_EMPTY),
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -268,7 +293,7 @@ const Core = struct {
     descriptors: []TaskDescriptor,
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    inject_queue: BoundedRing(u32),
+    inject_queue: BoundedRing(QueueEntry),
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
@@ -289,7 +314,7 @@ const Core = struct {
             .local_queues = try allocator.alloc(LocalQueue, normalized.max_threads),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
-            .inject_queue = try BoundedRing(u32).init(allocator, normalized.queue_capacity),
+            .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
         };
         errdefer self.deinitOwned();
@@ -649,6 +674,7 @@ const Core = struct {
         descriptor.complete_ns = 0;
         descriptor.state.store(.queued, .release);
 
+        const entry = packEntry(descriptor_index, descriptor.generation);
         var queued = false;
         if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
             const wi = tls_worker_index.?;
@@ -657,11 +683,11 @@ const Core = struct {
             // If the slot is full, fall through to the local ring.
             const w = &self.workers[wi];
             if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
-                w.lifo_slot.store(descriptor_index, .release);
+                w.lifo_slot.store(entry, .release);
                 queued = true;
             } else {
                 const was_empty = w.owned_queue_len == 0;
-                queued = self.local_queues[wi].tryPushBottom(descriptor_index);
+                queued = self.local_queues[wi].tryPushBottom(entry);
                 if (queued) {
                     w.owned_queue_len += 1;
                     if (was_empty) self.markWorkerNonEmpty(wi);
@@ -670,7 +696,7 @@ const Core = struct {
             }
         }
         if (!queued) {
-            queued = self.inject_queue.tryPush(descriptor_index);
+            queued = self.inject_queue.tryPush(entry);
         }
         if (!queued) {
             if (options.wait_group) |wait_group| wait_group.done();
@@ -732,13 +758,13 @@ const Core = struct {
         while (true) {
             if (self.shouldExit()) break;
 
-            const maybe_descriptor = self.nextTask(worker_index);
-            if (maybe_descriptor == null) {
+            const maybe_entry = self.nextTask(worker_index);
+            if (maybe_entry == null) {
                 self.idle(worker_index);
                 continue;
             }
 
-            self.runTask(worker_index, maybe_descriptor.?);
+            self.runTask(worker_index, maybe_entry.?);
         }
     }
 
@@ -752,7 +778,7 @@ const Core = struct {
         _ = self.workers_nonempty.fetchAnd(~bit, .release);
     }
 
-    fn nextTask(self: *Core, worker_index: usize) ?u32 {
+    fn nextTask(self: *Core, worker_index: usize) ?QueueEntry {
         var worker = &self.workers[worker_index];
         var lq = &self.local_queues[worker_index];
 
@@ -778,10 +804,10 @@ const Core = struct {
                 return cached;
             }
 
-            if (lq.popBottom()) |descriptor_index| {
+            if (lq.popBottom()) |entry| {
                 if (worker.owned_queue_len > 0) worker.owned_queue_len -= 1;
                 if (worker.owned_queue_len == 0) self.markWorkerEmpty(worker_index);
-                return descriptor_index;
+                return entry;
             }
             // popBottom returned null: real queue is empty regardless of
             // owned_queue_len (stealers may have drained). Reconcile.
@@ -791,7 +817,7 @@ const Core = struct {
             }
 
             {
-                var buf: [32]u32 = undefined;
+                var buf: [32]QueueEntry = undefined;
                 const cap = @min(self.config.inject_batch_size, buf.len);
                 const n = self.inject_queue.popMany(buf[0..cap]);
                 if (n > 0) {
@@ -826,7 +852,7 @@ const Core = struct {
             while (mask != 0) {
                 const victim_index: usize = @ctz(mask);
                 mask &= mask - 1; // clear lowest set bit
-                var stolen: [32]u32 = undefined;
+                var stolen: [32]QueueEntry = undefined;
                 const budget = @min(self.config.steal_batch_size, stolen.len);
                 const n = self.local_queues[victim_index].steal(stolen[0..budget]);
                 if (n > 0) {
@@ -837,10 +863,10 @@ const Core = struct {
                     const first = stolen[0];
                     const was_empty = worker.owned_queue_len == 0;
                     var pushed_count: usize = 0;
-                    for (stolen[1..n]) |idx| {
-                        if (!lq.tryPushBottom(idx)) {
+                    for (stolen[1..n]) |entry| {
+                        if (!lq.tryPushBottom(entry)) {
                             // Local deque full — put overflow on the inject queue so it isn't lost.
-                            _ = self.inject_queue.tryPush(idx);
+                            _ = self.inject_queue.tryPush(entry);
                         } else {
                             pushed_count += 1;
                         }
@@ -859,15 +885,24 @@ const Core = struct {
             return null;
         }
 
-        if (self.inject_queue.pop()) |descriptor_index| {
-            return descriptor_index;
+        if (self.inject_queue.pop()) |entry| {
+            return entry;
         }
         return null;
     }
 
-    fn runTask(self: *Core, worker_index: usize, descriptor_index: u32) void {
+    fn runTask(self: *Core, worker_index: usize, entry: QueueEntry) void {
         var worker = &self.workers[worker_index];
+        const descriptor_index = entryIndex(entry);
+        const entry_gen = entryGen(entry);
         var descriptor = &self.descriptors[descriptor_index];
+
+        // Stale-entry filter — see `QueueEntry` doc. Reject entries whose
+        // generation tag predates the descriptor's current generation, so
+        // a recycled slot cannot be double-dispatched through the state CAS.
+        if (@as(u32, @truncate(descriptor.generation)) != entry_gen) {
+            return;
+        }
 
         // Phase H fix: atomically transition .queued → .running. Any other
         // state means the descriptor was already claimed, already completed,
@@ -1060,8 +1095,8 @@ const Core = struct {
         // duplicate index popped during cancellation drains doesn't
         // double-decrement (which would underflow queued_tasks and
         // deadlock shouldExit).
-        while (self.inject_queue.pop()) |descriptor_index| {
-            self.cancelDescriptor(descriptor_index);
+        while (self.inject_queue.pop()) |entry| {
+            self.cancelDescriptor(entry);
         }
         if (self.config.scheduler_variant == .work_stealing) {
             // Drain LIFO slots too.
@@ -1072,15 +1107,22 @@ const Core = struct {
                 }
             }
             for (self.local_queues) |*lq| {
-                while (lq.stealOne()) |descriptor_index| {
-                    self.cancelDescriptor(descriptor_index);
+                while (lq.stealOne()) |entry| {
+                    self.cancelDescriptor(entry);
                 }
             }
         }
     }
 
-    fn cancelDescriptor(self: *Core, descriptor_index: u32) void {
+    fn cancelDescriptor(self: *Core, entry: QueueEntry) void {
+        const descriptor_index = entryIndex(entry);
+        const entry_gen = entryGen(entry);
         const descriptor = &self.descriptors[descriptor_index];
+        // Stale-entry filter (matches runTask): entry predates current
+        // generation → silently drop without decrementing.
+        if (@as(u32, @truncate(descriptor.generation)) != entry_gen) {
+            return;
+        }
         // Gate with the same state CAS pattern runTask uses. A duplicate
         // index emitted by a queue path will find state != .queued (already
         // cancelled, running, completed, or free) and silently return.

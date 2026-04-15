@@ -606,3 +606,79 @@ serializing. Candidate mechanisms yet to disprove:
 Path 1 is also the forward path for any queue-level fix: if
 stale-entry filtering works, Option D and C become viable as
 designed.
+
+## Iteration 3 (2026-04-15) — generation-tagged queue entries FIX LANDED
+
+Path 1 from "Next iteration candidates" above was implemented and
+validated. The stale-entry double-dispatch window is now closed at
+the queue layer, independently of the Option C/D reorder question.
+
+### Change summary
+
+`src/pool.zig`:
+
+- New `pub const QueueEntry = u64` with `packEntry(index, gen)`,
+  `entryIndex(entry)`, `entryGen(entry)` helpers. Layout is
+  `{gen_tag: u32 high, index: u32 low}`; `gen_tag` is
+  `@truncate(descriptor.generation)`.
+- `LocalQueue` union, `lifo_slot`, and `inject_queue` all widened
+  from `u32` to `QueueEntry`. `LIFO_SLOT_EMPTY` widened to
+  `0xFFFF_FFFF_FFFF_FFFF`.
+- `enqueuePush` packs `{index, generation}` into the entry before
+  writing any queue slot.
+- `runTask` and `cancelDescriptor` now take `QueueEntry`, decode
+  index + gen, and reject mismatches **before** the state CAS:
+
+```zig
+if (@as(u32, @truncate(descriptor.generation)) != entry_gen) {
+    return;
+}
+```
+
+  A mismatch means the descriptor was recycled between enqueue and
+  dispatch — the entry is stale and silently dropped. No counter
+  manipulation, no wake-up, no task body invocation.
+
+### Validation matrix
+
+All at `-Doptimize=ReleaseFast`, 20 runs each:
+
+| Scenario                                                       | Before iter 3 | After iter 3 |
+|----------------------------------------------------------------|---------------|--------------|
+| Main order, sentinel off (default config)                      | 20/20         | 20/20        |
+| Main order, sentinel forced on                                 | 20/20         | 20/20        |
+| **Reorder (bitmap-steal before inject-drain), sentinel on**    | **9/20**      | **20/20**    |
+
+The third row is the key result: the stale-entry filter closes the
+canonical double-dequeue panic + the NULL-TF-AT-CALL probe panics
+that iter 2 diagnosed. Reorder-based attacks (Options C, D, and
+future inject-head-contention variants) are now **unblocked** at
+the queue layer.
+
+### Performance (n=5 paired BSSB, tokio-parity)
+
+| Scenario                   | Δ        |
+|----------------------------|----------|
+| flood_1m                   | +2.0%    |
+| flood_1m_batched           | +0.7%    |
+| contended_spawn_8x         | -0.9%    |
+| contended_spawn_8x_batched | +0.4%    |
+
+Within ±2% session variance — no regression from widening queue
+slot from u32 to u64.
+
+### Unit + stress
+
+- `zig build test`: PASS
+- `zig build test-stress -Doptimize=ReleaseFast` x20 (default
+  config): 20/20 PASS
+
+### Outcome for this spec
+
+Option C's original drain-hint design is still closed as written
+(the correctness proof missed the drain-vs-steal visibility
+question, and the hint field is no longer needed). But the
+**mechanism that blocked it** — stale-entry double-dispatch
+through the state CAS — is now fixed. A future drain-hint or
+inject-contention attack can cite this fix instead of waiting on
+the SIGSEGV post-mortem.
