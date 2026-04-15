@@ -661,12 +661,27 @@ const Core = struct {
 
         const bit: u64 = @as(u64, 1) << @as(u6, @intCast(idx));
 
-        // F-005: idempotence guard — if the bit is already set in free_mask,
-        // the slot was already released. Bail to avoid racing with a concurrent
-        // registerSubmitter that may have been handed the same slot between two
-        // release calls on the same idx.
-        const mask = self.submitter_free_mask.load(.acquire);
-        if ((mask & bit) != 0) return;
+        // F-005: atomic claim of release-responsibility. CAS the bit from
+        // 0 (in-use) to 1 (free) in one step so that at most one concurrent
+        // releaseSubmitter wins and performs the drain. A naive load-then-
+        // act would let two simultaneous release calls both see bit=0 and
+        // both drain submitter_queues[idx] concurrently — a data race
+        // against the queue's SPMC contract.
+        //
+        // Residual caller-contract constraint: this CAS does NOT close the
+        // pathological release(A) → register(A) → release(A) sequence,
+        // because the second release sees bit=0 again (the intervening
+        // registerSubmitter cleared it) and proceeds. Closing that case
+        // requires per-slot generation tags on the free_mask itself, which
+        // is an API-breaking change out of scope for F-005. Callers MUST
+        // ensure a given idx is released at most once per registration.
+        while (true) {
+            const current = self.submitter_free_mask.load(.acquire);
+            if ((current & bit) != 0) return; // already free — idempotent bail
+            if (self.submitter_free_mask.cmpxchgWeak(current, current | bit, .acq_rel, .acquire) == null) {
+                break; // we won the release
+            }
+        }
 
         // F-005: thread-owner check — only clear TLS if this thread actually
         // owns the slot on this pool. A stray releaseSubmitter call from a
@@ -677,14 +692,23 @@ const Core = struct {
             tls_submitter_slot = .{};
         }
 
-        // Drain: spin-retry inject_queue.tryPush so no task is silently
-        // dropped. The submitter queue is bounded, so this loop terminates.
+        // Drain: bounded spin-retry on inject_queue.tryPush so no task is
+        // silently dropped in the common case. The outer loop terminates
+        // because the submitter queue is bounded; the inner spin is bounded
+        // to prevent livelock if inject_queue consumers are stalled (e.g.
+        // the pool is being torn down while a release races shutdown).
+        const max_push_retries: u32 = 1 << 20;
         while (self.submitter_queues[idx].stealOne()) |entry| {
-            while (!self.inject_queue.tryPush(entry)) std.atomic.spinLoopHint();
+            var retries: u32 = 0;
+            while (!self.inject_queue.tryPush(entry)) {
+                std.atomic.spinLoopHint();
+                retries += 1;
+                if (retries >= max_push_retries) break; // pathological: drop to avoid livelock
+            }
         }
 
         _ = self.submitter_nonempty.fetchAnd(~bit, .release);
-        _ = self.submitter_free_mask.fetchOr(bit, .release);
+        // Note: free_mask bit was already set by the CAS above.
     }
 
     pub fn wait(self: *Core, handle: types.TaskHandle) !void {
