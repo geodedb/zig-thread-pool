@@ -86,7 +86,7 @@ test "park handshake: no lost wakeups under submit-while-parking race" {
                 // Retry on transient QueueFull from rapid submit bursts.
                 while (true) {
                     _ = p.submit(common.counterTask, @ptrCast(c), .{}) catch {
-                        std.Thread.sleep(1_000);
+                        thread_pool.clock.sleep(1_000);
                         continue;
                     };
                     break;
@@ -101,10 +101,10 @@ test "park handshake: no lost wakeups under submit-while-parking race" {
     t2.join();
 
     // Wait up to 5s for completion. If any wakeup is lost, the counter stalls.
-    const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
-    while (std.time.nanoTimestamp() < deadline) {
+    const deadline = thread_pool.clock.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (thread_pool.clock.nanoTimestamp() < deadline) {
         if (counter.value.load(.acquire) >= total) break;
-        std.Thread.sleep(1_000_000);
+        thread_pool.clock.sleep(1_000_000);
     }
 
     try std.testing.expectEqual(total, counter.value.load(.acquire));
@@ -261,7 +261,7 @@ fn runQueueKindScenario(kind: thread_pool.QueueKind, total: u64) !void {
     while (i < total) : (i += 1) {
         while (true) {
             _ = pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg }) catch {
-                std.Thread.sleep(1_000);
+                thread_pool.clock.sleep(1_000);
                 continue;
             };
             break;
@@ -308,7 +308,7 @@ test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
             while (i < 4) : (i += 1) {
                 while (true) {
                     _ = p.submit(innerTask, @ptrCast(p), .{}) catch {
-                        std.Thread.sleep(1_000);
+                        thread_pool.clock.sleep(1_000);
                         continue;
                     };
                     break;
@@ -333,7 +333,7 @@ test "LIFO slot: nested-submit storm with 4 workers, no lost tasks" {
     while (i < outer_total) : (i += 1) {
         while (true) {
             _ = pool.submit(Nested.outerTask, @ptrCast(&pool), .{ .wait_group = &wg }) catch {
-                std.Thread.sleep(1_000);
+                thread_pool.clock.sleep(1_000);
                 continue;
             };
             break;
@@ -378,14 +378,14 @@ test "backpressure backoff: 4 submitters, queue=256, 2 workers, deadline-bounded
         }
     };
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = thread_pool.clock.nanoTimestamp();
     var threads: [n_submitters]std.Thread = undefined;
     for (&threads) |*t| {
         t.* = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &counter, total_per_submitter });
     }
     for (&threads) |*t| t.join();
     try pool.shutdown(.drain, null);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = thread_pool.clock.nanoTimestamp() - start_ns;
 
     // Hang detection first: if we exceeded the wall-time bound, that's the
     // primary signal regardless of counter state.
@@ -416,7 +416,7 @@ test "steal-scan bitmap: wide-pool flood with cpu-count workers" {
             _ = pool.submit(common.counterTask, @ptrCast(&counter), .{
                 .wait_group = &wg,
             }) catch {
-                std.Thread.sleep(1_000);
+                thread_pool.clock.sleep(1_000);
                 continue;
             };
             break;
@@ -450,7 +450,7 @@ test "hot_spinners: slow tasks force parked worker recruitment via propagation" 
         fn run(raw: *anyopaque, rt: *thread_pool.TaskContext) void {
             _ = rt;
             const ctx: *@This() = @ptrCast(@alignCast(raw));
-            std.Thread.sleep(ctx.sleep_ns);
+            thread_pool.clock.sleep(ctx.sleep_ns);
             _ = ctx.counter.value.fetchAdd(1, .monotonic);
         }
     };
@@ -463,9 +463,9 @@ test "hot_spinners: slow tasks force parked worker recruitment via propagation" 
     while (i < total) : (i += 1) {
         _ = try pool.submit(SlowCtx.run, @ptrCast(&slow), .{ .wait_group = &wg });
     }
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = thread_pool.clock.nanoTimestamp();
     wg.wait();
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = thread_pool.clock.nanoTimestamp() - start_ns;
 
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 
@@ -503,7 +503,7 @@ test "hot_spinners: wide-pool flood with cpu-count workers, hot_spinners=1" {
             _ = pool.submit(common.counterTask, @ptrCast(&counter), .{
                 .wait_group = &wg,
             }) catch {
-                std.Thread.sleep(1_000);
+                thread_pool.clock.sleep(1_000);
                 continue;
             };
             break;
@@ -557,10 +557,10 @@ test "phase g2: aggressive spin flood - no lost wakeups" {
     // Wait up to 30s for all tasks to complete. A lost wakeup would cause
     // the counter to stall below total.
     const deadline_ns: i128 = 30 * std.time.ns_per_s;
-    const start = std.time.nanoTimestamp();
-    while (std.time.nanoTimestamp() - start < deadline_ns) {
+    const start = thread_pool.clock.nanoTimestamp();
+    while (thread_pool.clock.nanoTimestamp() - start < deadline_ns) {
         if (counter.value.load(.acquire) >= total) break;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        thread_pool.clock.sleep(1 * std.time.ns_per_ms);
     }
 
     try std.testing.expectEqual(total, counter.value.load(.acquire));

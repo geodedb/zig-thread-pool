@@ -39,8 +39,8 @@ pub fn sample() !types.ProcessMemoryStats {
 
 fn sampleLinux() !types.ProcessMemoryStats {
     const posix = std.posix;
-    const fd = try posix.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    defer posix.close(fd);
+    const fd = try posix.openat(posix.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    defer _ = std.os.linux.close(fd);
 
     var buffer: [16 * 1024]u8 = undefined;
     var total: usize = 0;

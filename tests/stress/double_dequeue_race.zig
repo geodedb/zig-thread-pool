@@ -35,7 +35,7 @@ test "phase h: double-dequeue race reproducer" {
     defer pool.deinit();
 
     // Let workers reach their park/spin steady state before the flood.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
 
     const per_producer: u64 = 500_000;
     var wg = pool.waitGroup();
@@ -69,10 +69,10 @@ test "phase h: double-dequeue race reproducer" {
     // Matches the pattern used by the existing "phase g2: aggressive spin
     // flood" test in this file's sibling tests/stress.zig.
     const deadline_ns: i128 = 30 * std.time.ns_per_s;
-    const start = std.time.nanoTimestamp();
-    while (std.time.nanoTimestamp() - start < deadline_ns) {
+    const start = thread_pool.clock.nanoTimestamp();
+    while (thread_pool.clock.nanoTimestamp() - start < deadline_ns) {
         if (wg.pendingCount() == 0) break;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        thread_pool.clock.sleep(1 * std.time.ns_per_ms);
     }
 
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());

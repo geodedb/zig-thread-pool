@@ -3,10 +3,10 @@ const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
-    const deadline = std.time.nanoTimestamp() + (5 * std.time.ns_per_s);
-    while (std.time.nanoTimestamp() < deadline) {
+    const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
+    while (thread_pool.clock.nanoTimestamp() < deadline) {
         if (ctx.started.load(.acquire)) return;
-        std.Thread.sleep(100_000);
+        thread_pool.clock.sleep(100_000);
     }
     return error.Timeout;
 }
@@ -273,11 +273,11 @@ test "full blocking queue does not block default-lane submitters" {
 
     // Default-lane submissions: must complete quickly regardless of the
     // blocking-lane saturation.
-    const start = std.time.nanoTimestamp();
+    const start = thread_pool.clock.nanoTimestamp();
     for (0..64) |_| {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
     }
-    const elapsed_submit_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    const elapsed_submit_ns: u64 = @intCast(thread_pool.clock.nanoTimestamp() - start);
     // 64 non-contended submits should take far less than one blocking sleep.
     try std.testing.expect(elapsed_submit_ns < 25 * std.time.ns_per_ms);
 
@@ -394,9 +394,9 @@ test "cpu_helps_blocking opt-in lets default workers drain blocking lane" {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .lane = .blocking });
     }
 
-    const start = std.time.nanoTimestamp();
+    const start = thread_pool.clock.nanoTimestamp();
     wg.wait();
-    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    const elapsed_ns: u64 = @intCast(thread_pool.clock.nanoTimestamp() - start);
 
     try std.testing.expectEqual(@as(u64, 129), counter.value.load(.acquire));
     // The 128 fast blocking tasks should complete in parallel with the sleeper,
@@ -529,7 +529,7 @@ test "overflow worker spawned when default workers stall" {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
     }
 
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(50 * std.time.ns_per_ms);
 
     const stats = pool.statsSnapshot();
     try std.testing.expect(stats.overflow_spawns >= 1);
@@ -569,7 +569,7 @@ test "overflow worker self-retires after idle period" {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
     }
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(30 * std.time.ns_per_ms);
     const stats1 = pool.statsSnapshot();
     try std.testing.expect(stats1.overflow_spawns >= 1);
 
@@ -577,7 +577,7 @@ test "overflow worker self-retires after idle period" {
     gate2.release.store(true, .release);
     wg.wait();
 
-    std.Thread.sleep(40 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(40 * std.time.ns_per_ms);
 
     const stats2 = pool.statsSnapshot();
     try std.testing.expect(stats2.overflow_retires >= 1);

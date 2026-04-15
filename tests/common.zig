@@ -44,7 +44,7 @@ pub const SleepTaskContext = struct {
 pub fn sleepTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = runtime;
     const ctx: *SleepTaskContext = @ptrCast(@alignCast(raw_ctx));
-    std.Thread.sleep(ctx.sleep_ns);
+    thread_pool.clock.sleep(ctx.sleep_ns);
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
 }
 
@@ -59,7 +59,7 @@ pub fn gateTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     const ctx: *GateTaskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.started.store(true, .release);
     while (!ctx.release.load(.acquire)) {
-        std.Thread.sleep(100_000);
+        thread_pool.clock.sleep(100_000);
     }
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
 }

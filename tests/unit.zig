@@ -227,7 +227,7 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{});
 
     // Give the worker a moment to pick up the task so it becomes active.
-    std.Thread.sleep(10_000_000);
+    thread_pool.clock.sleep(10_000_000);
 
     // Shutdown with a 50ms timeout -- the 2-second task won't finish in time.
     const result = pool.core.shutdown(.drain, 50_000_000);
@@ -418,7 +418,7 @@ test "timestamp_mode disabled still purges scratch on idle" {
     // 2. Timeout to fire (idle_park_after_ns)
     // 3. Purge check to succeed (idle_purge_after_ns since task completion)
     // Use a generous sleep to account for scheduling delays
-    std.Thread.sleep(100_000_000); // 100ms — very ample time for purge to occur
+    thread_pool.clock.sleep(100_000_000); // 100ms — very ample time for purge to occur
 
     const stats = pool.statsSnapshot();
     // After purge, scratch memory should be released. live_bytes may still include
@@ -434,7 +434,11 @@ test "timestamp_mode disabled still purges scratch on idle" {
 
 test "fuzz BoundedRing push/pop consistency" {
     try std.testing.fuzz({}, struct {
-        fn testOne(_: void, input: []const u8) !void {
+        fn testOne(_: void, smith: *std.testing.Smith) !void {
+            var buf: [256]u8 = undefined;
+            const len = smith.sliceWithHash(&buf, 0);
+            const input = buf[0..len];
+
             const Ring = thread_pool.BoundedRing(u32);
             var ring = Ring.init(std.testing.allocator, 16) catch return;
             defer ring.deinit();
@@ -444,22 +448,14 @@ test "fuzz BoundedRing push/pop consistency" {
 
             for (input) |byte| {
                 if (byte % 2 == 0) {
-                    if (ring.tryPush(pushed)) {
-                        pushed += 1;
-                    }
+                    if (ring.tryPush(pushed)) pushed += 1;
                 } else {
-                    if (ring.pop()) |_| {
-                        popped += 1;
-                    }
+                    if (ring.pop()) |_| popped += 1;
                 }
             }
 
-            // Drain remaining items
-            while (ring.pop()) |_| {
-                popped += 1;
-            }
+            while (ring.pop()) |_| popped += 1;
 
-            // Conservation: every pushed item must have been popped
             try std.testing.expectEqual(pushed, popped);
         }
     }.testOne, .{});
@@ -467,13 +463,11 @@ test "fuzz BoundedRing push/pop consistency" {
 
 test "fuzz Config validation never panics" {
     try std.testing.fuzz({}, struct {
-        fn testOne(_: void, input: []const u8) !void {
-            if (input.len < 16) return;
-
-            const max_threads = std.mem.readInt(u32, input[0..4], .little);
-            const queue_cap = std.mem.readInt(u32, input[4..8], .little);
-            const local_cap = std.mem.readInt(u32, input[8..12], .little);
-            const scheduler_byte = input[12] % 3;
+        fn testOne(_: void, smith: *std.testing.Smith) !void {
+            const max_threads = smith.valueWithHash(u32, 1);
+            const queue_cap = smith.valueWithHash(u32, 2);
+            const local_cap = smith.valueWithHash(u32, 3);
+            const scheduler_byte = smith.valueWithHash(u8, 4) % 3;
 
             var cfg = thread_pool.Config{
                 .max_threads = max_threads,
@@ -482,7 +476,6 @@ test "fuzz Config validation never panics" {
                 .scheduler_variant = @enumFromInt(scheduler_byte),
             };
             cfg = cfg.normalized();
-            // validate() must return cleanly (success or error) -- never panic
             cfg.validate() catch {};
         }
     }.testOne, .{});
@@ -508,24 +501,24 @@ test "phase g2: worker returns from idle when lifo slot filled during spin windo
     defer pool.deinit();
 
     // Give workers time to enter idle().
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
 
     const Ctx = struct {
         ran_at_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         fn run(ctx_ptr: *anyopaque, _: *thread_pool.TaskContext) void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            self.ran_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+            self.ran_at_ns.store(@intCast(thread_pool.clock.nanoTimestamp()), .release);
         }
     };
     var ctx = Ctx{};
 
-    const submit_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const submit_ns: u64 = @intCast(thread_pool.clock.nanoTimestamp());
     _ = try pool.submit(Ctx.run, &ctx, .{});
 
     // Busy-wait up to 50 ms for the task to run.
     const deadline = submit_ns + 50 * std.time.ns_per_ms;
     while (ctx.ran_at_ns.load(.acquire) == 0) {
-        if (@as(u64, @intCast(std.time.nanoTimestamp())) > deadline) break;
+        if (@as(u64, @intCast(thread_pool.clock.nanoTimestamp())) > deadline) break;
         std.atomic.spinLoopHint();
     }
 
@@ -549,7 +542,7 @@ test "per-worker park: submit wakes a parked worker" {
     defer pool.deinit();
 
     // Let workers park before we submit.
-    std.Thread.sleep(50_000_000); // 50ms
+    thread_pool.clock.sleep(50_000_000); // 50ms
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
@@ -674,10 +667,10 @@ test "backpressure deadline: returns error.Timeout when queue stays full" {
     });
     defer pool.deinit();
 
-    var block_sem = std.Thread.Semaphore{};
+    var block_sem = thread_pool.sync.Semaphore{};
 
     const BlockCtx = struct {
-        sem: *std.Thread.Semaphore,
+        sem: *thread_pool.sync.Semaphore,
         fn run(raw: *anyopaque, rt: *thread_pool.TaskContext) void {
             _ = rt;
             const ctx: *@This() = @ptrCast(@alignCast(raw));
@@ -691,12 +684,12 @@ test "backpressure deadline: returns error.Timeout when queue stays full" {
     _ = try pool.submit(BlockCtx.run, @ptrCast(&bctx), .{});
 
     // Third submit must time out within ~100 ms.
-    const start = std.time.nanoTimestamp();
+    const start = thread_pool.clock.nanoTimestamp();
     const result = pool.submit(BlockCtx.run, @ptrCast(&bctx), .{
         .backpressure = .block_with_timeout,
         .timeout_ns = 10 * std.time.ns_per_ms,
     });
-    const elapsed = std.time.nanoTimestamp() - start;
+    const elapsed = thread_pool.clock.nanoTimestamp() - start;
     try std.testing.expectError(error.Timeout, result);
     try std.testing.expect(elapsed >= 10 * std.time.ns_per_ms);
     try std.testing.expect(elapsed < 100 * std.time.ns_per_ms); // hang guard
@@ -749,7 +742,7 @@ test "non_empty_workers bitmap invariant under racing push/pop" {
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 
     // Give workers a brief window to drain late stragglers so counters settle.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.queue_depth_current);
     try std.testing.expectEqual(@as(u64, 0), stats.active_tasks);
@@ -826,7 +819,7 @@ test "active_spinners: counter stays non-negative under concurrent workers" {
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 
     // Brief quiesce so workers drain any stragglers and return to idle.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
 
     // Submit one more task; must execute. If active_spinners is stuck >0
     // with all workers parked, the submitter skips the wake and this
@@ -887,7 +880,7 @@ test "hot_spinners = 1 executes follow-up task after quiesce" {
     try std.testing.expectEqual(@as(u64, 500), counter.value.load(.acquire));
 
     // Brief idle period so the non-hot worker parks.
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(10 * std.time.ns_per_ms);
 
     // One more task — must execute via the hot-spinner.
     var solo = common.Counter{};
@@ -926,7 +919,7 @@ test "phase h regression: state CAS gate rejects duplicate descriptor dispatch" 
     defer pool.deinit();
 
     // Let workers reach steady state before the flood.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
 
     const per_producer: u64 = 200_000;
     var wg = pool.waitGroup();
@@ -952,10 +945,10 @@ test "phase h regression: state CAS gate rejects duplicate descriptor dispatch" 
     // Deadline-based polling so a lost wakeup surfaces as a test failure
     // with a clear pendingCount rather than a process-level hang.
     const deadline_ns: i128 = 60 * std.time.ns_per_s;
-    const start = std.time.nanoTimestamp();
-    while (std.time.nanoTimestamp() - start < deadline_ns) {
+    const start = thread_pool.clock.nanoTimestamp();
+    while (thread_pool.clock.nanoTimestamp() - start < deadline_ns) {
         if (wg.pendingCount() == 0) break;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        thread_pool.clock.sleep(1 * std.time.ns_per_ms);
     }
 
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
