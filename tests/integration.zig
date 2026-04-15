@@ -12,6 +12,11 @@ comptime {
     _ = @import("integration/spawn_failure.zig");
 }
 
+// F-005 regression test: idempotent and bounds-checked releaseSubmitter
+comptime {
+    _ = @import("integration/submitter_lifecycle.zig");
+}
+
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
     const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
     while (thread_pool.clock.nanoTimestamp() < deadline) {

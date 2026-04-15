@@ -654,11 +654,35 @@ const Core = struct {
     }
 
     pub fn releaseSubmitter(self: *Core, idx: usize) void {
-        tls_submitter_slot = .{};
-        while (self.submitter_queues[idx].stealOne()) |entry| {
-            _ = self.inject_queue.tryPush(entry);
+        // F-005: bounds-check — idx must be within the allocated submitter
+        // queue slice. An out-of-range idx is silently ignored; the caller
+        // cannot do anything useful with a bad index anyway.
+        if (idx >= self.submitter_queues.len) return;
+
+        const bit: u64 = @as(u64, 1) << @as(u6, @intCast(idx));
+
+        // F-005: idempotence guard — if the bit is already set in free_mask,
+        // the slot was already released. Bail to avoid racing with a concurrent
+        // registerSubmitter that may have been handed the same slot between two
+        // release calls on the same idx.
+        const mask = self.submitter_free_mask.load(.acquire);
+        if ((mask & bit) != 0) return;
+
+        // F-005: thread-owner check — only clear TLS if this thread actually
+        // owns the slot on this pool. A stray releaseSubmitter call from a
+        // helper thread must not wipe an unrelated thread's submitter cache.
+        if (tls_submitter_slot.pool == @as(*anyopaque, @ptrCast(self)) and
+            tls_submitter_slot.index == idx)
+        {
+            tls_submitter_slot = .{};
         }
-        const bit: u64 = @as(u64, 1) << @intCast(idx);
+
+        // Drain: spin-retry inject_queue.tryPush so no task is silently
+        // dropped. The submitter queue is bounded, so this loop terminates.
+        while (self.submitter_queues[idx].stealOne()) |entry| {
+            while (!self.inject_queue.tryPush(entry)) std.atomic.spinLoopHint();
+        }
+
         _ = self.submitter_nonempty.fetchAnd(~bit, .release);
         _ = self.submitter_free_mask.fetchOr(bit, .release);
     }
