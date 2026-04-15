@@ -6,9 +6,19 @@ const flood_task_count: usize = 1_000_000;
 const contended_task_count: usize = 100_000;
 const contended_submitters: usize = 8;
 
+const SampleResult = struct {
+    elapsed_ns: u64,
+    latency_p50_us: u64 = 0,
+    latency_p95_us: u64 = 0,
+    latency_p99_us: u64 = 0,
+};
+
 const Sample = struct {
     elapsed_ns: u64,
     ops_per_sec: f64,
+    latency_p50_us: u64 = 0,
+    latency_p95_us: u64 = 0,
+    latency_p99_us: u64 = 0,
 };
 
 const ScenarioRow = struct {
@@ -22,6 +32,9 @@ const ScenarioRow = struct {
     sample_count: usize,
     warmup_discarded: usize,
     samples: []Sample,
+    latency_p50_us: u64 = 0,
+    latency_p95_us: u64 = 0,
+    latency_p99_us: u64 = 0,
 };
 
 const RuntimeDocument = struct {
@@ -86,6 +99,66 @@ pub fn main() !void {
         args.samples,
         args.warmup_discard,
         runContendedSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "cpu_work_10us",
+        10_000,
+        1,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runCpuWork10usSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "cpu_work_100us",
+        2_000,
+        1,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runCpuWork100usSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "contended_cpu_10us",
+        10_000,
+        4,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runContendedCpu10usSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "nested_fanout_4x",
+        10_000,
+        1,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runNestedFanout4xSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "burst_drain_burst",
+        4_000,
+        1,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runBurstDrainBurstSample,
+    ));
+    try rows.append(allocator, try measureScenario(
+        allocator,
+        "mixed_fast_slow",
+        5_000,
+        1,
+        worker_count,
+        args.samples,
+        args.warmup_discard,
+        runMixedFastSlowSample,
     ));
 
     const document = RuntimeDocument{
@@ -159,14 +232,22 @@ fn measureScenario(
     worker_count: usize,
     run_count: usize,
     warmup_discard: usize,
-    run_once: *const fn (usize) anyerror!u64,
+    run_once: *const fn (usize) anyerror!SampleResult,
 ) !ScenarioRow {
     const retained_count = run_count - warmup_discard;
     var all_samples = try allocator.alloc(Sample, run_count);
     defer allocator.free(all_samples);
 
     for (all_samples) |*sample| {
-        sample.* = try sampleOnce(task_count, worker_count, run_once);
+        const r = try run_once(worker_count);
+        const elapsed_s = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9;
+        sample.* = .{
+            .elapsed_ns = r.elapsed_ns,
+            .ops_per_sec = @as(f64, @floatFromInt(task_count)) / elapsed_s,
+            .latency_p50_us = r.latency_p50_us,
+            .latency_p95_us = r.latency_p95_us,
+            .latency_p99_us = r.latency_p99_us,
+        };
     }
 
     const retained = try allocator.alloc(Sample, retained_count);
@@ -188,9 +269,17 @@ fn measureScenario(
     const stddev = std.math.sqrt(sum_sq / @as(f64, @floatFromInt(retained_count)));
 
     std.debug.print(
-        "zig_thread_pool {s} median_ops_per_sec={d:.0} stddev_ops_per_sec={d:.0} workers={d}\n",
+        "zig_thread_pool {s} median_ops_per_sec={d:.0} stddev={d:.0} workers={d}",
         .{ scenario_name, median.ops_per_sec, stddev, worker_count },
     );
+    if (median.latency_p50_us > 0) {
+        std.debug.print(" p50={d}us p95={d}us p99={d}us", .{
+            median.latency_p50_us,
+            median.latency_p95_us,
+            median.latency_p99_us,
+        });
+    }
+    std.debug.print("\n", .{});
 
     return .{
         .scenario_name = scenario_name,
@@ -203,19 +292,15 @@ fn measureScenario(
         .sample_count = retained_count,
         .warmup_discarded = warmup_discard,
         .samples = retained,
+        .latency_p50_us = median.latency_p50_us,
+        .latency_p95_us = median.latency_p95_us,
+        .latency_p99_us = median.latency_p99_us,
     };
 }
 
-fn sampleOnce(task_count: usize, worker_count: usize, run_once: *const fn (usize) anyerror!u64) !Sample {
-    const elapsed_ns = try run_once(worker_count);
-    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
-    return .{
-        .elapsed_ns = elapsed_ns,
-        .ops_per_sec = @as(f64, @floatFromInt(task_count)) / elapsed_s,
-    };
-}
+// --- Existing scenarios (no per-task latency) ---
 
-fn runFloodSample(worker_count: usize) !u64 {
+fn runFloodSample(worker_count: usize) !SampleResult {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .min_threads = worker_count,
         .max_threads = worker_count,
@@ -235,10 +320,10 @@ fn runFloodSample(worker_count: usize) !u64 {
         });
     }
     wg.wait();
-    return elapsedNsSince(start_ns);
+    return .{ .elapsed_ns = elapsedNsSince(start_ns) };
 }
 
-fn runContendedSample(worker_count: usize) !u64 {
+fn runContendedSample(worker_count: usize) !SampleResult {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .min_threads = worker_count,
         .max_threads = worker_count,
@@ -268,7 +353,7 @@ fn runContendedSample(worker_count: usize) !u64 {
     }
     for (&threads) |*thread| thread.join();
     wg.wait();
-    return elapsedNsSince(start_ns);
+    return .{ .elapsed_ns = elapsedNsSince(start_ns) };
 }
 
 fn contendedSubmitterThread(ctx: *ContendedSubmitterCtx) void {
@@ -290,10 +375,358 @@ fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = ctx.marker.fetchAdd(1, .monotonic);
 }
 
+// --- Realistic scenarios (with per-task latency) ---
+
+const RealisticTaskCtx = struct {
+    completed_at_ns: *u64,
+    work_ns: u64,
+};
+
+fn realisticTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const ctx: *RealisticTaskCtx = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.work_ns > 0) busyWork(ctx.work_ns);
+    ctx.completed_at_ns.* = nowNs();
+}
+
+const NestedParentCtx = struct {
+    pool: *thread_pool.ThreadPool,
+    wg: *thread_pool.WaitGroup,
+    completed_at_ns: *u64,
+    child_ctxs: []RealisticTaskCtx,
+    child_submitted_at: []u64,
+};
+
+fn nestedParentTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const ctx: *NestedParentCtx = @ptrCast(@alignCast(raw_ctx));
+    ctx.completed_at_ns.* = nowNs();
+    for (ctx.child_ctxs, ctx.child_submitted_at) |*child, *sub| {
+        sub.* = nowNs();
+        _ = ctx.pool.submit(realisticTask, @ptrCast(child), .{
+            .wait_group = ctx.wg,
+            .backpressure = .block,
+        }) catch return;
+    }
+}
+
+fn runCpuWork10usSample(worker_count: usize) !SampleResult {
+    return runCpuWorkScenario(worker_count, 10_000, 10_000, 1);
+}
+
+fn runCpuWork100usSample(worker_count: usize) !SampleResult {
+    return runCpuWorkScenario(worker_count, 2_000, 100_000, 1);
+}
+
+fn runContendedCpu10usSample(worker_count: usize) !SampleResult {
+    return runCpuWorkScenario(worker_count, 10_000, 10_000, 4);
+}
+
+fn runCpuWorkScenario(worker_count: usize, task_count: usize, work_ns: u64, submitters: usize) !SampleResult {
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .min_threads = worker_count,
+        .max_threads = worker_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var submitted_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(submitted_at);
+    var completed_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(completed_at);
+    @memset(completed_at, 0);
+    const task_ctxs = try std.heap.smp_allocator.alloc(RealisticTaskCtx, task_count);
+    defer std.heap.smp_allocator.free(task_ctxs);
+    for (task_ctxs, 0..) |*ctx, i| {
+        ctx.* = .{ .completed_at_ns = &completed_at[i], .work_ns = work_ns };
+    }
+
+    var wg = pool.waitGroup();
+    const start_ns = std.time.nanoTimestamp();
+
+    if (submitters <= 1) {
+        for (task_ctxs, 0..) |*ctx, i| {
+            submitted_at[i] = nowNs();
+            _ = try pool.submit(realisticTask, @ptrCast(ctx), .{
+                .wait_group = &wg,
+                .backpressure = .block,
+            });
+        }
+    } else {
+        const per_submitter = task_count / submitters;
+        var threads = try std.heap.smp_allocator.alloc(std.Thread, submitters);
+        defer std.heap.smp_allocator.free(threads);
+
+        const CpuSubmitterCtx = struct {
+            p: *thread_pool.ThreadPool,
+            w: *thread_pool.WaitGroup,
+            tasks: []RealisticTaskCtx,
+            sub_at: []u64,
+        };
+        var sub_ctxs = try std.heap.smp_allocator.alloc(CpuSubmitterCtx, submitters);
+        defer std.heap.smp_allocator.free(sub_ctxs);
+
+        for (0..submitters) |s| {
+            const off = s * per_submitter;
+            sub_ctxs[s] = .{
+                .p = &pool,
+                .w = &wg,
+                .tasks = task_ctxs[off .. off + per_submitter],
+                .sub_at = submitted_at[off .. off + per_submitter],
+            };
+            threads[s] = try std.Thread.spawn(.{}, struct {
+                fn run(c: *CpuSubmitterCtx) void {
+                    for (c.tasks, 0..) |*t, j| {
+                        c.sub_at[j] = nowNs();
+                        _ = c.p.submit(realisticTask, @ptrCast(t), .{
+                            .wait_group = c.w,
+                            .backpressure = .block,
+                        }) catch return;
+                    }
+                }
+            }.run, .{&sub_ctxs[s]});
+        }
+        for (threads) |t| t.join();
+    }
+
+    wg.wait();
+    const elapsed_ns = elapsedNsSince(start_ns);
+
+    const latencies = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(latencies);
+    for (latencies, 0..) |*lat, i| {
+        lat.* = completed_at[i] -| submitted_at[i];
+    }
+
+    return latencyResult(elapsed_ns, latencies);
+}
+
+fn runNestedFanout4xSample(worker_count: usize) !SampleResult {
+    const parent_count: usize = 2_000;
+    const children_per_parent: usize = 4;
+    const total_tasks: usize = parent_count + parent_count * children_per_parent;
+
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .min_threads = worker_count,
+        .max_threads = worker_count,
+        .queue_capacity = 8192,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var parent_submitted = try std.heap.smp_allocator.alloc(u64, parent_count);
+    defer std.heap.smp_allocator.free(parent_submitted);
+    var parent_completed = try std.heap.smp_allocator.alloc(u64, parent_count);
+    defer std.heap.smp_allocator.free(parent_completed);
+    @memset(parent_completed, 0);
+
+    var child_submitted = try std.heap.smp_allocator.alloc(u64, parent_count * children_per_parent);
+    defer std.heap.smp_allocator.free(child_submitted);
+    @memset(child_submitted, 0);
+    var child_completed = try std.heap.smp_allocator.alloc(u64, parent_count * children_per_parent);
+    defer std.heap.smp_allocator.free(child_completed);
+    @memset(child_completed, 0);
+
+    const child_ctxs = try std.heap.smp_allocator.alloc(RealisticTaskCtx, parent_count * children_per_parent);
+    defer std.heap.smp_allocator.free(child_ctxs);
+    for (child_ctxs, 0..) |*ctx, i| {
+        ctx.* = .{ .completed_at_ns = &child_completed[i], .work_ns = 0 };
+    }
+
+    const parent_ctxs = try std.heap.smp_allocator.alloc(NestedParentCtx, parent_count);
+    defer std.heap.smp_allocator.free(parent_ctxs);
+
+    var wg = pool.waitGroup();
+
+    for (parent_ctxs, 0..) |*ctx, i| {
+        const off = i * children_per_parent;
+        ctx.* = .{
+            .pool = &pool,
+            .wg = &wg,
+            .completed_at_ns = &parent_completed[i],
+            .child_ctxs = child_ctxs[off .. off + children_per_parent],
+            .child_submitted_at = child_submitted[off .. off + children_per_parent],
+        };
+    }
+
+    const start_ns = std.time.nanoTimestamp();
+
+    for (parent_ctxs, 0..) |*ctx, i| {
+        parent_submitted[i] = nowNs();
+        _ = try pool.submit(nestedParentTask, @ptrCast(ctx), .{
+            .wait_group = &wg,
+            .backpressure = .block,
+        });
+    }
+
+    wg.wait();
+    const elapsed_ns = elapsedNsSince(start_ns);
+
+    const latencies = try std.heap.smp_allocator.alloc(u64, total_tasks);
+    defer std.heap.smp_allocator.free(latencies);
+    for (0..parent_count) |i| {
+        latencies[i] = parent_completed[i] -| parent_submitted[i];
+    }
+    for (0..parent_count * children_per_parent) |i| {
+        latencies[parent_count + i] = child_completed[i] -| child_submitted[i];
+    }
+
+    return latencyResult(elapsed_ns, latencies);
+}
+
+fn runBurstDrainBurstSample(worker_count: usize) !SampleResult {
+    const task_count: usize = 4_000;
+    const work_ns: u64 = 50_000;
+    const half = task_count / 2;
+
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .min_threads = worker_count,
+        .max_threads = worker_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var submitted_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(submitted_at);
+    var completed_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(completed_at);
+    @memset(completed_at, 0);
+    const burst_ctxs = try std.heap.smp_allocator.alloc(RealisticTaskCtx, task_count);
+    defer std.heap.smp_allocator.free(burst_ctxs);
+    for (burst_ctxs, 0..) |*ctx, i| {
+        ctx.* = .{ .completed_at_ns = &completed_at[i], .work_ns = work_ns };
+    }
+
+    const start_ns = std.time.nanoTimestamp();
+
+    // First burst
+    {
+        var wg = pool.waitGroup();
+        for (burst_ctxs[0..half], 0..) |*ctx, i| {
+            submitted_at[i] = nowNs();
+            _ = try pool.submit(realisticTask, @ptrCast(ctx), .{
+                .wait_group = &wg,
+                .backpressure = .block,
+            });
+        }
+        wg.wait();
+    }
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Second burst
+    {
+        var wg = pool.waitGroup();
+        for (burst_ctxs[half..], 0..) |*ctx, i| {
+            submitted_at[half + i] = nowNs();
+            _ = try pool.submit(realisticTask, @ptrCast(ctx), .{
+                .wait_group = &wg,
+                .backpressure = .block,
+            });
+        }
+        wg.wait();
+    }
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    const elapsed_ns = elapsedNsSince(start_ns);
+
+    const latencies = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(latencies);
+    for (latencies, 0..) |*lat, i| {
+        lat.* = completed_at[i] -| submitted_at[i];
+    }
+
+    return latencyResult(elapsed_ns, latencies);
+}
+
+fn runMixedFastSlowSample(worker_count: usize) !SampleResult {
+    const task_count: usize = 5_000;
+    const slow_ns: u64 = 1_000_000;
+
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .min_threads = worker_count,
+        .max_threads = worker_count,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var submitted_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(submitted_at);
+    var completed_at = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(completed_at);
+    @memset(completed_at, 0);
+    const mixed_ctxs = try std.heap.smp_allocator.alloc(RealisticTaskCtx, task_count);
+    defer std.heap.smp_allocator.free(mixed_ctxs);
+    for (mixed_ctxs, 0..) |*ctx, i| {
+        const is_slow = (i % 5) == 0;
+        ctx.* = .{
+            .completed_at_ns = &completed_at[i],
+            .work_ns = if (is_slow) slow_ns else 0,
+        };
+    }
+
+    var wg = pool.waitGroup();
+    const start_ns = std.time.nanoTimestamp();
+
+    for (mixed_ctxs, 0..) |*ctx, i| {
+        submitted_at[i] = nowNs();
+        _ = try pool.submit(realisticTask, @ptrCast(ctx), .{
+            .wait_group = &wg,
+            .backpressure = .block,
+        });
+    }
+
+    wg.wait();
+    const elapsed_ns = elapsedNsSince(start_ns);
+
+    const latencies = try std.heap.smp_allocator.alloc(u64, task_count);
+    defer std.heap.smp_allocator.free(latencies);
+    for (latencies, 0..) |*lat, i| {
+        lat.* = completed_at[i] -| submitted_at[i];
+    }
+
+    return latencyResult(elapsed_ns, latencies);
+}
+
+// --- Helpers ---
+
+fn busyWork(ns: u64) void {
+    const start = nowNs();
+    while (true) {
+        const now = nowNs();
+        if (now -| start >= ns) break;
+    }
+}
+
+fn latencyResult(elapsed_ns: u64, latencies: []u64) SampleResult {
+    std.sort.heap(u64, latencies, {}, comptime std.sort.asc(u64));
+    const n = latencies.len;
+    if (n == 0) return .{ .elapsed_ns = elapsed_ns };
+    return .{
+        .elapsed_ns = elapsed_ns,
+        .latency_p50_us = latencies[n * 50 / 100] / 1000,
+        .latency_p95_us = latencies[@min(n * 95 / 100, n - 1)] / 1000,
+        .latency_p99_us = latencies[@min(n * 99 / 100, n - 1)] / 1000,
+    };
+}
+
 fn elapsedNsSince(start_ns: i128) u64 {
     const end_ns = std.time.nanoTimestamp();
     const delta = end_ns - start_ns;
     return if (delta <= 0) 0 else @as(u64, @intCast(delta));
+}
+
+fn nowNs() u64 {
+    const ts = std.time.nanoTimestamp();
+    return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 
 fn gitSha(allocator: std.mem.Allocator) ![]const u8 {
