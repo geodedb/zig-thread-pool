@@ -1,13 +1,12 @@
 const std = @import("std");
 const common = @import("common.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(allocator);
 
     var baseline_path: ?[]const u8 = null;
     var current_path: ?[]const u8 = null;
@@ -21,8 +20,8 @@ pub fn main() !void {
         return error.InvalidArguments;
     }
 
-    const baseline_doc = try readDocument(allocator, baseline_path.?);
-    const current_doc = try readDocument(allocator, current_path.?);
+    const baseline_doc = try readDocument(allocator, init.io, baseline_path.?);
+    const current_doc = try readDocument(allocator, init.io, current_path.?);
 
     var failures: usize = 0;
     for (current_doc.value.rows) |row| {
@@ -55,8 +54,8 @@ pub fn main() !void {
     if (failures != 0) return error.BenchmarkRegression;
 }
 
-fn readDocument(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(common.ResultDocument) {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+fn readDocument(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(common.ResultDocument) {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
     return std.json.parseFromSlice(common.ResultDocument, allocator, bytes, .{ .ignore_unknown_fields = true });
 }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const thread_pool = @import("thread_pool");
+const clock = thread_pool.clock;
 
 const flood_task_count: usize = 1_000_000;
 const contended_task_count: usize = 100_000;
@@ -66,18 +67,18 @@ const ContendedSubmitterCtx = struct {
     count: usize,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = try parseArgs(allocator);
+    const args = try parseArgs(allocator, init.minimal.args);
     if (args.warmup_discard >= args.samples) return error.InvalidArguments;
 
     const worker_count = @max(std.Thread.getCpuCount() catch 1, 1);
-    const source_commit = args.source_commit orelse try gitSha(allocator);
+    const source_commit = args.source_commit orelse try gitSha(allocator, init.io);
 
-    var rows = std.ArrayList(ScenarioRow){};
+    var rows: std.ArrayList(ScenarioRow) = .empty;
     defer rows.deinit(allocator);
 
     try rows.append(allocator, try measureScenario(
@@ -165,7 +166,7 @@ pub fn main() !void {
         .runtime_name = "zig_thread_pool",
         .runtime_version = args.runtime_version,
         .source_commit = source_commit,
-        .generated_at_unix_s = std.time.timestamp(),
+        .generated_at_unix_s = @as(i64, @intCast(@divTrunc(clock.nanoTimestamp(), std.time.ns_per_s))),
         .host_os = @tagName(builtin.os.tag),
         .host_arch = @tagName(builtin.cpu.arch),
         .rows = try rows.toOwnedSlice(allocator),
@@ -175,19 +176,20 @@ pub fn main() !void {
     defer allocator.free(json);
 
     if (args.output_path) |path| {
-        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(json);
-        try file.writeAll("\n");
+        var file = try std.Io.Dir.cwd().createFile(init.io, path, .{ .truncate = true });
+        defer file.close(init.io);
+        try file.writeStreamingAll(init.io, json);
+        try file.writeStreamingAll(init.io, "\n");
     } else {
-        try std.fs.File.stdout().writeAll(json);
-        try std.fs.File.stdout().writeAll("\n");
+        const stdout = std.Io.File.stdout();
+        try stdout.writeStreamingAll(init.io, json);
+        try stdout.writeStreamingAll(init.io, "\n");
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Args {
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !Args {
     var parsed = Args{};
-    const argv = try std.process.argsAlloc(allocator);
+    const argv = try args.toSlice(allocator);
 
     var idx: usize = 1;
     while (idx < argv.len) : (idx += 1) {
@@ -312,7 +314,7 @@ fn runFloodSample(worker_count: usize) !SampleResult {
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
     for (0..flood_task_count) |_| {
         _ = try pool.submit(noopTask, @ptrCast(&ctx), .{
             .wait_group = &wg,
@@ -341,7 +343,7 @@ fn runContendedSample(worker_count: usize) !SampleResult {
     var threads: [contended_submitters]std.Thread = undefined;
     var submitters: [contended_submitters]ContendedSubmitterCtx = undefined;
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
     for (0..contended_submitters) |idx| {
         submitters[idx] = .{
             .pool = &pool,
@@ -444,7 +446,7 @@ fn runCpuWorkScenario(worker_count: usize, task_count: usize, work_ns: u64, subm
     }
 
     var wg = pool.waitGroup();
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
 
     if (submitters <= 1) {
         for (task_ctxs, 0..) |*ctx, i| {
@@ -552,7 +554,7 @@ fn runNestedFanout4xSample(worker_count: usize) !SampleResult {
         };
     }
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
 
     for (parent_ctxs, 0..) |*ctx, i| {
         parent_submitted[i] = nowNs();
@@ -602,7 +604,7 @@ fn runBurstDrainBurstSample(worker_count: usize) !SampleResult {
         ctx.* = .{ .completed_at_ns = &completed_at[i], .work_ns = work_ns };
     }
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
 
     // First burst
     {
@@ -617,7 +619,7 @@ fn runBurstDrainBurstSample(worker_count: usize) !SampleResult {
         wg.wait();
     }
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    clock.sleep(10 * std.time.ns_per_ms);
 
     // Second burst
     {
@@ -632,7 +634,7 @@ fn runBurstDrainBurstSample(worker_count: usize) !SampleResult {
         wg.wait();
     }
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    clock.sleep(10 * std.time.ns_per_ms);
 
     const elapsed_ns = elapsedNsSince(start_ns);
 
@@ -674,7 +676,7 @@ fn runMixedFastSlowSample(worker_count: usize) !SampleResult {
     }
 
     var wg = pool.waitGroup();
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = clock.nanoTimestamp();
 
     for (mixed_ctxs, 0..) |*ctx, i| {
         submitted_at[i] = nowNs();
@@ -719,24 +721,28 @@ fn latencyResult(elapsed_ns: u64, latencies: []u64) SampleResult {
 }
 
 fn elapsedNsSince(start_ns: i128) u64 {
-    const end_ns = std.time.nanoTimestamp();
+    const end_ns: i128 = clock.nanoTimestamp();
     const delta = end_ns - start_ns;
     return if (delta <= 0) 0 else @as(u64, @intCast(delta));
 }
 
 fn nowNs() u64 {
-    const ts = std.time.nanoTimestamp();
+    const ts: i128 = clock.nanoTimestamp();
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 
-fn gitSha(allocator: std.mem.Allocator) ![]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+fn gitSha(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ "git", "rev-parse", "HEAD" },
-        .max_output_bytes = 128,
+        .stdout_limit = .limited(128),
+        .stderr_limit = .limited(512),
     }) catch return allocator.dupe(u8, "unknown");
     defer allocator.free(result.stderr);
-    if (result.term.Exited != 0) {
+    const exited = switch (result.term) {
+        .exited => |code| code,
+        else => 1,
+    };
+    if (exited != 0) {
         allocator.free(result.stdout);
         return allocator.dupe(u8, "unknown");
     }

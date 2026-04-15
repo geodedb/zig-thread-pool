@@ -2,12 +2,12 @@ const std = @import("std");
 const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const output = try common.parseOutputArg(allocator);
+    const output = try common.parseOutputArg(allocator, init.minimal.args);
     const specs = [_]common.ScenarioSpec{
         .{
             .name = "conn_churn_seq",
@@ -28,5 +28,5 @@ pub fn main() !void {
         },
     };
     const variants = [_]thread_pool.SchedulerVariant{ .global_queue, .work_stealing };
-    try common.runScenarios(allocator, &specs, &variants, output);
+    try common.runScenarios(allocator, init.io, &specs, &variants, output);
 }

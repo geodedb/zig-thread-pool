@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const thread_pool = @import("thread_pool");
+const clock = thread_pool.clock;
 
 pub const ScenarioSpec = struct {
     name: []const u8,
@@ -63,20 +64,15 @@ pub const Counter = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
-pub fn parseOutputArg(allocator: std.mem.Allocator) !?[]const u8 {
-    const args = try std.process.argsAlloc(allocator);
-    // Caller owns the args memory via the arena allocator -- no defer free here
-    // to avoid returning a dangling pointer into freed argv storage.
+pub fn parseOutputArg(allocator: std.mem.Allocator, args: std.process.Args) !?[]const u8 {
+    const argv = try args.toSlice(allocator);
     var idx: usize = 0;
-    while (idx + 1 < args.len) : (idx += 1) {
-        if (std.mem.eql(u8, args[idx], "--output")) {
-            const path = args[idx + 1];
-            // Dupe the path so callers using non-arena allocators are safe.
-            return try allocator.dupe(u8, path);
+    while (idx + 1 < argv.len) : (idx += 1) {
+        if (std.mem.eql(u8, argv[idx], "--output")) {
+            // Dupe so callers using non-arena allocators are safe.
+            return try allocator.dupe(u8, argv[idx + 1]);
         }
     }
-    // No --output flag found; free args since we have nothing to return.
-    std.process.argsFree(allocator, args);
     return null;
 }
 
@@ -99,8 +95,8 @@ const SubmitterCtx = struct {
     lane: thread_pool.TaskLane,
 };
 
-pub fn runScenarios(allocator: std.mem.Allocator, specs: []const ScenarioSpec, variants: []const thread_pool.SchedulerVariant, output_path: ?[]const u8) !void {
-    var rows = std.ArrayList(ResultRow){};
+pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const ScenarioSpec, variants: []const thread_pool.SchedulerVariant, output_path: ?[]const u8) !void {
+    var rows: std.ArrayList(ResultRow) = .empty;
     defer {
         for (rows.items) |row| {
             allocator.free(row.git_sha);
@@ -119,7 +115,7 @@ pub fn runScenarios(allocator: std.mem.Allocator, specs: []const ScenarioSpec, v
             const SAMPLE_COUNT: usize = RUN_COUNT - WARMUP_DISCARD; // 6
             var results: [RUN_COUNT]ResultRow = undefined;
             for (&results) |*r| {
-                r.* = try runScenario(allocator, spec, variant);
+                r.* = try runScenario(allocator, io, spec, variant);
             }
             // Free the discarded warm-up run's allocations.
             for (results[0..WARMUP_DISCARD]) |r| {
@@ -156,27 +152,28 @@ pub fn runScenarios(allocator: std.mem.Allocator, specs: []const ScenarioSpec, v
     }
 
     const document = ResultDocument{
-        .generated_at_unix_s = std.time.timestamp(),
+        .generated_at_unix_s = @as(i64, @intCast(@divTrunc(clock.nanoTimestamp(), std.time.ns_per_s))),
         .rows = try rows.toOwnedSlice(allocator),
     };
     defer allocator.free(document.rows);
 
     if (output_path) |path| {
-        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
         const json = try std.json.Stringify.valueAlloc(allocator, document, .{ .whitespace = .indent_2 });
         defer allocator.free(json);
-        try file.writeAll(json);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(io, json);
+        try file.writeStreamingAll(io, "\n");
     } else {
         const json = try std.json.Stringify.valueAlloc(allocator, document, .{ .whitespace = .indent_2 });
         defer allocator.free(json);
-        try std.fs.File.stdout().writeAll(json);
-        try std.fs.File.stdout().writeAll("\n");
+        const stdout = std.Io.File.stdout();
+        try stdout.writeStreamingAll(io, json);
+        try stdout.writeStreamingAll(io, "\n");
     }
 }
 
-pub fn runScenario(allocator: std.mem.Allocator, spec: ScenarioSpec, variant: thread_pool.SchedulerVariant) !ResultRow {
+pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec, variant: thread_pool.SchedulerVariant) !ResultRow {
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = spec.worker_count,
         .max_threads = spec.worker_count,
@@ -221,9 +218,9 @@ pub fn runScenario(allocator: std.mem.Allocator, spec: ScenarioSpec, variant: th
 
     if (spec.idle_gap_ns != 0) {
         try submitRange(allocator, &pool, tasks[0 .. spec.task_count / 2], submit_latencies_ns[0 .. spec.task_count / 2], spec.submitter_count, spec.lane);
-        std.Thread.sleep(spec.idle_gap_ns);
+        clock.sleep(spec.idle_gap_ns);
         try submitRange(allocator, &pool, tasks[spec.task_count / 2 ..], submit_latencies_ns[spec.task_count / 2 ..], spec.submitter_count, spec.lane);
-        std.Thread.sleep(spec.idle_gap_ns);
+        clock.sleep(spec.idle_gap_ns);
     } else {
         try submitRange(allocator, &pool, tasks, submit_latencies_ns, spec.submitter_count, spec.lane);
     }
@@ -244,14 +241,14 @@ pub fn runScenario(allocator: std.mem.Allocator, spec: ScenarioSpec, variant: th
     const completion_summary = summarizeLatencies(completion_latencies);
 
     const throughput = @as(f64, @floatFromInt(spec.task_count)) / (@as(f64, @floatFromInt(wall_end - wall_start)) / std.time.ns_per_s);
-    const git_sha = try gitSha(allocator);
+    const git_sha = try gitSha(allocator, io);
     const cpu_name = try allocator.dupe(u8, @tagName(builtin.cpu.arch));
 
     const cpu_time_ns = if (cpu_after > cpu_before) cpu_after - cpu_before else wall_end - wall_start;
 
     return .{
         .git_sha = git_sha,
-        .run_timestamp_unix_s = std.time.timestamp(),
+        .run_timestamp_unix_s = @as(i64, @intCast(@divTrunc(clock.nanoTimestamp(), std.time.ns_per_s))),
         .zig_version = builtin.zig_version_string,
         .os = @tagName(builtin.os.tag),
         .arch = @tagName(builtin.cpu.arch),
@@ -376,7 +373,7 @@ fn benchTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
         _ = runtime.allocScratch(u8, ctx.scratch_bytes) catch {};
     }
     if (ctx.sleep_ns != 0) {
-        std.Thread.sleep(ctx.sleep_ns);
+        clock.sleep(ctx.sleep_ns);
     }
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
     ctx.completed_at_ns.* = nowNs();
@@ -445,14 +442,18 @@ fn percentile(values: []const u64, pct: u8) u64 {
     return values[idx];
 }
 
-fn gitSha(allocator: std.mem.Allocator) ![]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+fn gitSha(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ "git", "rev-parse", "HEAD" },
-        .max_output_bytes = 128,
+        .stdout_limit = .limited(128),
+        .stderr_limit = .limited(512),
     }) catch return allocator.dupe(u8, "unknown");
     defer allocator.free(result.stderr);
-    if (result.term.Exited != 0) {
+    const exited = switch (result.term) {
+        .exited => |code| code,
+        else => 1,
+    };
+    if (exited != 0) {
         allocator.free(result.stdout);
         return allocator.dupe(u8, "unknown");
     }
@@ -462,11 +463,17 @@ fn gitSha(allocator: std.mem.Allocator) ![]const u8 {
 
 fn processCpuTimeNs() !u64 {
     if (builtin.os.tag == .linux) {
-        var file = try std.fs.openFileAbsolute("/proc/self/stat", .{});
-        defer file.close();
+        const posix = std.posix;
+        const fd = try posix.openat(posix.AT.FDCWD, "/proc/self/stat", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        defer _ = std.os.linux.close(fd);
         var buffer: [4096]u8 = undefined;
-        const len = try file.readAll(&buffer);
-        const contents = buffer[0..len];
+        var total: usize = 0;
+        while (total < buffer.len) {
+            const n = try posix.read(fd, buffer[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        const contents = buffer[0..total];
         var it = std.mem.tokenizeScalar(u8, contents, ' ');
         var field_index: usize = 1;
         var utime_ticks: u64 = 0;
@@ -484,7 +491,7 @@ fn processCpuTimeNs() !u64 {
 }
 
 fn nowNs() u64 {
-    const ts = std.time.nanoTimestamp();
+    const ts = clock.nanoTimestamp();
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 
@@ -521,11 +528,17 @@ pub fn cpuSocketId(cpu_id: u32) !u32 {
     if (builtin.os.tag != .linux) return error.Unsupported;
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu_id}) catch return error.SocketIdUnavailable;
-    var file = std.fs.openFileAbsolute(path, .{}) catch return error.SocketIdUnavailable;
-    defer file.close();
+    const posix = std.posix;
+    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return error.SocketIdUnavailable;
+    defer _ = std.os.linux.close(fd);
     var read_buf: [32]u8 = undefined;
-    const len = file.readAll(&read_buf) catch return error.SocketIdUnavailable;
-    const trimmed = std.mem.trim(u8, read_buf[0..len], " \r\n\t");
+    var total: usize = 0;
+    while (total < read_buf.len) {
+        const n = posix.read(fd, read_buf[total..]) catch return error.SocketIdUnavailable;
+        if (n == 0) break;
+        total += n;
+    }
+    const trimmed = std.mem.trim(u8, read_buf[0..total], " \r\n\t");
     return std.fmt.parseInt(u32, trimmed, 10) catch error.SocketIdUnavailable;
 }
 
@@ -533,7 +546,7 @@ pub fn cpuSocketId(cpu_id: u32) !u32 {
 /// Returns an empty slice if no CPUs match (e.g. socket id not present).
 pub fn cpusInSocket(allocator: std.mem.Allocator, socket_id: u32) ![]u32 {
     if (builtin.os.tag != .linux) return error.Unsupported;
-    var list = std.ArrayList(u32){};
+    var list: std.ArrayList(u32) = .empty;
     errdefer list.deinit(allocator);
     var miss_streak: u32 = 0;
     var cpu: u32 = 0;

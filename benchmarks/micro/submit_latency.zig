@@ -5,6 +5,7 @@
 //! and records the time for each submit() call.
 const std = @import("std");
 const thread_pool = @import("thread_pool");
+const clock = thread_pool.clock;
 
 const sample_count = 100_000;
 const warmup = 10_000;
@@ -15,7 +16,7 @@ fn sleepyTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     // Workers never actually consume this — we rely on queue depth not runtime.
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -41,9 +42,9 @@ pub fn main() !void {
 
     // Measure.
     for (0..sample_count) |i| {
-        const start = std.time.nanoTimestamp();
+        const start = clock.nanoTimestamp();
         _ = try pool.submit(sleepyTask, @ptrCast(&marker), .{});
-        const end = std.time.nanoTimestamp();
+        const end = clock.nanoTimestamp();
         samples[i] = @intCast(end - start);
     }
 
@@ -61,5 +62,5 @@ pub fn main() !void {
         "submit_latency samples={d} min={d}ns p50={d}ns p95={d}ns p99={d}ns max={d}ns\n",
         .{ sample_count, min, p50, p95, p99, max },
     );
-    try std.fs.File.stdout().writeAll(line);
+    try std.Io.File.stdout().writeStreamingAll(init.io, line);
 }

@@ -1,15 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const thread_pool = @import("thread_pool");
+const clock = thread_pool.clock;
 const common = @import("common.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    const output = try common.parseOutputArg(allocator);
+    const output = try common.parseOutputArg(allocator, init.minimal.args);
     const workers = @max(@min(cpu_count, 16), 4);
 
     const specs = [_]common.ScenarioSpec{
@@ -65,7 +66,7 @@ pub fn main() !void {
     };
     const variants = [_]thread_pool.SchedulerVariant{.work_stealing};
 
-    try common.runScenarios(allocator, &specs, &variants, output);
+    try common.runScenarios(allocator, init.io, &specs, &variants, output);
 
     try runMixedWorkload(allocator, workers, output);
     try runLaneIsolation(allocator, workers, output);
@@ -117,7 +118,7 @@ fn runMixedWorkload(allocator: std.mem.Allocator, workers: usize, output_path: ?
             _ = runtime;
             const ctx: *TaskCtx = @ptrCast(@alignCast(raw_ctx));
             if (ctx.is_slow) {
-                std.Thread.sleep(1_000_000);
+                clock.sleep(1_000_000);
             }
             _ = ctx.counter.value.fetchAdd(1, .monotonic);
             ctx.completed_at_ns.* = nowNs();
@@ -136,9 +137,9 @@ fn runMixedWorkload(allocator: std.mem.Allocator, workers: usize, output_path: ?
     wg.wait();
     const wall_end = nowNs();
 
-    var fast_latencies = std.ArrayList(u64){};
+    var fast_latencies: std.ArrayList(u64) = .empty;
     defer fast_latencies.deinit(allocator);
-    var slow_latencies = std.ArrayList(u64){};
+    var slow_latencies: std.ArrayList(u64) = .empty;
     defer slow_latencies.deinit(allocator);
 
     for (task_ctxs, 0..) |ctx, i| {
@@ -235,7 +236,7 @@ fn runLaneIsolation(allocator: std.mem.Allocator, workers: usize, output_path: ?
         fn run(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
             _ = runtime;
             const ctx: *LaneCtx = @ptrCast(@alignCast(raw_ctx));
-            std.Thread.sleep(5_000_000);
+            clock.sleep(5_000_000);
             _ = ctx.counter.value.fetchAdd(1, .monotonic);
             ctx.completed_at_ns.* = nowNs();
         }
@@ -307,6 +308,6 @@ fn runLaneIsolation(allocator: std.mem.Allocator, workers: usize, output_path: ?
 }
 
 fn nowNs() u64 {
-    const ts = std.time.nanoTimestamp();
+    const ts = clock.nanoTimestamp();
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }

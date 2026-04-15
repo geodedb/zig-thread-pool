@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const thread_pool = @import("thread_pool");
+const clock = thread_pool.clock;
 const common = @import("common.zig");
 
 const flood_count: usize = 1_000_000;
@@ -29,9 +30,13 @@ fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = ctx.marker.fetchAdd(1, .monotonic);
 }
 
+fn writeLine(io: std.Io, line: []const u8) !void {
+    try std.Io.File.stdout().writeStreamingAll(io, line);
+}
+
 // === Scenario: flood_1m ===
 // Single submitter pushes 1M trivial tasks. Measures pure throughput.
-fn benchFlood(out_writer: anytype) !void {
+fn benchFlood(io: std.Io) !void {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .max_threads = 0, // CPU count
         .queue_capacity = 4096,
@@ -42,7 +47,7 @@ fn benchFlood(out_writer: anytype) !void {
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
-    const start = std.time.nanoTimestamp();
+    const start = clock.nanoTimestamp();
     for (0..flood_count) |_| {
         _ = try pool.submit(noopTask, @ptrCast(&ctx), .{
             .wait_group = &wg,
@@ -50,14 +55,14 @@ fn benchFlood(out_writer: anytype) !void {
         });
     }
     wg.wait();
-    const end = std.time.nanoTimestamp();
+    const end = clock.nanoTimestamp();
 
     const elapsed_ns: u64 = @intCast(end - start);
     const ops_per_sec = @as(f64, @floatFromInt(flood_count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
 
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=flood_1m tasks={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ flood_count, elapsed_ns, ops_per_sec });
-    try out_writer.writeAll(line);
+    try writeLine(io, line);
 }
 
 // === Scenario: flood_1m_batched ===
@@ -67,7 +72,7 @@ fn benchFlood(out_writer: anytype) !void {
 // the 2026-04-14 ceiling A/B as the flood_1m bottleneck.
 const flood_batch_size: usize = 64;
 
-fn benchFloodBatched(out_writer: anytype) !void {
+fn benchFloodBatched(io: std.Io) !void {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .max_threads = 0,
         .queue_capacity = 4096,
@@ -83,7 +88,7 @@ fn benchFloodBatched(out_writer: anytype) !void {
         b.* = .{ .task_fn = noopTask, .ctx = @ptrCast(&ctx) };
     }
 
-    const start = std.time.nanoTimestamp();
+    const start = clock.nanoTimestamp();
     var submitted_total: usize = 0;
     while (submitted_total < flood_count) {
         const remaining = flood_count - submitted_total;
@@ -95,14 +100,14 @@ fn benchFloodBatched(out_writer: anytype) !void {
         submitted_total += result.submitted;
     }
     wg.wait();
-    const end = std.time.nanoTimestamp();
+    const end = clock.nanoTimestamp();
 
     const elapsed_ns: u64 = @intCast(end - start);
     const ops_per_sec = @as(f64, @floatFromInt(flood_count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
 
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=flood_1m_batched tasks={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ flood_count, flood_batch_size, elapsed_ns, ops_per_sec });
-    try out_writer.writeAll(line);
+    try writeLine(io, line);
 }
 
 // === Scenario: contended_spawn_8x ===
@@ -124,7 +129,7 @@ fn contendedSubmitterThread(ctx: *ContendedSubmitterCtx) void {
     }
 }
 
-fn benchContended(out_writer: anytype) !void {
+fn benchContended(io: std.Io) !void {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .max_threads = 0,
         .queue_capacity = 4096,
@@ -140,7 +145,7 @@ fn benchContended(out_writer: anytype) !void {
     var threads: [contended_submitters]std.Thread = undefined;
     var submitter_ctxs: [contended_submitters]ContendedSubmitterCtx = undefined;
 
-    const start = std.time.nanoTimestamp();
+    const start = clock.nanoTimestamp();
     for (0..contended_submitters) |i| {
         submitter_ctxs[i] = .{
             .pool = &pool,
@@ -152,7 +157,7 @@ fn benchContended(out_writer: anytype) !void {
     }
     for (&threads) |*t| t.join();
     wg.wait();
-    const end = std.time.nanoTimestamp();
+    const end = clock.nanoTimestamp();
 
     const elapsed_ns: u64 = @intCast(end - start);
     const total_tasks = per_submitter * contended_submitters;
@@ -160,7 +165,7 @@ fn benchContended(out_writer: anytype) !void {
 
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=contended_spawn_8x tasks={d} submitters={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ total_tasks, contended_submitters, elapsed_ns, ops_per_sec });
-    try out_writer.writeAll(line);
+    try writeLine(io, line);
 }
 
 // === Scenario: contended_spawn_8x_batched ===
@@ -202,7 +207,7 @@ fn contendedBatchedSubmitterThread(ctx: *ContendedBatchedSubmitterCtx) void {
 /// null (no pinning — the existing baseline) or an 8-element array with the
 /// target cpu id per submitter.
 fn benchContendedBatchedCore(
-    out_writer: anytype,
+    io: std.Io,
     scenario_label: []const u8,
     pin_cpus: ?[contended_submitters]u32,
 ) !void {
@@ -221,7 +226,7 @@ fn benchContendedBatchedCore(
     var threads: [contended_submitters]std.Thread = undefined;
     var submitter_ctxs: [contended_submitters]ContendedBatchedSubmitterCtx = undefined;
 
-    const start = std.time.nanoTimestamp();
+    const start = clock.nanoTimestamp();
     for (0..contended_submitters) |i| {
         submitter_ctxs[i] = .{
             .pool = &pool,
@@ -234,7 +239,7 @@ fn benchContendedBatchedCore(
     }
     for (&threads) |*t| t.join();
     wg.wait();
-    const end = std.time.nanoTimestamp();
+    const end = clock.nanoTimestamp();
 
     const elapsed_ns: u64 = @intCast(end - start);
     const total_tasks = per_submitter * contended_submitters;
@@ -242,11 +247,11 @@ fn benchContendedBatchedCore(
 
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario={s} tasks={d} submitters={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ scenario_label, total_tasks, contended_submitters, flood_batch_size, elapsed_ns, ops_per_sec });
-    try out_writer.writeAll(line);
+    try writeLine(io, line);
 }
 
-fn benchContendedBatched(out_writer: anytype) !void {
-    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched", null);
+fn benchContendedBatched(io: std.Io) !void {
+    try benchContendedBatchedCore(io, "contended_spawn_8x_batched", null);
 }
 
 // === Pinned variants (Slice 0) ===========================================
@@ -284,9 +289,9 @@ fn pickCpu(list: []const u32, idx: usize) u32 {
     return list[idx % list.len];
 }
 
-fn benchContendedBatchedSymmetric(out_writer: anytype, map: SocketMap) !void {
+fn benchContendedBatchedSymmetric(io: std.Io, map: SocketMap) !void {
     if (map.s0.len == 0 or map.s1.len == 0) {
-        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_symmetric SKIPPED (need >=2 sockets)\n");
+        try writeLine(io, "tokio_parity scenario=contended_spawn_8x_batched_symmetric SKIPPED (need >=2 sockets)\n");
         return;
     }
     var pins: [contended_submitters]u32 = undefined;
@@ -299,36 +304,36 @@ fn benchContendedBatchedSymmetric(out_writer: anytype, map: SocketMap) !void {
     pins[5] = pickCpu(map.s1, 1);
     pins[6] = pickCpu(map.s1, 2);
     pins[7] = pickCpu(map.s1, 3);
-    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_symmetric", pins);
+    try benchContendedBatchedCore(io, "contended_spawn_8x_batched_symmetric", pins);
 }
 
-fn benchContendedBatchedAsymmetric(out_writer: anytype, map: SocketMap) !void {
+fn benchContendedBatchedAsymmetric(io: std.Io, map: SocketMap) !void {
     if (map.s0.len < contended_submitters) {
-        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_asymmetric SKIPPED (socket 0 has too few cpus)\n");
+        try writeLine(io, "tokio_parity scenario=contended_spawn_8x_batched_asymmetric SKIPPED (socket 0 has too few cpus)\n");
         return;
     }
     var pins: [contended_submitters]u32 = undefined;
     for (0..contended_submitters) |i| pins[i] = pickCpu(map.s0, i);
-    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_asymmetric", pins);
+    try benchContendedBatchedCore(io, "contended_spawn_8x_batched_asymmetric", pins);
 }
 
-fn benchContendedBatchedCrosssocket(out_writer: anytype, map: SocketMap) !void {
+fn benchContendedBatchedCrosssocket(io: std.Io, map: SocketMap) !void {
     if (map.s1.len < contended_submitters) {
-        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_crosssocket SKIPPED (socket 1 has too few cpus)\n");
+        try writeLine(io, "tokio_parity scenario=contended_spawn_8x_batched_crosssocket SKIPPED (socket 1 has too few cpus)\n");
         return;
     }
     var pins: [contended_submitters]u32 = undefined;
     for (0..contended_submitters) |i| pins[i] = pickCpu(map.s1, i);
-    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_crosssocket", pins);
+    try benchContendedBatchedCore(io, "contended_spawn_8x_batched_crosssocket", pins);
 }
 
 // === flood_1m_crosssocket =================================================
 // Single submitter pinned to socket 1.  Workers default (both sockets).
 // Isolates cross-socket inject cost from the multi-producer contention
 // overlay that benchContendedBatched scenarios introduce.
-fn benchFloodCrosssocket(out_writer: anytype, map: SocketMap) !void {
+fn benchFloodCrosssocket(io: std.Io, map: SocketMap) !void {
     if (map.s1.len == 0) {
-        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (no socket 1)\n");
+        try writeLine(io, "tokio_parity scenario=flood_1m_crosssocket SKIPPED (no socket 1)\n");
         return;
     }
 
@@ -344,19 +349,19 @@ fn benchFloodCrosssocket(out_writer: anytype, map: SocketMap) !void {
     defer pool.deinit();
 
     const saved = common.getCurrentAffinity() catch {
-        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (affinity save failed)\n");
+        try writeLine(io, "tokio_parity scenario=flood_1m_crosssocket SKIPPED (affinity save failed)\n");
         return;
     };
     defer common.setAffinity(&saved) catch {};
 
     common.pinCurrentThreadToCpu(map.s1[0]) catch {
-        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (pin failed)\n");
+        try writeLine(io, "tokio_parity scenario=flood_1m_crosssocket SKIPPED (pin failed)\n");
         return;
     };
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
-    const start = std.time.nanoTimestamp();
+    const start = clock.nanoTimestamp();
     for (0..flood_count) |_| {
         _ = try pool.submit(noopTask, @ptrCast(&ctx), .{
             .wait_group = &wg,
@@ -364,23 +369,23 @@ fn benchFloodCrosssocket(out_writer: anytype, map: SocketMap) !void {
         });
     }
     wg.wait();
-    const end = std.time.nanoTimestamp();
+    const end = clock.nanoTimestamp();
 
     const elapsed_ns: u64 = @intCast(end - start);
     const ops_per_sec = @as(f64, @floatFromInt(flood_count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
 
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=flood_1m_crosssocket tasks={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ flood_count, elapsed_ns, ops_per_sec });
-    try out_writer.writeAll(line);
+    try writeLine(io, line);
 }
 
-pub fn main() !void {
-    const stdout = std.fs.File.stdout();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
 
-    try benchFlood(stdout);
-    try benchFloodBatched(stdout);
-    try benchContended(stdout);
-    try benchContendedBatched(stdout);
+    try benchFlood(io);
+    try benchFloodBatched(io);
+    try benchContended(io);
+    try benchContendedBatched(io);
 
     // Pinned variants require socket topology.  On non-Linux / single-socket
     // hosts the discoverSocketMap call may error or produce empty slices;
@@ -389,14 +394,14 @@ pub fn main() !void {
         var map = discoverSocketMap(std.heap.smp_allocator) catch null;
         if (map) |*m| {
             defer m.deinit();
-            try benchFloodCrosssocket(stdout, m.*);
-            try benchContendedBatchedSymmetric(stdout, m.*);
-            try benchContendedBatchedAsymmetric(stdout, m.*);
-            try benchContendedBatchedCrosssocket(stdout, m.*);
+            try benchFloodCrosssocket(io, m.*);
+            try benchContendedBatchedSymmetric(io, m.*);
+            try benchContendedBatchedAsymmetric(io, m.*);
+            try benchContendedBatchedCrosssocket(io, m.*);
         } else {
-            try stdout.writeAll("tokio_parity pinned-variants SKIPPED (socket discovery failed)\n");
+            try writeLine(io, "tokio_parity pinned-variants SKIPPED (socket discovery failed)\n");
         }
     } else {
-        try stdout.writeAll("tokio_parity pinned-variants SKIPPED (non-Linux)\n");
+        try writeLine(io, "tokio_parity pinned-variants SKIPPED (non-Linux)\n");
     }
 }
