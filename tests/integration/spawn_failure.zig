@@ -14,9 +14,11 @@ const thread_pool = @import("thread_pool");
 
 test "F-002: partial init failure does not UAF or leak" {
     // Iterate over a range of failure-injection indices; one or more of these
-    // will land between worker spawns and exercise the F-002 path.
+    // will land between worker spawns and exercise the F-002 path. Step of 1
+    // so no candidate index is skipped — spawn-failure landing is
+    // timing-sensitive and halving coverage could mask a regression.
     var n: usize = 10;
-    while (n < 80) : (n += 2) {
+    while (n < 80) : (n += 1) {
         var backing = std.heap.DebugAllocator(.{}){};
         defer {
             const leak_check = backing.deinit();

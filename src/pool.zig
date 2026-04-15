@@ -487,6 +487,12 @@ const Core = struct {
         // Spawn-aware cleanup: if a later spawn fails, tell already-spawned
         // workers to exit and join them before the outer errdefer runs
         // deinitOwned and frees their backing arrays (F-002).
+        //
+        // No drain is required before signalling exit: Core.init has not
+        // yet returned, so no caller can have submitted a task. Workers'
+        // shouldExit() predicate requires totalQueuedTasks() == 0, which
+        // holds here. If Core.init is ever extended to submit an internal
+        // warmup task, this errdefer must be revisited to drain first.
         var spawned_workers: usize = 0;
         errdefer {
             if (spawned_workers > 0) {
@@ -512,11 +518,13 @@ const Core = struct {
 
         if (normalized.watchdog_interval_ns > 0) {
             errdefer {
-                // Workers are already signalled by the outer errdefer if
-                // this watchdog spawn fails. Just stop and join the watchdog
-                // if it was already set (it won't be — this is its own spawn
-                // — but defensively check). The workers errdefer above handles
-                // the worker-side cleanup regardless.
+                // Defensive placeholder: if Core.init is ever extended with a
+                // fallible step AFTER the watchdog spawn, this errdefer will
+                // stop and join the watchdog before deinitOwned runs. As of
+                // F-002, the watchdog spawn is the final fallible step in
+                // init, so this body is currently unreachable — but the
+                // structure is kept so the next maintainer does not have to
+                // rediscover the need when adding a post-watchdog step.
                 if (self.watchdog_thread) |t| {
                     self.watchdog_stop.store(true, .release);
                     t.join();
