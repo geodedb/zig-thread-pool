@@ -4,7 +4,11 @@
 **Target hotspot:** `BoundedRing.popMany` at 16.64% worker self-time;
 13.43% pure atomic loads on `inject_queue.head` and per-slot
 `sequence` cachelines (v2 profile 2026-04-14).
-**Status:** DESIGN — no code yet. Implementation gated on review.
+**Status:** CLOSED 2026-04-15 — implementation passed unit tests
+but SIGSEGV'd in `test-stress` `phase h: double-dequeue race
+reproducer` at ~15% rate (2/13 ReleaseFast runs). Same failure
+signature as Option D's blocked reorder. See "Failure mode" at
+bottom of this doc.
 
 ## Intent
 
@@ -315,3 +319,61 @@ Estimated diff: ~30 lines of code + struct field.
 If stress/A-B fails: revert the nextTask + notifySubmits changes
 (single commit), leave the struct field in place for a follow-up
 iteration. Update this doc with the failure mode.
+
+## Failure mode (2026-04-15)
+
+Implemented per the spec. `zig build test` PASS. `zig build
+test-stress -Doptimize=ReleaseFast` crashed with **signal 11
+(SIGSEGV)** in `stress.double_dequeue_race.test.phase h:
+double-dequeue race reproducer` at a ~15% rate across 13 runs
+(2 failures, both in that single test; pre-change control was
+5/5 PASS). Failing seed example: `0x186b1479`.
+
+### Why the correctness proof missed it
+
+The spec's "No races with `cancelQueuedTasks`" section argued
+that ring operations already tolerate concurrent consumers and
+that shutdown is safe. That is true of the ring, but the SIGSEGV
+target is `double_dequeue_race` — a test that exercises the
+phase-H ghost-duplicate path where a descriptor can be emitted
+by multiple queue paths concurrently and must be filtered via
+the atomic `.queued → .running` transition in `runTask`. The
+design didn't reason about whether changing the *order* of inject
+drain vs bitmap-steal for non-hinted workers changes the duplicate
+emission rate or visibility window, and evidently it does.
+
+### Why the same symptom as Option D
+
+Option D was "popMany-after-bitmap-steal only" — the exact
+pattern this implementation applies to non-hinted workers (step
+4 before step 5). Any change that moves inject drain *after*
+bitmap-steal re-creates Option D's SIGSEGV signature. The design
+doc's brainstorm noted D was "blocked on understanding the
+SIGSEGV root cause" — Option C inherited that block the moment
+it made non-hinted workers drain-last.
+
+### Remaining paths forward
+
+1. **Hint-only, no fallback** — step 5 removed. Non-hinted
+   workers never touch inject. Loses forward-progress guarantee
+   under stale-hint quiescence; would need a replacement
+   quiescence safety net (e.g., hinted worker re-hints before
+   parking, or a periodic "any-worker-can-drain" tick). Not yet
+   designed.
+2. **Hint-only with pre-park drain** — non-hinted workers skip
+   inject in nextTask but drain it once before calling `park`.
+   Keeps quiescence safety, avoids bitmap-steal-then-drain
+   reorder. Would need new design doc.
+3. **Post-mortem on the SIGSEGV** — before any Option D / C
+   variant, instrument or `rr`-record the crash to learn whether
+   duplicates leak through `.queued → .running` or whether this
+   is a distinct use-after-free in the stealing/shutdown path.
+   Capturing a core dump + backtrace from the failing seed is
+   the prerequisite for all reorder-based attacks.
+
+### Reverted changes
+
+`src/pool.zig` working-tree changes discarded (never committed).
+The `drain_hint` field from the spec was NOT retained in-tree;
+the closed-out design doc stands on its own. A future iteration
+that re-opens this attack should re-derive from the design.
