@@ -937,12 +937,12 @@ const Core = struct {
         // handshake and shutdown's drain loop both still see 0 iff every
         // submitted item has been claimed (real) or discarded (duplicate).
         //
-        // Lane routing (Slice L1): the inject queue this worker drains is
-        // the one matching its `serves_lane`. Steal targets are restricted
-        // to same-lane workers via `laneMask`. Cross-lane steal is deferred
-        // to Slice L3 (dynamic rebalancing).
-        const lane_inject = self.laneInjectQueue(worker.serves_lane);
-        const lane_bits = self.laneMask(worker.serves_lane);
+        // Lane routing (Slice L1): the own-lane inject queue is drained first,
+        // with steal victims restricted to same-lane workers via `laneMask`.
+        // Slice L3 adds optional cross-lane fallback: an idle blocking worker
+        // helps the default lane (always on — purely additive capacity with no
+        // isolation concern), and a default worker can help the blocking lane
+        // when `cpu_helps_blocking` is opted in.
         const uses_local = self.config.scheduler_variant == .work_stealing or
             self.config.scheduler_variant == .lane_extension;
         if (uses_local) {
@@ -964,83 +964,124 @@ const Core = struct {
                 worker.owned_queue_len = 0;
                 self.markWorkerEmpty(worker_index);
             }
-
-            {
-                var buf: [32]QueueEntry = undefined;
-                const cap = @min(self.config.inject_batch_size, buf.len);
-                const n = lane_inject.popMany(buf[0..cap]);
-                if (n > 0) {
-                    const first = buf[0];
-                    const was_empty = worker.owned_queue_len == 0;
-                    var pushed_count: usize = 0;
-                    var i: usize = 1;
-                    while (i < n) : (i += 1) {
-                        if (!lq.tryPushBottom(buf[i])) {
-                            while (i < n) : (i += 1) {
-                                _ = lane_inject.tryPush(buf[i]);
-                            }
-                            break;
-                        }
-                        pushed_count += 1;
-                    }
-                    if (pushed_count > 0) {
-                        worker.owned_queue_len += pushed_count;
-                        if (was_empty) self.markWorkerNonEmpty(worker_index);
-                    }
-                    updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
-                    return first;
-                }
-            }
-
-            // Steal-peek bitmap: read ONE u64 instead of probing each
-            // victim's head/tail cachelines. Owner-side updates this
-            // mask only on 0↔1 transitions, so stealer-side reads rarely
-            // coincide with writer-side writes. Lane mask restricts
-            // steal victims to same-lane workers (Slice L1).
-            const self_bit: u64 = @as(u64, 1) << @intCast(worker_index);
-            var mask = self.workers_nonempty.load(.acquire) & lane_bits & ~self_bit;
-            while (mask != 0) {
-                const victim_index: usize = @ctz(mask);
-                mask &= mask - 1; // clear lowest set bit
-                var stolen: [32]QueueEntry = undefined;
-                const budget = @min(self.config.steal_batch_size, stolen.len);
-                const n = self.local_queues[victim_index].steal(stolen[0..budget]);
-                if (n > 0) {
-                    // Keep the first for ourselves, push the rest to our local deque.
-                    // No decrement here — runTask's CAS-success path decrements for
-                    // `first`; items pushed to lq will decrement when their eventual
-                    // runTask CAS succeeds (or be silently skipped if duplicate).
-                    const first = stolen[0];
-                    const was_empty = worker.owned_queue_len == 0;
-                    var pushed_count: usize = 0;
-                    for (stolen[1..n]) |entry| {
-                        if (!lq.tryPushBottom(entry)) {
-                            // Local deque full — put overflow on the lane's inject
-                            // queue so it isn't lost. Same lane only because the
-                            // victim is necessarily same-lane (laneMask gate above).
-                            _ = lane_inject.tryPush(entry);
-                        } else {
-                            pushed_count += 1;
-                        }
-                    }
-                    if (pushed_count > 0) {
-                        worker.owned_queue_len += pushed_count;
-                        if (was_empty) self.markWorkerNonEmpty(worker_index);
-                    }
-                    _ = worker.steals.fetchAdd(n, .release);
-                    updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
-                    return first;
-                }
-            }
-
-            _ = worker.steal_failures.fetchAdd(1, .release);
-            return null;
         }
 
-        // global_queue variant: no LIFO/local; drain the lane's inject queue.
-        if (lane_inject.pop()) |entry| {
+        // Try the worker's own lane first (L1 behavior).
+        if (self.tryDrainLaneForWorker(worker, worker_index, lq, worker.serves_lane, uses_local)) |entry| {
             return entry;
         }
+
+        // L3: cross-lane fallback when own lane is empty. Always recomputed
+        // per nextTask call — "returns to own lane as soon as new own-lane
+        // work arrives" semantic falls out of the always-try-own-lane-first
+        // ordering above. No sticky cross-lane affinity.
+        if (self.rebalanceLane(worker.serves_lane)) |other_lane| {
+            if (self.tryDrainLaneForWorker(worker, worker_index, lq, other_lane, uses_local)) |entry| {
+                return entry;
+            }
+        }
+
+        if (uses_local) {
+            _ = worker.steal_failures.fetchAdd(1, .release);
+        }
+        return null;
+    }
+
+    /// Returns the lane a worker should try as a fallback when its own lane
+    /// has no work, or null if cross-lane rebalancing is not allowed for
+    /// this worker. Blocking workers always help the default lane (isolation
+    /// is preserved because default-lane steal never targets blocking
+    /// workers). Default workers help the blocking lane only under the
+    /// explicit `cpu_helps_blocking` opt-in.
+    inline fn rebalanceLane(self: *const Core, worker_lane: types.TaskLane) ?types.TaskLane {
+        return switch (worker_lane) {
+            .blocking => if (self.config.blocking_workers > 0) types.TaskLane.default else null,
+            .default => if (self.config.cpu_helps_blocking) types.TaskLane.blocking else null,
+        };
+    }
+
+    /// Drain one task for `worker` from `lane`'s queues: pop the lane's
+    /// inject queue in a batch (spilling into the worker's local deque),
+    /// then steal from `lane`'s workers via the non-empty bitmap. Returns
+    /// the task to run, or null if `lane` is empty.
+    ///
+    /// Invariant: overflow from both pop paths goes back into `lane`'s
+    /// inject queue, never the other lane's. This keeps cross-lane steal
+    /// decisions lossless — a blocking worker rebalancing to the default
+    /// lane never contaminates `blocking_inject` with default tasks.
+    inline fn tryDrainLaneForWorker(
+        self: *Core,
+        worker: *Worker,
+        worker_index: usize,
+        lq: *LocalQueue,
+        lane: types.TaskLane,
+        uses_local: bool,
+    ) ?QueueEntry {
+        const lane_inject = self.laneInjectQueue(lane);
+        const lane_bits = self.laneMask(lane);
+
+        if (!uses_local) {
+            // global_queue: no LIFO/local; straight pop.
+            return lane_inject.pop();
+        }
+
+        {
+            var buf: [32]QueueEntry = undefined;
+            const cap = @min(self.config.inject_batch_size, buf.len);
+            const n = lane_inject.popMany(buf[0..cap]);
+            if (n > 0) {
+                const first = buf[0];
+                const was_empty = worker.owned_queue_len == 0;
+                var pushed_count: usize = 0;
+                var i: usize = 1;
+                while (i < n) : (i += 1) {
+                    if (!lq.tryPushBottom(buf[i])) {
+                        while (i < n) : (i += 1) {
+                            _ = lane_inject.tryPush(buf[i]);
+                        }
+                        break;
+                    }
+                    pushed_count += 1;
+                }
+                if (pushed_count > 0) {
+                    worker.owned_queue_len += pushed_count;
+                    if (was_empty) self.markWorkerNonEmpty(worker_index);
+                }
+                updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
+                return first;
+            }
+        }
+
+        // Steal-peek bitmap restricted to `lane`'s workers.
+        const self_bit: u64 = @as(u64, 1) << @intCast(worker_index);
+        var mask = self.workers_nonempty.load(.acquire) & lane_bits & ~self_bit;
+        while (mask != 0) {
+            const victim_index: usize = @ctz(mask);
+            mask &= mask - 1;
+            var stolen: [32]QueueEntry = undefined;
+            const budget = @min(self.config.steal_batch_size, stolen.len);
+            const n = self.local_queues[victim_index].steal(stolen[0..budget]);
+            if (n > 0) {
+                const first = stolen[0];
+                const was_empty = worker.owned_queue_len == 0;
+                var pushed_count: usize = 0;
+                for (stolen[1..n]) |entry| {
+                    if (!lq.tryPushBottom(entry)) {
+                        _ = lane_inject.tryPush(entry);
+                    } else {
+                        pushed_count += 1;
+                    }
+                }
+                if (pushed_count > 0) {
+                    worker.owned_queue_len += pushed_count;
+                    if (was_empty) self.markWorkerNonEmpty(worker_index);
+                }
+                _ = worker.steals.fetchAdd(n, .release);
+                updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
+                return first;
+            }
+        }
+
         return null;
     }
 

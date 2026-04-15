@@ -334,3 +334,115 @@ test "blocking_queue_capacity sized independently of queue_capacity" {
     // 5 blocking sleepers + 256 default counters = 261.
     try std.testing.expectEqual(@as(u64, 261), counter.value.load(.acquire));
 }
+test "blocking worker rebalances to default lane when blocking_inject is empty" {
+    // Slice L3: the blocking worker always helps the default lane when its own
+    // lane is idle. With a single default worker swamped by many default tasks,
+    // an idle blocking worker must pick up and execute default work.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .lane_extension,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // Submit only default-lane work. No blocking submissions — the blocking
+    // worker has no own-lane work and must rebalance to the default lane to
+    // finish the batch.
+    for (0..512) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 512), counter.value.load(.acquire));
+}
+
+test "cpu_helps_blocking opt-in lets default workers drain blocking lane" {
+    // Slice L3: with cpu_helps_blocking = true, a default worker will fall back
+    // to the blocking lane after finding its own lane empty. Use a single
+    // blocking worker with a long-sleeping task blocking it, and submit many
+    // fast blocking tasks — without CPU help they'd serialize behind the
+    // sleeper; with CPU help, default workers drain them in parallel.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 3,
+        .max_threads = 3,
+        .queue_capacity = 1024,
+        .blocking_queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .lane_extension,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .cpu_helps_blocking = true,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    // Wedge the blocking worker on a long sleep.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 200 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+
+    // Flood the blocking lane with fast work. Default workers must help drain.
+    for (0..128) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .lane = .blocking });
+    }
+
+    const start = std.time.nanoTimestamp();
+    wg.wait();
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+
+    try std.testing.expectEqual(@as(u64, 129), counter.value.load(.acquire));
+    // The 128 fast blocking tasks should complete in parallel with the sleeper,
+    // not serialized after it. Bound generously: 2x the sleeper (400ms) is
+    // still well under the ~25s it would take if every fast task queued
+    // behind the sleeper at 200ms each on a single blocking worker.
+    try std.testing.expect(elapsed_ns < 400 * std.time.ns_per_ms);
+}
+
+test "default workers ignore blocking lane without cpu_helps_blocking" {
+    // Slice L3: with cpu_helps_blocking = false (default), default workers must
+    // NOT touch the blocking lane. Verify that with the blocking worker wedged
+    // on a long task, queued blocking tasks wait for the blocking worker to
+    // free up rather than being picked up by default workers.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 3,
+        .max_threads = 3,
+        .queue_capacity = 1024,
+        .blocking_queue_capacity = 64,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .lane_extension,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        // cpu_helps_blocking defaults to false
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    // Short sleeper (50ms) to wedge the blocking worker briefly.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 50 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+
+    // A handful of fast blocking tasks queued behind the sleeper.
+    for (0..8) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .lane = .blocking });
+    }
+
+    // Default-lane work in parallel, should finish quickly.
+    for (0..256) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+
+    wg.wait();
+    // 1 sleeper + 8 blocking counters + 256 default counters = 265.
+    try std.testing.expectEqual(@as(u64, 265), counter.value.load(.acquire));
+}

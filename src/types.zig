@@ -152,6 +152,21 @@ pub const Config = struct {
     /// some deployments want the opposite invariant (force `.block` on
     /// default, `.return_error` on blocking).
     default_backpressure: ?BackpressurePolicy = null,
+    /// Slice L3 — when true, default-lane workers fall back to the
+    /// blocking inject queue (and steal from blocking workers' local
+    /// queues) when their own lane is idle. Off by default because it
+    /// violates the "CPU workers never touch blocking lane" isolation
+    /// invariant — a blocking task executed on a CPU worker blocks
+    /// that core from CPU work, and subsequent default-lane steals may
+    /// pick up blocking work from the CPU worker's local queue. Requires
+    /// `blocking_workers > 0` (a blocking lane must exist to help).
+    ///
+    /// Note: blocking-worker → default fallback is ALWAYS on (no config
+    /// knob). Idle blocking workers draining CPU backlog is always a
+    /// capacity win and does not violate any isolation invariant —
+    /// default work landing in a blocking worker's local queue cannot
+    /// be stolen by default workers (same-lane-only steal).
+    cpu_helps_blocking: bool = false,
     timestamp_mode: TimestampMode = .full,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
@@ -215,6 +230,8 @@ pub const Config = struct {
             return error.BlockingQueueCapacityWithoutLane;
         if (self.blocking_backpressure != null and self.blocking_workers == 0)
             return error.BlockingBackpressureWithoutLane;
+        if (self.cpu_helps_blocking and self.blocking_workers == 0)
+            return error.CpuHelpsBlockingWithoutLane;
     }
 };
 
@@ -424,6 +441,16 @@ test "Config validation rejects blocking_backpressure without blocking_workers" 
 test "Config normalized rounds blocking_queue_capacity to power of two" {
     const cfg = (Config{ .blocking_queue_capacity = 100 }).normalized();
     try std.testing.expectEqual(@as(usize, 128), cfg.blocking_queue_capacity);
+}
+
+test "Config validation rejects cpu_helps_blocking without blocking_workers" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .cpu_helps_blocking = true,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.CpuHelpsBlockingWithoutLane, cfg.validate());
 }
 
 test "WaitGroup blocks until count reaches zero" {
