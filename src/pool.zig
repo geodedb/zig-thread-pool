@@ -344,6 +344,16 @@ const Core = struct {
     workers: []Worker,
     local_queues: []LocalQueue,
     descriptors: []TaskDescriptor,
+    /// Singly-linked freelist of descriptor slots. Each slot stores the
+    /// index of the next free descriptor (or `0xFFFFFFFF` sentinel).
+    ///
+    /// The per-slot atomic is `.monotonic` because the `.acq_rel` /
+    /// `.acquire` on `free_top_tagged.cmpxchgWeak` establishes the
+    /// happens-before relationship that orders the freelist reads and
+    /// writes. No additional ordering on the per-slot load/store is
+    /// needed. Promoted to `std.atomic.Value(u32)` for F-003: on
+    /// weak-memory platforms (riscv, armv7) a plain `[]u32` access
+    /// between ABA-tagged CAS operations could tear.
     free_indices: []std.atomic.Value(u32),
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(QueueEntry),
