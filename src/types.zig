@@ -133,6 +133,25 @@ pub const Config = struct {
     /// Default 0 preserves pre-lane-extension behavior byte-for-byte.
     /// See `docs/superpowers/specs/2026-04-15-lane-extension-scheduler-design.md`.
     blocking_workers: u32 = 0,
+    /// Slice L2 — capacity of the blocking-lane inject queue. 0 means "use
+    /// `queue_capacity`" (L1 behavior). Rounded to power-of-two in
+    /// `normalized()`. Ignored when `blocking_workers == 0` (no blocking queue
+    /// is allocated in that case). Letting operators size the lanes
+    /// independently is the common reason to reach for L2 — a blocking lane
+    /// that holds 8 long sleepers needs far less capacity than the default
+    /// lane feeding thousands of CPU tasks.
+    blocking_queue_capacity: usize = 0,
+    /// Slice L2 — pool-wide override for blocking-lane backpressure policy.
+    /// `null` means "inherit the caller's `SubmitOptions.backpressure`"
+    /// (L1 behavior). Non-null forces the lane's submitters to use this
+    /// policy regardless of what the caller asked for. The common use:
+    /// force `.return_error` so an overloaded blocking lane cannot stall
+    /// request handlers that happen to submit via `.block`.
+    blocking_backpressure: ?BackpressurePolicy = null,
+    /// Slice L2 — same pattern for the default lane. Symmetry matters:
+    /// some deployments want the opposite invariant (force `.block` on
+    /// default, `.return_error` on blocking).
+    default_backpressure: ?BackpressurePolicy = null,
     timestamp_mode: TimestampMode = .full,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
@@ -162,6 +181,9 @@ pub const Config = struct {
         if (cfg.queue_capacity != 0) {
             cfg.queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.queue_capacity) catch cfg.queue_capacity;
         }
+        if (cfg.blocking_queue_capacity != 0) {
+            cfg.blocking_queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.blocking_queue_capacity) catch cfg.blocking_queue_capacity;
+        }
         cfg.steal_batch_size = std.math.clamp(cfg.steal_batch_size, 1, 32);
         if (cfg.queue_kind == .chase_lev) cfg.steal_batch_size = 1;
         if (cfg.wake_coalesce_batch > 1024) cfg.wake_coalesce_batch = 1024;
@@ -187,6 +209,12 @@ pub const Config = struct {
             return error.BlockingLaneWithoutFlag;
         if (self.allow_blocking_lane and self.blocking_workers == 0)
             return error.AllowBlockingLaneRequiresWorkers;
+        if (self.blocking_queue_capacity > std.math.maxInt(u32))
+            return error.InvalidBlockingQueueCapacity;
+        if (self.blocking_queue_capacity > 0 and self.blocking_workers == 0)
+            return error.BlockingQueueCapacityWithoutLane;
+        if (self.blocking_backpressure != null and self.blocking_workers == 0)
+            return error.BlockingBackpressureWithoutLane;
     }
 };
 
@@ -371,6 +399,31 @@ test "Config validation rejects allow_blocking_lane without workers" {
     };
     cfg = cfg.normalized();
     try std.testing.expectError(error.AllowBlockingLaneRequiresWorkers, cfg.validate());
+}
+
+test "Config validation rejects blocking_queue_capacity without blocking_workers" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .blocking_queue_capacity = 128,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.BlockingQueueCapacityWithoutLane, cfg.validate());
+}
+
+test "Config validation rejects blocking_backpressure without blocking_workers" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .blocking_backpressure = .return_error,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.BlockingBackpressureWithoutLane, cfg.validate());
+}
+
+test "Config normalized rounds blocking_queue_capacity to power of two" {
+    const cfg = (Config{ .blocking_queue_capacity = 100 }).normalized();
+    try std.testing.expectEqual(@as(usize, 128), cfg.blocking_queue_capacity);
 }
 
 test "WaitGroup blocks until count reaches zero" {

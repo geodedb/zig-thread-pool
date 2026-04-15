@@ -236,14 +236,22 @@ const Sync = struct {
     completion_mutex: std.Thread.Mutex = .{},
     completion_cond: std.Thread.Condition = .{},
     /// Backpressure primitives: blocked submitters (when queue/descriptor
-    /// pool is full) sleep on `backpressure_cond` rather than polling with
+    /// pool is full) sleep on a lane-scoped condvar rather than polling with
     /// a fixed-interval `Thread.sleep`. `releaseDescriptor` signals the
-    /// condvar when capacity becomes available. `backpressure_waiters` is
-    /// an atomic fast-path counter so the producer path can skip acquiring
-    /// `backpressure_mutex` entirely when nobody is blocked.
-    backpressure_mutex: std.Thread.Mutex = .{},
-    backpressure_cond: std.Thread.Condition = .{},
-    backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// condvars when capacity becomes available. `*_waiters` is an atomic
+    /// fast-path counter so the producer path can skip acquiring the mutex
+    /// entirely when nobody is blocked.
+    ///
+    /// Slice L2 splits the backpressure primitives per lane so a full
+    /// blocking queue cannot thundering-herd wake default-lane submitters,
+    /// and vice versa. When `blocking_workers == 0` the blocking primitives
+    /// are initialized but never touched.
+    default_backpressure_mutex: std.Thread.Mutex = .{},
+    default_backpressure_cond: std.Thread.Condition = .{},
+    default_backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    blocking_backpressure_mutex: std.Thread.Mutex = .{},
+    blocking_backpressure_cond: std.Thread.Condition = .{},
+    blocking_backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 /// Atomic counters tracking pool-wide task and worker events.
@@ -340,7 +348,10 @@ const Core = struct {
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
             .blocking_inject = if (normalized.blocking_workers > 0)
-                try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity)
+                try BoundedRing(QueueEntry).init(allocator, if (normalized.blocking_queue_capacity > 0)
+                    normalized.blocking_queue_capacity
+                else
+                    normalized.queue_capacity)
             else
                 null,
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
@@ -434,7 +445,8 @@ const Core = struct {
     pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !SubmitBatchResult {
         if (tasks.len == 0) return .{ .submitted = 0 };
 
-        const deadline = if (options.backpressure == .block_with_timeout and options.timeout_ns != null)
+        const effective = self.effectiveBackpressure(options);
+        const deadline = if (effective == .block_with_timeout and options.timeout_ns != null)
             nowNs() + options.timeout_ns.?
         else
             0;
@@ -454,7 +466,7 @@ const Core = struct {
                 i += 1;
             } else |err| switch (err) {
                 error.QueueFull, error.TaskPoolExhausted => {
-                    if (options.backpressure == .return_error) {
+                    if (effective == .return_error) {
                         if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
                         if (submitted == 0) return err;
                         return .{ .submitted = submitted };
@@ -468,7 +480,7 @@ const Core = struct {
                         self.notifySubmits(pending_notify, options.lane);
                         pending_notify = 0;
                     }
-                    self.waitForCapacity(deadline);
+                    self.waitForCapacity(deadline, options.lane);
                 },
                 error.BlockingLaneDisabled => {
                     // Config rejects this lane. Flush pending then propagate
@@ -530,11 +542,11 @@ const Core = struct {
             if (queued == 0 and active == 0) break;
             if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
 
-            // Wait on the backpressure condvar, which releaseDescriptor signals on
-            // every completion. Cap at 10ms so we re-check state even if a signal
-            // is lost. Reuse waitForCapacity to avoid code duplication and register
-            // as a waiter so releaseDescriptor takes the signal fast-path.
-            self.waitForCapacity(deadline);
+            // Wait on the default-lane backpressure condvar, which
+            // releaseDescriptor signals on every completion (both lanes are
+            // signaled, so either queue draining progresses the shutdown).
+            // Cap at 10ms so we re-check state even if a signal is lost.
+            self.waitForCapacity(deadline, .default);
         }
 
         self.joinAllWorkers();
@@ -551,10 +563,14 @@ const Core = struct {
         }
         // Wake any submitters blocked on backpressure so they observe the
         // state change and return error.ShutdownInProgress instead of
-        // sleeping forever.
-        self.sync.backpressure_mutex.lock();
-        self.sync.backpressure_cond.broadcast();
-        self.sync.backpressure_mutex.unlock();
+        // sleeping forever. Broadcast both lanes because either may have
+        // waiters parked on a full queue.
+        self.sync.default_backpressure_mutex.lock();
+        self.sync.default_backpressure_cond.broadcast();
+        self.sync.default_backpressure_mutex.unlock();
+        self.sync.blocking_backpressure_mutex.lock();
+        self.sync.blocking_backpressure_cond.broadcast();
+        self.sync.blocking_backpressure_mutex.unlock();
 
         // Join all threads
         for (self.workers) |*worker| {
@@ -566,15 +582,22 @@ const Core = struct {
         self.state.store(.stopped, .release);
     }
 
-    /// Wait for descriptor/queue capacity to free up, bounded by `deadline`
-    /// (absolute nanoseconds; 0 = no deadline). Cap each wait at 10ms so we
-    /// re-check state periodically even if a signal is missed.
-    fn waitForCapacity(self: *Core, deadline: u64) void {
-        _ = self.sync.backpressure_waiters.fetchAdd(1, .monotonic);
-        defer _ = self.sync.backpressure_waiters.fetchSub(1, .monotonic);
+    /// Wait for descriptor/queue capacity to free up on `lane`, bounded by
+    /// `deadline` (absolute nanoseconds; 0 = no deadline). Cap each wait at
+    /// 10ms so we re-check state periodically even if a signal is missed.
+    ///
+    /// Split per-lane (L2): a full blocking queue parks blocking-lane
+    /// submitters only, leaving default-lane submitters free to proceed.
+    fn waitForCapacity(self: *Core, deadline: u64, lane: types.TaskLane) void {
+        const waiters = self.backpressureWaiters(lane);
+        const mtx = self.backpressureMutex(lane);
+        const cond = self.backpressureCond(lane);
 
-        self.sync.backpressure_mutex.lock();
-        defer self.sync.backpressure_mutex.unlock();
+        _ = waiters.fetchAdd(1, .monotonic);
+        defer _ = waiters.fetchSub(1, .monotonic);
+
+        mtx.lock();
+        defer mtx.unlock();
 
         const wait_ns: u64 = if (deadline != 0) blk: {
             const now = nowNs();
@@ -582,8 +605,39 @@ const Core = struct {
         } else 10_000_000;
 
         if (wait_ns > 0) {
-            self.sync.backpressure_cond.timedWait(&self.sync.backpressure_mutex, wait_ns) catch {};
+            cond.timedWait(mtx, wait_ns) catch {};
         }
+    }
+
+    inline fn backpressureWaiters(self: *Core, lane: types.TaskLane) *std.atomic.Value(u32) {
+        return switch (lane) {
+            .default => &self.sync.default_backpressure_waiters,
+            .blocking => &self.sync.blocking_backpressure_waiters,
+        };
+    }
+
+    inline fn backpressureMutex(self: *Core, lane: types.TaskLane) *std.Thread.Mutex {
+        return switch (lane) {
+            .default => &self.sync.default_backpressure_mutex,
+            .blocking => &self.sync.blocking_backpressure_mutex,
+        };
+    }
+
+    inline fn backpressureCond(self: *Core, lane: types.TaskLane) *std.Thread.Condition {
+        return switch (lane) {
+            .default => &self.sync.default_backpressure_cond,
+            .blocking => &self.sync.blocking_backpressure_cond,
+        };
+    }
+
+    /// Effective backpressure policy for a submit: `Config.blocking_backpressure`
+    /// / `Config.default_backpressure` forces the lane's policy when non-null
+    /// (L2), otherwise the caller's `SubmitOptions.backpressure` wins.
+    inline fn effectiveBackpressure(self: *const Core, options: types.SubmitOptions) types.BackpressurePolicy {
+        return switch (options.lane) {
+            .blocking => self.config.blocking_backpressure orelse options.backpressure,
+            .default => self.config.default_backpressure orelse options.backpressure,
+        };
     }
 
     pub fn statsSnapshot(self: *Core) types.Stats {
@@ -667,7 +721,8 @@ const Core = struct {
     }
 
     fn submitInternal(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions, allow_block: bool) !types.TaskHandle {
-        const deadline = if (allow_block and options.backpressure == .block_with_timeout and options.timeout_ns != null)
+        const effective = self.effectiveBackpressure(options);
+        const deadline = if (allow_block and effective == .block_with_timeout and options.timeout_ns != null)
             nowNs() + options.timeout_ns.?
         else
             0;
@@ -678,9 +733,9 @@ const Core = struct {
                 return handle;
             } else |err| switch (err) {
                 error.QueueFull, error.TaskPoolExhausted => {
-                    if (!allow_block or options.backpressure == .return_error) return err;
+                    if (!allow_block or effective == .return_error) return err;
                     if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
-                    self.waitForCapacity(deadline);
+                    self.waitForCapacity(deadline, options.lane);
                 },
                 else => return err,
             }
@@ -1313,13 +1368,21 @@ const Core = struct {
             break;
         }
 
-        // Wake one blocked submitter (if any) now that a descriptor is
-        // available. Fast-path: skip the mutex entirely when no submitter
-        // is blocked — the common uncontended case.
-        if (self.sync.backpressure_waiters.load(.monotonic) > 0) {
-            self.sync.backpressure_mutex.lock();
-            self.sync.backpressure_cond.signal();
-            self.sync.backpressure_mutex.unlock();
+        // Wake one blocked submitter per lane (if any) now that a descriptor
+        // is available. Fast-path: skip the mutex entirely when no submitter
+        // is blocked on that lane — the common uncontended case. Descriptors
+        // are pool-wide, so either lane's waiter can benefit from a release;
+        // waking one per lane avoids missed-signal deadlocks without a
+        // broadcast thundering-herd.
+        if (self.sync.default_backpressure_waiters.load(.monotonic) > 0) {
+            self.sync.default_backpressure_mutex.lock();
+            self.sync.default_backpressure_cond.signal();
+            self.sync.default_backpressure_mutex.unlock();
+        }
+        if (self.sync.blocking_backpressure_waiters.load(.monotonic) > 0) {
+            self.sync.blocking_backpressure_mutex.lock();
+            self.sync.blocking_backpressure_cond.signal();
+            self.sync.blocking_backpressure_mutex.unlock();
         }
     }
 

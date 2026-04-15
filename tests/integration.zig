@@ -174,3 +174,123 @@ test "lane_extension variant accepted with blocking_workers > 0" {
     wg.wait();
     try std.testing.expectEqual(@as(u64, 20), counter.value.load(.acquire));
 }
+
+test "blocking_backpressure config forces return_error on full blocking queue" {
+    // Slice L2: Config.blocking_backpressure overrides caller's SubmitOptions.backpressure.
+    // One blocking worker sleeps, filling the tiny blocking queue; the next
+    // blocking submit is asked to .block but must see return_error per config.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .blocking_queue_capacity = 2,
+        .blocking_backpressure = .return_error,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // Long sleep so the blocking worker stays occupied while we fill the queue.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100 * std.time.ns_per_ms };
+
+    // First submit: consumed by the blocking worker. Next 2 fill the queue.
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+
+    // The caller asks to .block, but blocking_backpressure = .return_error
+    // forces QueueFull.
+    const result = pool.submit(
+        common.sleepTask,
+        @ptrCast(&sleeper),
+        .{ .wait_group = &wg, .lane = .blocking, .backpressure = .block },
+    );
+    try std.testing.expectError(error.QueueFull, result);
+
+    wg.wait();
+}
+
+test "full blocking queue does not block default-lane submitters" {
+    // Slice L2 cross-lane isolation: a full blocking queue with .block policy
+    // must not serialize default-lane submitters on shared mutex/cond.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 128,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .blocking_queue_capacity = 2,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 50 * std.time.ns_per_ms };
+
+    // Saturate the blocking lane: 1 in flight + 2 queued.
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+
+    // Default-lane submissions: must complete quickly regardless of the
+    // blocking-lane saturation.
+    const start = std.time.nanoTimestamp();
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    const elapsed_submit_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    // 64 non-contended submits should take far less than one blocking sleep.
+    try std.testing.expect(elapsed_submit_ns < 25 * std.time.ns_per_ms);
+
+    wg.wait();
+    // 3 blocking + 64 default = 67 tasks.
+    try std.testing.expectEqual(@as(u64, 67), counter.value.load(.acquire));
+}
+
+test "blocking_queue_capacity sized independently of queue_capacity" {
+    // Slice L2: blocking_queue_capacity is honored; default-queue capacity
+    // stays large enough to absorb many default-lane submits.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 512,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .blocking_queue_capacity = 4,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100 * std.time.ns_per_ms };
+
+    // 1 in flight + 4 queued = 5 accepted. The 6th must fail with QueueFull.
+    for (0..5) |_| {
+        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    }
+    const overflow = pool.submit(
+        common.sleepTask,
+        @ptrCast(&sleeper),
+        .{ .wait_group = &wg, .lane = .blocking, .backpressure = .return_error },
+    );
+    try std.testing.expectError(error.QueueFull, overflow);
+
+    // Default lane (capacity 512) still accepts plenty.
+    for (0..256) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    // 5 blocking sleepers + 256 default counters = 261.
+    try std.testing.expectEqual(@as(u64, 261), counter.value.load(.acquire));
+}
