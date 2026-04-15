@@ -396,7 +396,7 @@ fn nestedTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     ctx.completed_at_ns.* = nowNs();
 }
 
-fn warmup(pool: *thread_pool.ThreadPool, task_count: usize, scratch_bytes: usize) !void {
+pub fn warmup(pool: *thread_pool.ThreadPool, task_count: usize, scratch_bytes: usize) !void {
     var counter = Counter{};
     var wg = pool.waitGroup();
     var submitted: u64 = 0;
@@ -419,7 +419,7 @@ fn warmup(pool: *thread_pool.ThreadPool, task_count: usize, scratch_bytes: usize
     wg.wait();
 }
 
-fn summarizeLatencies(values: []u64) thread_pool.LatencySummary {
+pub fn summarizeLatencies(values: []u64) thread_pool.LatencySummary {
     std.sort.heap(u64, values, {}, comptime std.sort.asc(u64));
     return .{
         .count = values.len,

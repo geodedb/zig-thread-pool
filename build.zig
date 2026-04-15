@@ -163,6 +163,16 @@ pub fn build(b: *std.Build) void {
     const runtime_compare_step = b.step("bench-runtime-compare", "Run direct side-by-side benchmarks against vendored Tokio and Go runtimes");
     runtime_compare_step.dependOn(&runtime_compare.step);
 
+    const realistic_bench_exe = b.addExecutable(.{
+        .name = "thread-pool-bench-realistic",
+        .root_module = importedModule(b, "benchmarks/bench_realistic.zig", target, .ReleaseFast, module),
+    });
+    b.installArtifact(realistic_bench_exe);
+    const run_realistic_bench = b.addRunArtifact(realistic_bench_exe);
+    if (b.args) |args| run_realistic_bench.addArgs(args);
+    const realistic_bench_step = b.step("bench-realistic", "Realistic workload benchmarks (latency, fairness, lanes)");
+    realistic_bench_step.dependOn(&run_realistic_bench.step);
+
     // Aggregate "bench-micro" step
     const micro_all_step = b.step("bench-micro", "All micro-benchmarks");
     micro_all_step.dependOn(&run_micro_submit.step);
