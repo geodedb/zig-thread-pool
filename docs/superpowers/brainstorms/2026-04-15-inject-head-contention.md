@@ -57,6 +57,48 @@ the 2 shared loads.
 regressing others. But treat as a generic optimization, not a
 flood_1m_batched fix.
 
+### Option A — CLOSED 2026-04-15 (tried, failed)
+
+Implemented clear-and-recheck variant (producer conditional set,
+consumer clears on popMany=0, double-check popMany to close race).
+Stress (`zig build test-stress`, ReleaseFast) ran >5 min vs HEAD's
+~3.7 s — 30–60× slowdown.
+
+**Root cause:** `popMany` returns 0 for two reasons — (1) queue
+genuinely empty at snapshot, (2) CAS lost to a competing consumer.
+Case (2) leaves the queue non-empty. The consumer-clear path
+treated both identically, writing flag=0 under heavy contention
+where CAS-loss is common. With 56 consumers racing, many clears
+fired while the queue still held items; other consumers then read
+flag=0 and skipped `popMany` entirely, falling through to bitmap-
+steal against local queues that (under a batched flood) hadn't yet
+had any drain result distributed. Net effect was self-inflicted
+serialization: only the popMany winner drained, losers quit the
+inject path and starved.
+
+**No-clear variant** (producer set only, no consumer clear) is
+stress-clean (3×3 runs within 3.4–4.1 s of HEAD) but trivially
+useless: after the first push, flag stays 1 forever, and the
+consumer-side flag load degenerates to a guaranteed-true check
+that always falls through to today's `popMany`. Zero benefit on
+any hot path.
+
+**Why the recheck didn't save it:** The recheck popMany on the
+*same* consumer does eventually drain the items, but only after
+the flag was already cleared. During the window between
+store-flag-0 and the recheck, *other* consumers' flag loads
+observe 0 and skip. Under high-rate production (e.g.
+`flood_1m_batched` pushing 64-item batches), that window is wide
+enough that dozens of workers quit the inject path per clear, and
+the next producer's conditional set doesn't fire fast enough to
+re-open it before they park or bitmap-steal into emptiness.
+
+**What would be required to make A work:** Distinguish true-empty
+from CAS-lost inside `popMany` (new return signal) so the consumer
+only clears flag on true-empty. That is effectively a `popMany`
+API change and was not pursued. No-clear-only variant was also
+evaluated and rejected as zero-benefit.
+
 ## Option B — FetchAdd-based head reservation
 
 **Design sketch:**
@@ -234,8 +276,11 @@ a quick measurement alongside F.
 4. Revisit Option D (post-mortem the SIGSEGV) if we need to
    understand the shutdown race independent of optimization.
 
-Option B is closed. Option E is dominated. Option A is generic
-but won't clear the primary gate.
+As of 2026-04-15: Options B, F, G, A all tried and closed. D is
+blocked on SIGSEGV root cause. C is the only remaining viable
+candidate and requires a design-first approach (no more code
+without an explicit shutdown-synchronization plan). E is
+dominated.
 
 ## Measurement plan (for any attack)
 
