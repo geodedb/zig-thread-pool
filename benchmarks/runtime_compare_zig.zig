@@ -242,9 +242,11 @@ fn runContendedSample(worker_count: usize) !u64 {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .min_threads = worker_count,
         .max_threads = worker_count,
-        .queue_capacity = 4096,
+        .queue_capacity = 16384,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = contended_submitters,
+        .submitter_queue_capacity = 4096,
     });
     defer pool.deinit();
 
@@ -270,6 +272,10 @@ fn runContendedSample(worker_count: usize) !u64 {
 }
 
 fn contendedSubmitterThread(ctx: *ContendedSubmitterCtx) void {
+    const slot = ctx.pool.registerSubmitter() catch
+        @panic("registerSubmitter failed during contended benchmark");
+    defer ctx.pool.releaseSubmitter(slot);
+
     for (0..ctx.count) |_| {
         _ = ctx.pool.submit(noopTask, @ptrCast(ctx.marker), .{
             .wait_group = ctx.wg,

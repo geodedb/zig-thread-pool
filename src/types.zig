@@ -190,6 +190,8 @@ pub const Config = struct {
     /// only single-item steal is correct and the runtime forces this to 1
     /// via `normalized()`.
     steal_batch_size: usize = 8,
+    max_submitter_queues: u32 = 0,
+    submitter_queue_capacity: usize = 0,
 
     pub fn normalized(self: Config) Config {
         var cfg = self;
@@ -218,6 +220,13 @@ pub const Config = struct {
         cfg.steal_batch_size = std.math.clamp(cfg.steal_batch_size, 1, 32);
         if (cfg.queue_kind == .chase_lev) cfg.steal_batch_size = 1;
         if (cfg.wake_coalesce_batch > 1024) cfg.wake_coalesce_batch = 1024;
+        if (cfg.submitter_queue_capacity == 0 and cfg.max_submitter_queues > 0) {
+            cfg.submitter_queue_capacity = cfg.local_queue_capacity;
+        }
+        if (cfg.submitter_queue_capacity != 0) {
+            cfg.submitter_queue_capacity = std.math.ceilPowerOfTwo(usize, cfg.submitter_queue_capacity) catch cfg.submitter_queue_capacity;
+        }
+        if (cfg.max_submitter_queues > 64) cfg.max_submitter_queues = 64;
         return cfg;
     }
 

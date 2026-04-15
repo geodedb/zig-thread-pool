@@ -9,6 +9,7 @@ const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
 const process_memory = @import("stats/process_memory.zig");
 
 threadlocal var tls_worker_index: ?usize = null;
+threadlocal var tls_submitter_index: ?usize = null;
 
 /// Runtime context passed to every task function. Provides the worker
 /// index, cancellation state, and access to the per-worker scratch allocator.
@@ -351,6 +352,9 @@ const Core = struct {
     /// 55-victim `len()` peek loop in nextTask with one u64 load.
     /// Max 64 workers (enforced by Config.validate).
     workers_nonempty: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
+    submitter_queues: []LocalQueue = &.{},
+    submitter_nonempty: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
+    submitter_free_mask: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Slice L4 — optional watchdog thread. Spawned when
     /// `config.watchdog_interval_ns > 0`. Walks default-lane workers every
     /// interval looking for stalled tasks (task duration exceeds
@@ -436,6 +440,15 @@ const Core = struct {
                 .is_overflow = true,
             };
             self.recordOwnedAlloc(self.local_queues[oidx].capacity() * @sizeOf(u32));
+        }
+
+        if (normalized.max_submitter_queues > 0) {
+            self.submitter_queues = try allocator.alloc(LocalQueue, normalized.max_submitter_queues);
+            for (self.submitter_queues) |*sq| {
+                sq.* = try LocalQueue.init(allocator, normalized.submitter_queue_capacity, normalized.queue_kind);
+            }
+            self.submitter_free_mask = std.atomic.Value(u64).init((@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1);
+            self.recordOwnedAlloc(self.submitter_queues.len * @sizeOf(LocalQueue));
         }
 
         for (self.workers[0..normalized.max_threads], 0..) |*worker, idx| {
@@ -537,6 +550,30 @@ const Core = struct {
         }
         if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
         return .{ .submitted = submitted };
+    }
+
+    pub fn registerSubmitter(self: *Core) !usize {
+        while (true) {
+            const mask = self.submitter_free_mask.load(.acquire);
+            if (mask == 0) return error.NoSubmitterSlots;
+            const idx: usize = @ctz(mask);
+            const bit: u64 = @as(u64, 1) << @intCast(idx);
+            if (self.submitter_free_mask.cmpxchgWeak(mask, mask & ~bit, .acq_rel, .monotonic) == null) {
+                tls_submitter_index = idx;
+                _ = self.submitter_nonempty.fetchOr(bit, .release);
+                return idx;
+            }
+        }
+    }
+
+    pub fn releaseSubmitter(self: *Core, idx: usize) void {
+        tls_submitter_index = null;
+        while (self.submitter_queues[idx].stealOne()) |entry| {
+            _ = self.inject_queue.tryPush(entry);
+        }
+        const bit: u64 = @as(u64, 1) << @intCast(idx);
+        _ = self.submitter_nonempty.fetchAnd(~bit, .release);
+        _ = self.submitter_free_mask.fetchOr(bit, .release);
     }
 
     pub fn wait(self: *Core, handle: types.TaskHandle) !void {
@@ -891,6 +928,10 @@ const Core = struct {
                     }
                 }
             }
+            if (!queued and tls_submitter_index != null) {
+                const si = tls_submitter_index.?;
+                queued = self.submitter_queues[si].tryPushBottom(entry);
+            }
             if (!queued) {
                 queued = self.inject_queue.tryPush(entry);
             }
@@ -1226,6 +1267,35 @@ const Core = struct {
                 }
                 updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
                 return first;
+            }
+        }
+
+        {
+            var sub_mask = self.submitter_nonempty.load(.acquire);
+            while (sub_mask != 0) {
+                const sub_idx: usize = @ctz(sub_mask);
+                sub_mask &= sub_mask - 1;
+                var stolen: [32]QueueEntry = undefined;
+                const budget = @min(self.config.steal_batch_size, stolen.len);
+                const n = self.submitter_queues[sub_idx].steal(stolen[0..budget]);
+                if (n > 0) {
+                    const first = stolen[0];
+                    const was_empty = worker.owned_queue_len == 0;
+                    var pushed_count: usize = 0;
+                    for (stolen[1..n]) |entry| {
+                        if (!lq.tryPushBottom(entry)) {
+                            _ = lane_inject.tryPush(entry);
+                        } else {
+                            pushed_count += 1;
+                        }
+                    }
+                    if (pushed_count > 0) {
+                        worker.owned_queue_len += pushed_count;
+                        if (was_empty) self.markWorkerNonEmpty(worker_index);
+                    }
+                    updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
+                    return first;
+                }
             }
         }
 
@@ -1628,6 +1698,13 @@ const Core = struct {
             self.recordOwnedFree(lq.capacity() * @sizeOf(u32));
             lq.deinit();
         }
+        if (self.submitter_queues.len > 0) {
+            for (self.submitter_queues) |*sq| {
+                sq.deinit();
+            }
+            self.recordOwnedFree(self.submitter_queues.len * @sizeOf(LocalQueue));
+            self.allocator.free(self.submitter_queues);
+        }
         self.inject_queue.deinit();
         if (self.blocking_inject) |*bi| {
             self.recordOwnedFree(bi.capacity() * @sizeOf(u32));
@@ -1738,6 +1815,14 @@ pub const ThreadPool = struct {
     /// subsequent failures return a partial `SubmitBatchResult`.
     pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
         return self.core.submitBatch(tasks, options);
+    }
+
+    pub fn registerSubmitter(self: *ThreadPool) !usize {
+        return self.core.registerSubmitter();
+    }
+
+    pub fn releaseSubmitter(self: *ThreadPool, idx: usize) void {
+        self.core.releaseSubmitter(idx);
     }
 
     /// Block until a waitable task completes or is cancelled.

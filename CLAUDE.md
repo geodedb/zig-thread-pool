@@ -59,14 +59,18 @@ From `benchmarks/results/runtime-comparison-latest.json` on 2026-04-15
 
 | Scenario | Zig thread-pool | Tokio | Go |
 |---|---:|---:|---:|
-| `flood_1m` | 1,141,058 ops/s | 428,545 ops/s | 768,076 ops/s |
-| `contended_spawn_8x` | 836,904 ops/s | 582,075 ops/s | 2,899,822 ops/s |
+| `flood_1m` | 922,230 ops/s | 433,151 ops/s | 737,807 ops/s |
+| `contended_spawn_8x` | 981,070 ops/s | 597,468 ops/s | 2,776,111 ops/s |
 
 Interpretation:
 
-- This pool is `1.49x` ahead of Go and `2.66x` ahead of Tokio on `flood_1m`.
-- Go remains `3.46x` ahead on `contended_spawn_8x` (architectural: goroutines submit to local P queues, our external submitters use the shared inject queue).
-- Wake coalescing (`wake_coalesce_batch=32`, default) reduced scan+signal cost from per-submit to every 32nd submit.
+- This pool is `1.25x` ahead of Go and `2.13x` ahead of Tokio on `flood_1m`.
+- Go remains `2.83x` ahead on `contended_spawn_8x` (reduced from `3.46x`
+  via per-submitter queues that eliminate inject-queue CAS contention).
+- Wake coalescing (`wake_coalesce_batch=32`, default) reduced scan+signal
+  cost from per-submit to every 32nd submit.
+- Per-submitter queues (`registerSubmitter` API) give each external submitter
+  a dedicated work-stealing deque; workers steal from them like local queues.
 
 ## Docs Entry Points
 
