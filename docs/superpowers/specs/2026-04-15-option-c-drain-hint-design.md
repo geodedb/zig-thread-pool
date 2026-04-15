@@ -488,3 +488,121 @@ This is still a hypothesis. Confirmation requires either:
 All reorder-based attacks remain blocked on path 1 (dispatch
 counter) confirming the double-dispatch hypothesis and
 identifying the specific seam — or a debugger becoming available.
+
+### Post-mortem iteration 2 (2026-04-15) — double-dispatch confirmed
+
+Reopened under stress with `claim_sentinel_enabled = true` (forced,
+not `std.debug.runtime_safety`) and the **minimal** reorder from
+Option D (all workers bitmap-steal before inject drain; no hint
+field, no tryDrainInject helper — just swapping the two blocks in
+nextTask). Goal: determine whether (a) today's code double-dispatches
+but stays silent because the sentinel is gated off in ReleaseFast,
+or (b) the reorder itself introduces the double-dispatch.
+
+Results:
+
+| Configuration | 20× ReleaseFast test-stress |
+|---|---|
+| Today's main, sentinel FORCED ON | 20 PASS, 0 FAIL |
+| Option D reorder, sentinel FORCED ON | 9 PASS, 11 FAIL |
+| — of those FAILs: `double-dequeue:` panics | **2** |
+| — of those FAILs: SEGV at `task_fn.?(...)` | 0 (elided by probe) |
+
+With a `@atomicLoad(?TaskFn, &descriptor.task_fn, .acquire)` probe
+right before the call, 11/20 runs panic with "NULL-TF-AT-CALL"
+instead of SEGV'ing. Ten of the eleven panics report `state=free`,
+meaning the descriptor has fully transitioned
+`.running → .completed → .free` between our CAS-win and the
+probe — i.e., a SECOND worker ran the task and called
+`releaseDescriptor` while we were between CAS and call. The
+remaining case reports `state=running claimed_by=self` — the
+stale-memory-view variant where we see null task_fn even though
+our own .running state is still current.
+
+Concrete panic examples:
+
+```text
+thread X panic: NULL-TF-AT-CALL: desc=38 worker=10 state=free gen=4360 claimed_by=10
+thread Y panic: double-dequeue: descriptor 17 claimed by worker 13, now worker 9 also tried to claim it
+thread Z panic: NULL-TF-AT-CALL: desc=17 worker=13 state=running gen=6373 claimed_by=13
+```
+
+The sentinel fires AND the null-task_fn probe fires in the same
+seed (desc=17): worker 13 CAS-wins state, but worker 9 ALSO
+CAS-wins sentinel (the "loser" from worker 13's perspective),
+meaning two workers both passed `state.cmpxchgStrong(.queued,
+.running)` on the same descriptor+generation. That is the CAS
+atomicity invariant being broken — two winners on a single
+compare-and-swap against the same address.
+
+Hypothesis update: this is not a classic A/B/A on descriptor
+indices (which would leave the sentinel silent, because the
+stale-gen worker and the rightful-gen worker would never race on
+the same generation's state). It is a true double-CAS-win on the
+SAME (descriptor, generation). The mechanism is still unclear —
+the single-word state field and x86 `lock cmpxchg` should be
+serializing. Candidate mechanisms yet to disprove:
+
+- **Mixed-atomicity undefined behavior.** `descriptor.state` is
+  `std.atomic.Value(TaskState)` accessed atomically, but
+  `descriptor.task_fn` and several other fields are written via
+  plain stores in `enqueuePush` and cleared via plain stores in
+  `releaseDescriptor`. Zig's memory model treats mixing atomic
+  and non-atomic accesses to *different* fields of the same
+  struct as defined if no concurrent accesses target the
+  non-atomic fields — but `descriptor.* = .{}` in
+  `acquireDescriptor` (pool.zig:1116) writes the atomic state
+  field via a non-atomic bulk memcpy, before the final
+  `state.store(.reserved, .release)` at line 1122. A concurrent
+  reader's atomic load of `state` during that bulk store is
+  technically UB; the compiler may be generating code that
+  violates the expected happens-before in ReleaseFast.
+- **`descriptor.* = .{}` torn write.** The bulk struct reset
+  writes `state` twice — once as part of the memcpy (default
+  `.free`), once via the explicit `state.store(.reserved,
+  .release)`. On x86 TSO the intermediate `.free` is observable;
+  on non-x86 the release store's position relative to the memcpy
+  is the concern. We're only running x86 in this test, so likely
+  not this.
+- **Stale queue emission + no in-dispatch generation check.**
+  `descriptor.generation` is `u64` (pool.zig:129), so wrap
+  aliasing is not the issue — panic messages show gen values in
+  the single-digit-to-100k range, nowhere near u64 wrap. BUT:
+  `runTask` never compares the descriptor's generation against
+  the generation in the queue entry, because **queue entries
+  carry only the u32 index, not the generation**. A queue entry
+  popped after the descriptor was recycled cannot be detected as
+  stale. The state CAS is the only gate, and if the new
+  generation's submitter has also stored `state=.queued`, the
+  stale entry's CAS passes. Two CAS-winners could arise if two
+  queue entries both carry index D and the state oscillates
+  `.queued → .running → .free → .reserved → .queued → .running`
+  fast enough between their CAS attempts. The reorder widens
+  this window.
+
+### Next iteration candidates
+
+1. **Generation tag on queue entries.** Pack `{index:u32,
+   generation:u32}` into the queue's u64 slot (today it's just
+   u32 index + 4 bytes of padding). Check the packed gen against
+   `descriptor.generation` in `runTask` *before* the state CAS.
+   Mismatch → stale entry → silent skip. This closes the stale-
+   entry window without changing any queue invariants. Expected
+   outcome: reorder + sentinel now PASSes stress because stale
+   entries are filtered before they can contend. Highest-yield
+   diagnostic and a plausible production fix.
+2. **Mixed-atomicity audit.** Convert `task_fn` and `ctx` writes
+   in `enqueuePush` and `releaseDescriptor` to `@atomicStore`
+   with `.release`, then rerun. If the 1-in-11 `state=running
+   claimed_by=self` panic disappears, the codegen is splitting
+   the plain-store → atomic-store edge; that's a separate bug
+   from the double-dispatch.
+3. **Cancelled variant.** The descriptor state machine has
+   `.cancelled` as a sibling of `.completed`; verify the CAS in
+   `runTask` can't see a `.cancelled` state transitioned in by
+   a concurrent `cancelQueuedTasks` during stress. Lowest
+   expected yield; do last.
+
+Path 1 is also the forward path for any queue-level fix: if
+stale-entry filtering works, Option D and C become viable as
+designed.
