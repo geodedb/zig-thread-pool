@@ -13,6 +13,25 @@
 # runners still pass. Trigger cross-OS runs by setting RUN_CROSS_OS=true
 # or by scheduling / merging to the default branch.
 
+# Cancel in-flight pipelines on new commits for everything except
+# release-producing runs (tag pipelines and default-branch pipelines,
+# which feed `release-semantic`). All jobs default to interruptible so
+# the auto-cancel actually kicks in; opt out per-job when needed.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      auto_cancel:
+        on_new_commit: none
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      auto_cancel:
+        on_new_commit: none
+    - when: always
+
+default:
+  interruptible: true
+
 include:
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.7.1
