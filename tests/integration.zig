@@ -7,6 +7,11 @@ comptime {
     _ = @import("integration/two_pool_cross_submit.zig");
 }
 
+// F-002 regression test: spawn-aware errdefer in Core.init
+comptime {
+    _ = @import("integration/spawn_failure.zig");
+}
+
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
     const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
     while (thread_pool.clock.nanoTimestamp() < deadline) {

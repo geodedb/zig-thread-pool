@@ -25,7 +25,7 @@ Update the Status and Regression class columns in the table below after each ste
 | Step | Fix | Status | Regression class |
 |------|-----|--------|------------------|
 | 1 | F-001 per-pool TLS | done | clean (bench noise, see diff) |
-| 2 | F-002 spawn errdefer | pending | – |
+| 2 | F-002 spawn errdefer | done | clean (bench + p95 noise, ruled out by construction) |
 | 3 | F-003 atomic free_indices | pending | – |
 | 4 | F-006 no unreachable blocking_inject | pending | – |
 | 5 | F-005 harden releaseSubmitter | pending | – |

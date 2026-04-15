@@ -374,6 +374,20 @@ const Core = struct {
     /// Signals the watchdog thread to exit. Set by `joinAllWorkers` before
     /// join. Read by `watchdogMain` on each tick.
     watchdog_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Number of `Worker` entries whose `.scratch` and other fields were
+    /// fully initialized by `Core.init` via `worker.* = .{...}`.  Used by
+    /// `deinitOwned` so it does not call `worker.scratch.purge()` on entries
+    /// that were never written — raw allocator memory whose `scratch.accounting`
+    /// pointers are garbage.  Equals `workers.len` once `Core.init` succeeds;
+    /// never mutated after that.
+    init_worker_count: usize = 0,
+    /// Number of `local_queues` entries that were fully initialized by
+    /// `Core.init` via `LocalQueue.init`.  Parallel to `init_worker_count`.
+    /// Equals `local_queues.len` once `Core.init` succeeds.
+    init_queue_count: usize = 0,
+    /// Number of `submitter_queues` entries that were fully initialized.
+    /// Equals `submitter_queues.len` once the submitter-init block succeeds.
+    init_submitter_count: usize = 0,
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -431,23 +445,32 @@ const Core = struct {
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
         for (self.workers[0..normalized.max_threads], self.local_queues[0..normalized.max_threads], 0..) |*worker, *lq, idx| {
-            lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            // Initialize worker first (no allocation, cannot fail) so that
+            // deinitOwned can safely call worker.scratch.purge() even if the
+            // LocalQueue.init below fails partway through the loop.  Track
+            // init_worker_count so deinitOwned knows the safe upper bound.
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
                 .serves_lane = if (idx < normalized.blocking_workers) .blocking else .default,
             };
+            self.init_worker_count += 1;
+            lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            self.init_queue_count += 1;
             self.recordOwnedAlloc(lq.capacity() * @sizeOf(u32));
         }
 
         for (normalized.max_threads..total_worker_slots) |oidx| {
-            self.local_queues[oidx] = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            // Same ordering: worker first (infallible), queue second (fallible).
             self.workers[oidx] = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
                 .serves_lane = .default,
                 .is_overflow = true,
             };
+            self.init_worker_count += 1;
+            self.local_queues[oidx] = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            self.init_queue_count += 1;
             self.recordOwnedAlloc(self.local_queues[oidx].capacity() * @sizeOf(u32));
         }
 
@@ -455,16 +478,51 @@ const Core = struct {
             self.submitter_queues = try allocator.alloc(LocalQueue, normalized.max_submitter_queues);
             for (self.submitter_queues) |*sq| {
                 sq.* = try LocalQueue.init(allocator, normalized.submitter_queue_capacity, normalized.queue_kind);
+                self.init_submitter_count += 1;
             }
             self.submitter_free_mask = std.atomic.Value(u64).init((@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1);
             self.recordOwnedAlloc(self.submitter_queues.len * @sizeOf(LocalQueue));
         }
 
+        // Spawn-aware cleanup: if a later spawn fails, tell already-spawned
+        // workers to exit and join them before the outer errdefer runs
+        // deinitOwned and frees their backing arrays (F-002).
+        var spawned_workers: usize = 0;
+        errdefer {
+            if (spawned_workers > 0) {
+                self.state.store(.stopping, .release);
+                for (self.workers[0..spawned_workers]) |*w| {
+                    w.park_mutex.lock();
+                    w.park_cond.broadcast();
+                    w.park_mutex.unlock();
+                }
+                for (self.workers[0..spawned_workers]) |*w| {
+                    if (w.thread) |t| {
+                        t.join();
+                        w.thread = null;
+                    }
+                }
+            }
+        }
+
         for (self.workers[0..normalized.max_threads], 0..) |*worker, idx| {
             worker.thread = try std.Thread.spawn(.{}, workerMain, .{ self, idx });
+            spawned_workers += 1;
         }
 
         if (normalized.watchdog_interval_ns > 0) {
+            errdefer {
+                // Workers are already signalled by the outer errdefer if
+                // this watchdog spawn fails. Just stop and join the watchdog
+                // if it was already set (it won't be — this is its own spawn
+                // — but defensively check). The workers errdefer above handles
+                // the worker-side cleanup regardless.
+                if (self.watchdog_thread) |t| {
+                    self.watchdog_stop.store(true, .release);
+                    t.join();
+                    self.watchdog_thread = null;
+                }
+            }
             self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
         }
     }
@@ -1722,15 +1780,22 @@ const Core = struct {
     }
 
     fn deinitOwned(self: *Core) void {
-        for (self.workers) |*worker| {
+        // Use init_worker_count / init_queue_count / init_submitter_count to
+        // bound the cleanup loops: if Core.init fails partway through the
+        // worker/queue init loops, the trailing entries are raw allocator memory
+        // whose fields are uninitialized garbage. Iterating beyond the init
+        // counts would invoke purge() / deinit() on garbage pointers → crash.
+        // After a successful init these counts equal the slice lengths, so the
+        // hot (non-error) path is unchanged.
+        for (self.workers[0..self.init_worker_count]) |*worker| {
             worker.scratch.purge();
         }
-        for (self.local_queues) |*lq| {
+        for (self.local_queues[0..self.init_queue_count]) |*lq| {
             self.recordOwnedFree(lq.capacity() * @sizeOf(u32));
             lq.deinit();
         }
         if (self.submitter_queues.len > 0) {
-            for (self.submitter_queues) |*sq| {
+            for (self.submitter_queues[0..self.init_submitter_count]) |*sq| {
                 sq.deinit();
             }
             self.recordOwnedFree(self.submitter_queues.len * @sizeOf(LocalQueue));
