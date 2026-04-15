@@ -25,6 +25,7 @@ fn importedModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTar
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer on test artifacts") orelse false;
 
     const module = b.addModule("thread_pool", .{
         .root_source_file = b.path("src/root.zig"),
@@ -52,18 +53,24 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/unit.zig", target, optimize, module),
     });
+    if (tsan) unit_tests.root_module.sanitize_thread = true;
     unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/integration.zig", target, optimize, module),
     });
+    if (tsan) integration_tests.root_module.sanitize_thread = true;
     integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
+    // Under TSan, switch stress from ReleaseFast to Debug so races are not
+    // optimised away; -Dtsan is always a Debug-instrumented build.
+    const stress_optimize: std.builtin.OptimizeMode = if (tsan) .Debug else .ReleaseFast;
     const stress_step = b.step("test-stress", "Run stress and load tests");
     const stress_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/stress.zig", target, .ReleaseFast, module),
+        .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module),
     });
+    if (tsan) stress_tests.root_module.sanitize_thread = true;
     stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
     const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
