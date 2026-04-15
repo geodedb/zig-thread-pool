@@ -182,6 +182,13 @@ const Worker = struct {
     /// acquiring park_mutex during signal — saves a futex syscall when the
     /// worker isn't actually parked.
     is_parked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Owner-private upper bound on `local_queues[worker_index]` length.
+    /// Incremented on every push by the owner; decremented on every
+    /// successful pop. Stealers reduce real length below this value —
+    /// reconciled to 0 when `popBottom` returns null. Used to drive
+    /// 0↔1 transitions of `Core.workers_nonempty` WITHOUT reading the
+    /// queue's stealer-written `head` cacheline every pop.
+    owned_queue_len: usize = 0,
     /// Tokio-style single-slot LIFO cache. When a task is submitted from this
     /// worker's thread, it goes here first (single atomic store); `nextTask`
     /// pops the slot ahead of the local ring. Cross-worker submits never
@@ -265,6 +272,11 @@ const Core = struct {
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
+    /// Bit `i` set iff worker `i`'s local queue is believed non-empty.
+    /// Owner-side updates only on 0↔1 transitions. Replaces the
+    /// 55-victim `len()` peek loop in nextTask with one u64 load.
+    /// Max 64 workers (enforced by Config.validate).
+    workers_nonempty: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -648,10 +660,12 @@ const Core = struct {
                 w.lifo_slot.store(descriptor_index, .release);
                 queued = true;
             } else {
+                const was_empty = w.owned_queue_len == 0;
                 queued = self.local_queues[wi].tryPushBottom(descriptor_index);
                 if (queued) {
-                    const local_len = @as(u32, @intCast(self.local_queues[wi].len()));
-                    updatePeakU32(&w.local_queue_peak, local_len);
+                    w.owned_queue_len += 1;
+                    if (was_empty) self.markWorkerNonEmpty(wi);
+                    updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
                 }
             }
         }
@@ -728,6 +742,16 @@ const Core = struct {
         }
     }
 
+    inline fn markWorkerNonEmpty(self: *Core, worker_index: usize) void {
+        const bit: u64 = @as(u64, 1) << @intCast(worker_index);
+        _ = self.workers_nonempty.fetchOr(bit, .release);
+    }
+
+    inline fn markWorkerEmpty(self: *Core, worker_index: usize) void {
+        const bit: u64 = @as(u64, 1) << @intCast(worker_index);
+        _ = self.workers_nonempty.fetchAnd(~bit, .release);
+    }
+
     fn nextTask(self: *Core, worker_index: usize) ?u32 {
         var worker = &self.workers[worker_index];
         var lq = &self.local_queues[worker_index];
@@ -755,7 +779,15 @@ const Core = struct {
             }
 
             if (lq.popBottom()) |descriptor_index| {
+                if (worker.owned_queue_len > 0) worker.owned_queue_len -= 1;
+                if (worker.owned_queue_len == 0) self.markWorkerEmpty(worker_index);
                 return descriptor_index;
+            }
+            // popBottom returned null: real queue is empty regardless of
+            // owned_queue_len (stealers may have drained). Reconcile.
+            if (worker.owned_queue_len != 0) {
+                worker.owned_queue_len = 0;
+                self.markWorkerEmpty(worker_index);
             }
 
             {
@@ -764,6 +796,8 @@ const Core = struct {
                 const n = self.inject_queue.popMany(buf[0..cap]);
                 if (n > 0) {
                     const first = buf[0];
+                    const was_empty = worker.owned_queue_len == 0;
+                    var pushed_count: usize = 0;
                     var i: usize = 1;
                     while (i < n) : (i += 1) {
                         if (!lq.tryPushBottom(buf[i])) {
@@ -772,26 +806,26 @@ const Core = struct {
                             }
                             break;
                         }
+                        pushed_count += 1;
                     }
-                    const local_len = @as(u32, @intCast(lq.len()));
-                    updatePeakU32(&worker.local_queue_peak, local_len);
+                    if (pushed_count > 0) {
+                        worker.owned_queue_len += pushed_count;
+                        if (was_empty) self.markWorkerNonEmpty(worker_index);
+                    }
+                    updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
                     return first;
                 }
             }
 
-            // Use worker_index mixed with submitted count for pseudo-random start.
-            // Avoids global atomic fetchAdd contention that causes thundering-herd
-            // when all idle workers get sequential starting indices.
-            const start = (worker_index +% @as(usize, @truncate(self.counters.submitted.load(.monotonic)))) % self.workers.len;
-            var offset: usize = 0;
-            while (offset < self.workers.len) : (offset += 1) {
-                const victim_index = (start + offset) % self.workers.len;
-                if (victim_index == worker_index) continue;
-                // Cheap peek before paying the seq_cst CAS cost in steal().
-                // len() reads bottom and top with acquire loads; under contention it
-                // may return a stale value, but skipping a victim that *appears* empty
-                // just means we move to the next one — correctness is unaffected.
-                if (self.local_queues[victim_index].len() == 0) continue;
+            // Steal-peek bitmap: read ONE u64 instead of probing each
+            // victim's head/tail cachelines. Owner-side updates this
+            // mask only on 0↔1 transitions, so stealer-side reads rarely
+            // coincide with writer-side writes.
+            const self_bit: u64 = @as(u64, 1) << @intCast(worker_index);
+            var mask = self.workers_nonempty.load(.acquire) & ~self_bit;
+            while (mask != 0) {
+                const victim_index: usize = @ctz(mask);
+                mask &= mask - 1; // clear lowest set bit
                 var stolen: [32]u32 = undefined;
                 const budget = @min(self.config.steal_batch_size, stolen.len);
                 const n = self.local_queues[victim_index].steal(stolen[0..budget]);
@@ -801,15 +835,22 @@ const Core = struct {
                     // `first`; items pushed to lq will decrement when their eventual
                     // runTask CAS succeeds (or be silently skipped if duplicate).
                     const first = stolen[0];
+                    const was_empty = worker.owned_queue_len == 0;
+                    var pushed_count: usize = 0;
                     for (stolen[1..n]) |idx| {
                         if (!lq.tryPushBottom(idx)) {
                             // Local deque full — put overflow on the inject queue so it isn't lost.
                             _ = self.inject_queue.tryPush(idx);
+                        } else {
+                            pushed_count += 1;
                         }
                     }
+                    if (pushed_count > 0) {
+                        worker.owned_queue_len += pushed_count;
+                        if (was_empty) self.markWorkerNonEmpty(worker_index);
+                    }
                     _ = worker.steals.fetchAdd(n, .release);
-                    const local_len: u32 = @intCast(lq.len());
-                    updatePeakU32(&worker.local_queue_peak, local_len);
+                    updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
                     return first;
                 }
             }

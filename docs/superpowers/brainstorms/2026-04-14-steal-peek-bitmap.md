@@ -138,19 +138,61 @@ any other scenario → land.
    Non-empty bitmap adds a new synchronization primitive — stress
    may reveal races I haven't thought of. Must iterate.
 
+## Measured result (n=10 BSSB, paired, same host)
+
+| Scenario | Baseline | Bitmap v2 | Δ | Sep |
+|---|---:|---:|---:|:---|
+| flood_1m | 395,410 | 393,413 | -0.51% | overlap |
+| flood_1m_batched | 904,987 | 931,902 | +2.97% | overlap |
+| contended_spawn_8x | 641,014 | 750,235 | **+17.04%** | **CLEAN** |
+| contended_spawn_8x_batched | 663,339 | 631,887 | -4.74% | overlap |
+
+Primary-target gate (≥+15% flood_1m_batched CLEAN) **FAILED** —
+the peek cost wasn't the dominant flood_1m_batched bottleneck as
+the profile suggested. But contended_spawn_8x got a **+17% CLEAN**
+— a real steal-heavy scenario win.
+
+**v2 refactor:** Initial v1 used `lq.len()` pre/post for
+transition detection — which reads the stealer-written `head`
+cacheline on every pop (1 coherence miss × 1M pops). Replaced with
+owner-private `Worker.owned_queue_len` counter. Increments on
+push, decrements on pop, reconciles to 0 when `popBottom` returns
+null (handles stealer-drain case). Keeps all owner-side bookkeeping
+in owner-local L1.
+
+**Decision: LAND.** Precedent: popMany (cd15524) landed +9% CLEAN
+contended_spawn_8x despite missing flood_1m_batched primary gate.
+This is a strictly larger contended_spawn_8x win (+17% vs +9%),
+neutral flood_1m and flood_1m_batched, soft -5% overlap on
+contended_spawn_8x_batched (not CLEAN regression). No CLEAN
+regressions anywhere → worth banking.
+
+**Follow-up:** socket-partition bitmap (2× u64, one per NUMA
+socket) may reduce fetchOr/fetchAnd contention enough to move
+flood_1m_batched into positive CLEAN territory. Separate experiment.
+
 ## Proposed commit message
 
 ```text
-perf(pool): non-empty worker bitmap eliminates 110-load peek storm
+perf(pool): worker non-empty bitmap for steal-peek scan
 
-Replace nextTask's 55-victim linear peek (2 acquire loads per
-victim, 43.79% worker self-time per profile) with a single u64
-bitmap read. Owner-side updates run only on queue 0↔1 transitions
-(rare; amortize at ~3% of ops). Stealers iterate set bits of
-`core.workers_nonempty & ~self_bit` via @ctz.
+Replace nextTask's 55-victim linear peek loop (each victim required
+2 acquire loads on its head/tail cachelines — 43.79% worker
+self-time per flood_1m_batched profile) with a single u64 bitmap
+read. Owner-side updates run only on queue 0↔1 transitions.
 
-flood_1m_batched: TBD%  CLEAN (measured ...)
-contended_spawn_8x: TBD%
+Transition detection uses an owner-private `Worker.owned_queue_len`
+counter (incremented on push, decremented on pop, reconciled to 0
+when popBottom returns null) — avoids reading the stealer-written
+head cacheline during owner bookkeeping.
+
+Shutdown drain path already iterates all workers explicitly, so
+stale bitmap bits cannot orphan pending tasks.
+
+n=10 BSSB paired A/B on 56-worker Xeon E5-2680 v4:
+- contended_spawn_8x: +17.04% CLEAN (641k → 750k ops/sec)
+- flood_1m: -0.51% overlap (neutral)
+- flood_1m_batched: +2.97% overlap (missed +15% gate — peek cost
+  not the dominant batched-flood bottleneck after all)
+- contended_spawn_8x_batched: -4.74% overlap (not CLEAN)
 ```
-
-Filled in post-measurement.
