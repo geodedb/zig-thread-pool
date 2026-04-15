@@ -381,6 +381,9 @@ pub const Stats = struct {
     /// running longer than `Config.blocking_promotion_timeout_ns`. Always
     /// zero when `Config.watchdog_interval_ns == 0`.
     watchdog_stalls_detected: u64 = 0,
+    overflow_spawns: u64 = 0,
+    overflow_retires: u64 = 0,
+    overflow_active: u64 = 0,
     task_wait_ns: LatencySummary = .{},
     task_exec_ns: LatencySummary = .{},
     memory: ProcessMemoryStats = .{},

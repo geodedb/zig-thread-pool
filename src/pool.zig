@@ -234,6 +234,8 @@ const Worker = struct {
     /// when the watchdog is disabled to preserve zero-overhead hot path.
     /// The watchdog thread reads this on every tick to detect stalls.
     current_task_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    is_overflow: bool = false,
+    overflow_retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -311,6 +313,9 @@ const Counters = extern struct {
     // the pool's lifetime; a single long-stalled task may be counted more
     // than once (once per watchdog tick it remains stalled).
     watchdog_stalls_detected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    overflow_spawns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    overflow_retires: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    overflow_active: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     comptime {
         // Cacheline isolation invariants: each hot-write counter owns a distinct line.
@@ -350,8 +355,8 @@ const Core = struct {
     /// `config.watchdog_interval_ns > 0`. Walks default-lane workers every
     /// interval looking for stalled tasks (task duration exceeds
     /// `config.blocking_promotion_timeout_ns`). Stalls increment
-    /// `counters.watchdog_stalls_detected`. Overflow-worker spawn is deferred
-    /// to L4b; this slice lands observability only.
+    /// `counters.watchdog_stalls_detected` and trigger overflow-worker
+    /// spawn up to `config.max_overflow_workers`.
     watchdog_thread: ?std.Thread = null,
     /// Signals the watchdog thread to exit. Set by `joinAllWorkers` before
     /// join. Read by `watchdogMain` on each tick.
@@ -361,11 +366,12 @@ const Core = struct {
         var normalized = config.normalized();
         try normalized.validate();
 
+        const total_worker_slots = normalized.max_threads + normalized.max_overflow_workers;
         self.* = .{
             .allocator = allocator,
             .config = normalized,
-            .workers = try allocator.alloc(Worker, normalized.max_threads),
-            .local_queues = try allocator.alloc(LocalQueue, normalized.max_threads),
+            .workers = try allocator.alloc(Worker, total_worker_slots),
+            .local_queues = try allocator.alloc(LocalQueue, total_worker_slots),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
@@ -376,7 +382,7 @@ const Core = struct {
                     normalized.queue_capacity)
             else
                 null,
-            .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
+            .worker_stats_buffer = try allocator.alloc(types.WorkerStats, total_worker_slots),
         };
         errdefer self.deinitOwned();
 
@@ -411,7 +417,7 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
-        for (self.workers, self.local_queues, 0..) |*worker, *lq, idx| {
+        for (self.workers[0..normalized.max_threads], self.local_queues[0..normalized.max_threads], 0..) |*worker, *lq, idx| {
             lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
@@ -421,7 +427,18 @@ const Core = struct {
             self.recordOwnedAlloc(lq.capacity() * @sizeOf(u32));
         }
 
-        for (self.workers, 0..) |*worker, idx| {
+        for (normalized.max_threads..total_worker_slots) |oidx| {
+            self.local_queues[oidx] = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
+            self.workers[oidx] = .{
+                .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
+                .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
+                .serves_lane = .default,
+                .is_overflow = true,
+            };
+            self.recordOwnedAlloc(self.local_queues[oidx].capacity() * @sizeOf(u32));
+        }
+
+        for (self.workers[0..normalized.max_threads], 0..) |*worker, idx| {
             worker.thread = try std.Thread.spawn(.{}, workerMain, .{ self, idx });
         }
 
@@ -581,6 +598,15 @@ const Core = struct {
     fn joinAllWorkers(self: *Core) void {
         // Signal all workers to exit
         self.state.store(.stopping, .release);
+        // Stop the watchdog FIRST so it cannot spawn new overflow workers
+        // while we are joining. The watchdog only reads worker atomics and
+        // spawns threads — stopping it before the worker join pass ensures
+        // no new threads appear after we start joining.
+        if (self.watchdog_thread) |thread| {
+            self.watchdog_stop.store(true, .release);
+            thread.join();
+            self.watchdog_thread = null;
+        }
         // Wake every worker so they observe the state change and exit.
         for (self.workers) |*w| {
             w.park_mutex.lock();
@@ -598,20 +624,12 @@ const Core = struct {
         self.sync.blocking_backpressure_cond.broadcast();
         self.sync.blocking_backpressure_mutex.unlock();
 
-        // Join all threads
+        // Join all threads (regular + any active overflow workers)
         for (self.workers) |*worker| {
             if (worker.thread) |thread| {
                 thread.join();
                 worker.thread = null;
             }
-        }
-        // Slice L4: stop and join the watchdog last — it only reads pool
-        // state, so joining after workers ensures it won't touch a partially-
-        // freed worker struct.
-        if (self.watchdog_thread) |thread| {
-            self.watchdog_stop.store(true, .release);
-            thread.join();
-            self.watchdog_thread = null;
         }
         self.state.store(.stopped, .release);
     }
@@ -740,6 +758,9 @@ const Core = struct {
             .live_bytes = self.counters.live_bytes.load(.acquire),
             .peak_live_bytes = self.counters.peak_live_bytes.load(.acquire),
             .watchdog_stalls_detected = self.counters.watchdog_stalls_detected.load(.acquire),
+            .overflow_spawns = self.counters.overflow_spawns.load(.acquire),
+            .overflow_retires = self.counters.overflow_retires.load(.acquire),
+            .overflow_active = self.counters.overflow_active.load(.acquire),
             .task_wait_ns = merged_wait.summary(),
             .task_exec_ns = merged_exec.summary(),
             .memory = memory,
@@ -927,38 +948,102 @@ const Core = struct {
     }
 
     /// Slice L4 — watchdog main loop. Wakes every `watchdog_interval_ns`,
-    /// walks default-lane workers, and increments
+    /// walks default-lane workers [nb..max_threads), and increments
     /// `counters.watchdog_stalls_detected` for each worker whose current task
-    /// has been running longer than `blocking_promotion_timeout_ns`. Exits
-    /// when `watchdog_stop` is set by `joinAllWorkers`.
-    ///
-    /// Overflow-worker spawn is intentionally deferred to L4b — this slice
-    /// lands observability only so operators can size their pool based on
-    /// measured stall rates before turning on elastic promotion.
+    /// has been running longer than `blocking_promotion_timeout_ns`. When
+    /// stalls are detected, spawns up to one overflow worker per tick via
+    /// `maybeSpawnOverflow`. Exits when `watchdog_stop` is set by
+    /// `joinAllWorkers`.
     fn watchdogMain(self: *Core) void {
         const interval_ns = self.config.watchdog_interval_ns;
         const timeout_ns = self.config.blocking_promotion_timeout_ns;
         const nb: usize = self.config.blocking_workers;
         while (!self.watchdog_stop.load(.acquire)) {
-            // Sleep first so startup races don't fire a spurious stall on
-            // worker slots that haven't been populated yet.
             std.Thread.sleep(interval_ns);
             if (self.watchdog_stop.load(.acquire)) break;
 
+            self.reapRetiredOverflow();
+
             const now = nowNs();
-            // Only default-lane workers [nb..workers.len) — blocking-lane
-            // stalls are expected (that's what the lane is for) and are not
-            // candidates for overflow promotion.
+            var stalls_this_tick: u32 = 0;
             var idx: usize = nb;
-            while (idx < self.workers.len) : (idx += 1) {
+            while (idx < self.config.max_threads) : (idx += 1) {
                 const started = self.workers[idx].current_task_started_ns.load(.acquire);
                 if (started == 0) continue;
                 if (now <= started) continue;
                 if (now - started > timeout_ns) {
                     _ = self.counters.watchdog_stalls_detected.fetchAdd(1, .monotonic);
+                    stalls_this_tick += 1;
                 }
             }
+
+            if (stalls_this_tick > 0) {
+                self.maybeSpawnOverflow();
+            }
         }
+    }
+
+    fn reapRetiredOverflow(self: *Core) void {
+        const max_overflow = self.config.max_overflow_workers;
+        if (max_overflow == 0) return;
+        const overflow_start = self.config.max_threads;
+        const overflow_end = overflow_start + max_overflow;
+        var idx: usize = overflow_start;
+        while (idx < overflow_end) : (idx += 1) {
+            var worker = &self.workers[idx];
+            if (worker.overflow_retired.load(.acquire) and worker.thread != null) {
+                worker.thread.?.join();
+                worker.thread = null;
+                worker.overflow_retired.store(false, .release);
+                _ = self.counters.overflow_retires.fetchAdd(1, .monotonic);
+                _ = self.counters.overflow_active.fetchSub(1, .monotonic);
+            }
+        }
+    }
+
+    fn maybeSpawnOverflow(self: *Core) void {
+        const max_overflow = self.config.max_overflow_workers;
+        if (max_overflow == 0) return;
+        const overflow_start = self.config.max_threads;
+        const overflow_end = overflow_start + max_overflow;
+        var idx: usize = overflow_start;
+        while (idx < overflow_end) : (idx += 1) {
+            var worker = &self.workers[idx];
+            if (worker.thread == null) {
+                worker.thread = std.Thread.spawn(.{}, overflowWorkerMain, .{ self, idx }) catch return;
+                _ = self.counters.overflow_spawns.fetchAdd(1, .monotonic);
+                _ = self.counters.overflow_active.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+
+    fn overflowWorkerMain(self: *Core, worker_index: usize) void {
+        tls_worker_index = worker_index;
+        defer tls_worker_index = null;
+        const idle_retire_ns: u64 = self.config.watchdog_interval_ns * 2;
+        var idle_since: u64 = 0;
+
+        while (true) {
+            if (self.shouldExit()) break;
+
+            const maybe_entry = self.nextTask(worker_index);
+            if (maybe_entry == null) {
+                const now = nowNs();
+                if (idle_since == 0) {
+                    idle_since = now;
+                } else if (now - idle_since > idle_retire_ns) {
+                    break;
+                }
+                self.idle(worker_index);
+                continue;
+            }
+
+            idle_since = 0;
+            self.runTask(worker_index, maybe_entry.?);
+        }
+
+        self.workers[worker_index].overflow_retired.store(true, .release);
     }
 
     fn workerMain(self: *Core, worker_index: usize) void {

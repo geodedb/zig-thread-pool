@@ -500,3 +500,109 @@ test "default workers ignore blocking lane without cpu_helps_blocking" {
     // 1 sleeper + 8 blocking counters + 256 default counters = 265.
     try std.testing.expectEqual(@as(u64, 265), counter.value.load(.acquire));
 }
+
+test "overflow worker spawned when default workers stall" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .watchdog_interval_ns = 5 * std.time.ns_per_ms,
+        .blocking_promotion_timeout_ns = 10 * std.time.ns_per_ms,
+        .max_overflow_workers = 1,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    var gate1 = common.GateTaskContext{ .counter = &counter };
+    var gate2 = common.GateTaskContext{ .counter = &counter };
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate1), .{ .wait_group = &wg });
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate2), .{ .wait_group = &wg });
+    try waitUntilGateStarted(&gate1);
+    try waitUntilGateStarted(&gate2);
+
+    for (0..16) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.overflow_spawns >= 1);
+
+    gate1.release.store(true, .release);
+    gate2.release.store(true, .release);
+    wg.wait();
+
+    try std.testing.expectEqual(@as(u64, 18), counter.value.load(.acquire));
+}
+
+test "overflow worker self-retires after idle period" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .watchdog_interval_ns = 5 * std.time.ns_per_ms,
+        .blocking_promotion_timeout_ns = 10 * std.time.ns_per_ms,
+        .max_overflow_workers = 1,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    var gate1 = common.GateTaskContext{ .counter = &counter };
+    var gate2 = common.GateTaskContext{ .counter = &counter };
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate1), .{ .wait_group = &wg });
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate2), .{ .wait_group = &wg });
+    try waitUntilGateStarted(&gate1);
+    try waitUntilGateStarted(&gate2);
+
+    for (0..4) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    const stats1 = pool.statsSnapshot();
+    try std.testing.expect(stats1.overflow_spawns >= 1);
+
+    gate1.release.store(true, .release);
+    gate2.release.store(true, .release);
+    wg.wait();
+
+    std.Thread.sleep(40 * std.time.ns_per_ms);
+
+    const stats2 = pool.statsSnapshot();
+    try std.testing.expect(stats2.overflow_retires >= 1);
+    try std.testing.expectEqual(@as(u64, 0), stats2.overflow_active);
+}
+
+test "max_overflow_workers = 0 produces no overflow activity" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 50 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg });
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.overflow_spawns);
+    try std.testing.expectEqual(@as(u64, 0), stats.overflow_retires);
+    try std.testing.expectEqual(@as(u64, 0), stats.overflow_active);
+}
