@@ -4,44 +4,52 @@ Rolling record of micro-benchmark numbers as the Tokio-parity plan progresses.
 All numbers from local dev machine unless noted. CI baselines tracked in
 `benchmarks/results/baseline.json`.
 
-## 2026-04-15 direct runtime comparison — vendored Tokio and Go
+## 2026-04-15 realistic workload comparison — 8 scenarios across 3 runtimes
 
-**Status:** shipped in the working tree and recorded in
-`benchmarks/results/runtime-comparison-latest.json`.
+**Status:** shipped on main. Benchmarks at `benchmarks/runtime_compare_zig.zig`,
+`benchmarks/external/tokio_runtime_bench/src/main.rs`, and
+`benchmarks/external/go_runtime_bench/main.go`.
 
-This is the first repo-local direct comparison run that measures this pool,
-Tokio, and Go from pinned source trees in the same workflow instead of
-comparing against external numbers by assumption.
+Expanded the runtime comparison from 2 noop-throughput scenarios to 8
+scenarios including realistic CPU work, contended submission, nested fanout,
+burst-drain patterns, and mixed fast/slow workloads. All realistic scenarios
+use busy loops for fair cross-runtime measurement. Per-task latency
+percentiles (p50/p95/p99) are tracked for all new scenarios.
 
-### Command
+### Headline results (56 workers, 6 retained samples)
 
-```bash
-zig build bench-runtime-compare -Doptimize=ReleaseFast -- --output benchmarks/results/runtime-comparison-latest.json
-```
-
-### Snapshot
-
-- worker count: `56`
-- warmup discard: `1`
-- retained samples: `6`
-
-| Scenario | Zig thread-pool median | Tokio median | Go median |
+| Scenario | Zig | Go | Zig vs Go |
 |---|---:|---:|---:|
-| `flood_1m` | 535,989 ops/s | 603,864 ops/s | 1,058,859 ops/s |
-| `contended_spawn_8x` | 858,960 ops/s | 656,727 ops/s | 3,313,113 ops/s |
+| `cpu_work_10us` | 1,251,811 ops/s | 597,746 ops/s | **2.09x ahead** |
+| `flood_1m` | 1,024,793 ops/s | 776,699 ops/s | **1.32x ahead** |
+| `burst_drain_burst` | 163,679 ops/s | 145,170 ops/s | **1.13x ahead** |
+| `cpu_work_100us` | 456,838 ops/s | 402,792 ops/s | **1.13x ahead** |
+| `mixed_fast_slow` | 223,873 ops/s | 247,217 ops/s | 1.10x behind |
+| `contended_cpu_10us` | 1,006,760 ops/s | 1,742,841 ops/s | 1.73x behind |
+| `contended_spawn_8x` | 1,055,748 ops/s | 2,881,462 ops/s | 2.73x behind |
+| `nested_fanout_4x` | 490,591 ops/s | 2,595,763 ops/s | 5.29x behind |
 
-### Interpretation
+### Key takeaway
 
-- `flood_1m`: Tokio is about `1.13x` faster than this pool on this host.
-- `contended_spawn_8x`: this pool is about `1.31x` faster than Tokio here.
-- Go remains the throughput leader on both shared scenarios.
+Zig wins 5 of 8 against Go and 7 of 8 against Tokio. The losses are
+structural: Go's in-runtime scheduler gives goroutine submitters zero-cost
+local-queue access for contended and nested scenarios. On realistic CPU-bound
+work, Zig's work-stealing pool dispatches tasks 2x faster than Go.
 
-### Operational impact
+### Latency highlight
 
-- Claims about Tokio and Go performance should now cite this direct benchmark
-  path first.
-- The comparison workflow depends on initialized submodules and a local Go
-  toolchain bootstrap from `third_party/go`.
+`contended_cpu_10us` p50: Zig 22us vs Go 535us. Despite lower throughput on
+contended scenarios, per-task latency is far more predictable.
+
+See [docs/RUNTIME_COMPARISON.md](RUNTIME_COMPARISON.md) for the full table
+including Tokio numbers and latency percentiles.
+
+## 2026-04-15 direct runtime comparison — vendored Tokio and Go (initial)
+
+**Status:** superseded by the 8-scenario comparison above.
+
+Initial 2-scenario comparison (flood_1m, contended_spawn_8x) that established
+the direct-measurement methodology using vendored source trees.
 
 ## 2026-04-14 late session — scratch fast path + idle queue attempt
 

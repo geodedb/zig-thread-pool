@@ -38,6 +38,7 @@ benchmarks/external/tokio_runtime_bench/target/
 
 # Core dumps
 core
+core.*
 
 # Distribution
 dist/
@@ -61,5 +62,14 @@ zig-*/
 *.key
 *.p12
 *.pfx
+
+# Compiled Go benchmark binary
+benchmarks/external/go_runtime_bench/thread-pool-go-runtime-bench
+
+# Temporary benchmark results
+benchmarks/results/.tmp/
+
+# Experimental / unfinished source (retained for future use)
+src/topology.zig
 
 .claude/scheduled_tasks.lock
