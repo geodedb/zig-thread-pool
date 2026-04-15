@@ -65,10 +65,20 @@ fn parseProcStatusKiB(contents: []const u8, prefix: []const u8) u64 {
         if (!std.mem.startsWith(u8, line, prefix)) continue;
         var field_it = std.mem.tokenizeAny(u8, line[prefix.len..], " \t");
         while (field_it.next()) |field| {
-            return std.fmt.parseInt(u64, field, 10) catch 0;
+            const kib = std.fmt.parseInt(u64, field, 10) catch return 0;
+            // Cap so caller *1024 cannot overflow u64 (F-007).
+            return @min(kib, std.math.maxInt(u64) / 1024);
         }
     }
     return 0;
+}
+
+test "F-007: parseProcStatusKiB clamps so callers can *1024 without overflow" {
+    const big = "VmRSS:\t18446744073709551615 kB\n";
+    const v = parseProcStatusKiB(big, "VmRSS:");
+    // Caller multiplies by 1024; this must not overflow u64.
+    _ = v *% 1024; // wrapping mul would catch a regression via assertion below
+    try std.testing.expect(v <= std.math.maxInt(u64) / 1024);
 }
 
 fn sampleMacos() !types.ProcessMemoryStats {

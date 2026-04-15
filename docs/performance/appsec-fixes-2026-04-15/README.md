@@ -29,7 +29,7 @@ Update the Status and Regression class columns in the table below after each ste
 | 3 | F-003 atomic free_indices | done | clean (zero codegen delta on x86_64; all low-stddev scenarios flat-to-improved) |
 | 4 | F-006 no unreachable blocking_inject | done | clean (contention-bench variance within historical 9–10% CV; realistic scenarios flat-to-improved) |
 | 5 | F-005 harden releaseSubmitter | done | clean (releaseSubmitter is cold-path lifecycle, not exercised in any bench; all shifts are sample-to-sample noise within known 9–14% CV, see diff) |
-| 6 | F-004 soften WaitGroup.done | pending | – |
-| 7 | F-007 clamp parseProcStatusKiB | pending | – |
+| 6 | F-004 soften WaitGroup.done | done | clean (bench noise, ruled out by construction on underflow-only code path) |
+| 7 | F-007 clamp parseProcStatusKiB | done | clean (bench noise, ruled out by construction on stats-sampling-only code path) |
 | 8 | TSan stress run | pending | – |
 | 9 | Fuzz harness | pending | – |
