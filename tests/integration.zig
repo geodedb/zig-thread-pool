@@ -2,6 +2,11 @@ const std = @import("std");
 const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
+// F-001 regression test: cross-pool TLS index scoping
+comptime {
+    _ = @import("integration/two_pool_cross_submit.zig");
+}
+
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
     const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
     while (thread_pool.clock.nanoTimestamp() < deadline) {

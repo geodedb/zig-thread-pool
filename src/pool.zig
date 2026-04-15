@@ -10,8 +10,15 @@ const Accounting = @import("memory/scratch.zig").Accounting;
 const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
 const process_memory = @import("stats/process_memory.zig");
 
-threadlocal var tls_worker_index: ?usize = null;
-threadlocal var tls_submitter_index: ?usize = null;
+/// TLS state scoped per pool. Each entry records the `Core *` that set it,
+/// so cross-pool submits don't index pool-A's slot into pool-B's arrays
+/// (F-001). The stored pointer is compared for identity only; no deref.
+const TlsSlot = struct {
+    pool: ?*anyopaque = null,
+    index: usize = 0,
+};
+threadlocal var tls_worker_slot: TlsSlot = .{};
+threadlocal var tls_submitter_slot: TlsSlot = .{};
 
 /// Runtime context passed to every task function. Provides the worker
 /// index, cancellation state, and access to the per-worker scratch allocator.
@@ -561,7 +568,7 @@ const Core = struct {
             const idx: usize = @ctz(mask);
             const bit: u64 = @as(u64, 1) << @intCast(idx);
             if (self.submitter_free_mask.cmpxchgWeak(mask, mask & ~bit, .acq_rel, .monotonic) == null) {
-                tls_submitter_index = idx;
+                tls_submitter_slot = .{ .pool = @as(*anyopaque, @ptrCast(self)), .index = idx };
                 _ = self.submitter_nonempty.fetchOr(bit, .release);
                 return idx;
             }
@@ -569,7 +576,7 @@ const Core = struct {
     }
 
     pub fn releaseSubmitter(self: *Core, idx: usize) void {
-        tls_submitter_index = null;
+        tls_submitter_slot = .{};
         while (self.submitter_queues[idx].stealOne()) |entry| {
             _ = self.inject_queue.tryPush(entry);
         }
@@ -912,27 +919,29 @@ const Core = struct {
             // both use per-worker queues; global_queue skips them.
             const uses_local = self.config.scheduler_variant == .work_stealing or
                 self.config.scheduler_variant == .lane_extension;
-            if (uses_local and tls_worker_index != null) {
-                const wi = tls_worker_index.?;
-                const w = &self.workers[wi];
-                if (w.serves_lane == .default) {
-                    if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
-                        w.lifo_slot.store(entry, .release);
-                        queued = true;
-                    } else {
-                        const was_empty = w.owned_queue_len == 0;
-                        queued = self.local_queues[wi].tryPushBottom(entry);
-                        if (queued) {
-                            w.owned_queue_len += 1;
-                            if (was_empty) self.markWorkerNonEmpty(wi);
-                            updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
+            if (uses_local) {
+                if (self.tlsWorkerIndexFor()) |wi| {
+                    const w = &self.workers[wi];
+                    if (w.serves_lane == .default) {
+                        if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
+                            w.lifo_slot.store(entry, .release);
+                            queued = true;
+                        } else {
+                            const was_empty = w.owned_queue_len == 0;
+                            queued = self.local_queues[wi].tryPushBottom(entry);
+                            if (queued) {
+                                w.owned_queue_len += 1;
+                                if (was_empty) self.markWorkerNonEmpty(wi);
+                                updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
+                            }
                         }
                     }
                 }
             }
-            if (!queued and tls_submitter_index != null) {
-                const si = tls_submitter_index.?;
-                queued = self.submitter_queues[si].tryPushBottom(entry);
+            if (!queued) {
+                if (self.tlsSubmitterIndexFor()) |si| {
+                    queued = self.submitter_queues[si].tryPushBottom(entry);
+                }
             }
             if (!queued) {
                 queued = self.inject_queue.tryPush(entry);
@@ -1084,8 +1093,8 @@ const Core = struct {
     }
 
     fn overflowWorkerMain(self: *Core, worker_index: usize) void {
-        tls_worker_index = worker_index;
-        defer tls_worker_index = null;
+        tls_worker_slot = .{ .pool = @as(*anyopaque, @ptrCast(self)), .index = worker_index };
+        defer tls_worker_slot = .{};
         const idle_retire_ns: u64 = self.config.watchdog_interval_ns * 2;
         var idle_since: u64 = 0;
 
@@ -1112,8 +1121,8 @@ const Core = struct {
     }
 
     fn workerMain(self: *Core, worker_index: usize) void {
-        tls_worker_index = worker_index;
-        defer tls_worker_index = null;
+        tls_worker_slot = .{ .pool = @as(*anyopaque, @ptrCast(self)), .index = worker_index };
+        defer tls_worker_slot = .{};
 
         while (true) {
             if (self.shouldExit()) break;
@@ -1126,6 +1135,26 @@ const Core = struct {
 
             self.runTask(worker_index, maybe_entry.?);
         }
+    }
+
+    /// Returns the TLS worker index only when it belongs to this pool and the
+    /// index is in-bounds for `self.workers`. Cross-pool submits return null
+    /// and fall through to the shared inject queue (F-001).
+    inline fn tlsWorkerIndexFor(self: *Core) ?usize {
+        const slot = tls_worker_slot;
+        if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        if (slot.index >= self.workers.len) return null;
+        return slot.index;
+    }
+
+    /// Returns the TLS submitter index only when it belongs to this pool and
+    /// the index is in-bounds for `self.submitter_queues`. Cross-pool submits
+    /// return null and fall through to the shared inject queue (F-001).
+    inline fn tlsSubmitterIndexFor(self: *Core) ?usize {
+        const slot = tls_submitter_slot;
+        if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        if (slot.index >= self.submitter_queues.len) return null;
+        return slot.index;
     }
 
     inline fn markWorkerNonEmpty(self: *Core, worker_index: usize) void {
