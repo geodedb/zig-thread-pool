@@ -987,10 +987,17 @@ const Core = struct {
         if (options.lane == .blocking) {
             // Blocking-lane submit: go directly to the blocking inject queue.
             // Config.validate enforces allow_blocking_lane → blocking_workers > 0,
-            // so blocking_inject is guaranteed non-null here.
+            // so blocking_inject is non-null under normal operation.
             if (self.blocking_inject) |*bi| {
                 queued = bi.tryPush(entry);
-            } else unreachable;
+            } else {
+                // Defense-in-depth: Config.validate + allow_blocking_lane gate
+                // above should make this branch unreachable. Falling back to
+                // the default inject queue preserves forward progress if the
+                // invariant is ever broken by a future refactor, instead of
+                // becoming ReleaseFast UB (F-006).
+                queued = self.inject_queue.tryPush(entry);
+            }
         } else {
             // Default-lane submit: LIFO/local fast path, gated on TLS worker
             // being a default-lane worker. work_stealing and lane_extension
@@ -1344,7 +1351,9 @@ const Core = struct {
         lane: types.TaskLane,
         uses_local: bool,
     ) ?QueueEntry {
-        const lane_inject = self.laneInjectQueue(lane);
+        // If blocking_inject is absent (invariant broken), treat as no work
+        // available for this lane rather than trapping on UB (F-006).
+        const lane_inject = self.laneInjectQueue(lane) orelse return null;
         const lane_bits = self.laneMask(lane);
 
         if (!uses_local) {
@@ -1444,10 +1453,15 @@ const Core = struct {
     /// Returns the inject queue this worker should drain based on its lane.
     /// When `blocking_workers == 0`, all workers are `.default` and this
     /// always returns `&inject_queue` — no change vs pre-L1.
-    inline fn laneInjectQueue(self: *Core, lane: types.TaskLane) *BoundedRing(QueueEntry) {
+    /// Returns null for `.blocking` if `blocking_inject` is absent — callers
+    /// treat null as "no work available on this lane" (F-006).
+    inline fn laneInjectQueue(self: *Core, lane: types.TaskLane) ?*BoundedRing(QueueEntry) {
         return switch (lane) {
             .default => &self.inject_queue,
-            .blocking => if (self.blocking_inject) |*bi| bi else unreachable,
+            // Returns null if the blocking lane is disabled — Config.validate
+            // should prevent this in production, but we keep the fallback to
+            // avoid ReleaseFast UB if the invariant breaks (F-006).
+            .blocking => if (self.blocking_inject) |*bi| bi else null,
         };
     }
 

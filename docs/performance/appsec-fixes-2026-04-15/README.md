@@ -27,7 +27,7 @@ Update the Status and Regression class columns in the table below after each ste
 | 1 | F-001 per-pool TLS | done | clean (bench noise, see diff) |
 | 2 | F-002 spawn errdefer | done | clean (bench + p95 noise, ruled out by construction) |
 | 3 | F-003 atomic free_indices | done | clean (zero codegen delta on x86_64; all low-stddev scenarios flat-to-improved) |
-| 4 | F-006 no unreachable blocking_inject | pending | – |
+| 4 | F-006 no unreachable blocking_inject | done | clean (contention-bench variance within historical 9–10% CV; realistic scenarios flat-to-improved) |
 | 5 | F-005 harden releaseSubmitter | pending | – |
 | 6 | F-004 soften WaitGroup.done | pending | – |
 | 7 | F-007 clamp parseProcStatusKiB | pending | – |
