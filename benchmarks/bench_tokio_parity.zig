@@ -11,7 +11,9 @@
 //! suite require a continuation/callback feature this pool doesn't expose
 //! today; they can be added when nested-submit gets a first-class API.
 const std = @import("std");
+const builtin = @import("builtin");
 const thread_pool = @import("thread_pool");
+const common = @import("common.zig");
 
 const flood_count: usize = 1_000_000;
 const contended_count: usize = 100_000;
@@ -170,9 +172,16 @@ const ContendedBatchedSubmitterCtx = struct {
     wg: *thread_pool.WaitGroup,
     marker: *NoopCtx,
     count: usize,
+    pin_cpu_id: ?u32 = null,
 };
 
 fn contendedBatchedSubmitterThread(ctx: *ContendedBatchedSubmitterCtx) void {
+    if (ctx.pin_cpu_id) |cpu_id| {
+        // Best-effort pin: if the host can't honor it (non-Linux / OOR), fall
+        // through and measure unpinned — a noisy single data point is better
+        // than a silently-failed scenario.
+        common.pinCurrentThreadToCpu(cpu_id) catch {};
+    }
     var batch: [flood_batch_size]thread_pool.BatchTask = undefined;
     for (&batch) |*b| {
         b.* = .{ .task_fn = noopTask, .ctx = @ptrCast(ctx.marker) };
@@ -189,7 +198,14 @@ fn contendedBatchedSubmitterThread(ctx: *ContendedBatchedSubmitterCtx) void {
     }
 }
 
-fn benchContendedBatched(out_writer: anytype) !void {
+/// Shared core for all contended-batched variants.  `pin_cpus` is either
+/// null (no pinning — the existing baseline) or an 8-element array with the
+/// target cpu id per submitter.
+fn benchContendedBatchedCore(
+    out_writer: anytype,
+    scenario_label: []const u8,
+    pin_cpus: ?[contended_submitters]u32,
+) !void {
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
         .max_threads = 0,
         .queue_capacity = 4096,
@@ -212,6 +228,7 @@ fn benchContendedBatched(out_writer: anytype) !void {
             .wg = &wg,
             .marker = &ctx,
             .count = per_submitter,
+            .pin_cpu_id = if (pin_cpus) |cpus| cpus[i] else null,
         };
         threads[i] = try std.Thread.spawn(.{}, contendedBatchedSubmitterThread, .{&submitter_ctxs[i]});
     }
@@ -224,7 +241,136 @@ fn benchContendedBatched(out_writer: anytype) !void {
     const ops_per_sec = @as(f64, @floatFromInt(total_tasks)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
 
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=contended_spawn_8x_batched tasks={d} submitters={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ total_tasks, contended_submitters, flood_batch_size, elapsed_ns, ops_per_sec });
+    const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario={s} tasks={d} submitters={d} batch={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ scenario_label, total_tasks, contended_submitters, flood_batch_size, elapsed_ns, ops_per_sec });
+    try out_writer.writeAll(line);
+}
+
+fn benchContendedBatched(out_writer: anytype) !void {
+    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched", null);
+}
+
+// === Pinned variants (Slice 0) ===========================================
+//
+// Without producer pinning, the kernel scatters the 8 submitter threads
+// across the 2 sockets in a way that varies run-to-run, making cross-socket
+// coherence effects indistinguishable from measurement noise.  The three
+// variants below pin producers to controlled placements so downstream
+// slices (sharded inject, socket-local wake-scan) have a measurable signal.
+
+/// socket_cpus[0] = cpus on socket 0, socket_cpus[1] = cpus on socket 1.
+/// On a single-socket box or discovery failure, both slices may be empty or
+/// degenerate; the scenario-runners skip with a note in that case.
+const SocketMap = struct {
+    s0: []u32,
+    s1: []u32,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *SocketMap) void {
+        self.allocator.free(self.s0);
+        self.allocator.free(self.s1);
+    }
+};
+
+fn discoverSocketMap(allocator: std.mem.Allocator) !SocketMap {
+    const s0 = try common.cpusInSocket(allocator, 0);
+    errdefer allocator.free(s0);
+    const s1 = try common.cpusInSocket(allocator, 1);
+    return .{ .s0 = s0, .s1 = s1, .allocator = allocator };
+}
+
+fn pickCpu(list: []const u32, idx: usize) u32 {
+    // Round-robin over the socket's cpu list.  Never out of bounds: callers
+    // check list.len > 0 before calling.
+    return list[idx % list.len];
+}
+
+fn benchContendedBatchedSymmetric(out_writer: anytype, map: SocketMap) !void {
+    if (map.s0.len == 0 or map.s1.len == 0) {
+        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_symmetric SKIPPED (need >=2 sockets)\n");
+        return;
+    }
+    var pins: [contended_submitters]u32 = undefined;
+    // 4 on socket 0, 4 on socket 1
+    pins[0] = pickCpu(map.s0, 0);
+    pins[1] = pickCpu(map.s0, 1);
+    pins[2] = pickCpu(map.s0, 2);
+    pins[3] = pickCpu(map.s0, 3);
+    pins[4] = pickCpu(map.s1, 0);
+    pins[5] = pickCpu(map.s1, 1);
+    pins[6] = pickCpu(map.s1, 2);
+    pins[7] = pickCpu(map.s1, 3);
+    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_symmetric", pins);
+}
+
+fn benchContendedBatchedAsymmetric(out_writer: anytype, map: SocketMap) !void {
+    if (map.s0.len < contended_submitters) {
+        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_asymmetric SKIPPED (socket 0 has too few cpus)\n");
+        return;
+    }
+    var pins: [contended_submitters]u32 = undefined;
+    for (0..contended_submitters) |i| pins[i] = pickCpu(map.s0, i);
+    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_asymmetric", pins);
+}
+
+fn benchContendedBatchedCrosssocket(out_writer: anytype, map: SocketMap) !void {
+    if (map.s1.len < contended_submitters) {
+        try out_writer.writeAll("tokio_parity scenario=contended_spawn_8x_batched_crosssocket SKIPPED (socket 1 has too few cpus)\n");
+        return;
+    }
+    var pins: [contended_submitters]u32 = undefined;
+    for (0..contended_submitters) |i| pins[i] = pickCpu(map.s1, i);
+    try benchContendedBatchedCore(out_writer, "contended_spawn_8x_batched_crosssocket", pins);
+}
+
+// === flood_1m_crosssocket =================================================
+// Single submitter pinned to socket 1.  Workers default (both sockets).
+// Isolates cross-socket inject cost from the multi-producer contention
+// overlay that benchContendedBatched scenarios introduce.
+fn benchFloodCrosssocket(out_writer: anytype, map: SocketMap) !void {
+    if (map.s1.len == 0) {
+        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (no socket 1)\n");
+        return;
+    }
+
+    // Create the pool FIRST.  Worker threads inherit the current main-thread
+    // affinity, so we must not be pinned yet or all 56 workers will collapse
+    // onto a single cpu, producing a meaningless "in-L1" throughput.
+    var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
+        .max_threads = 0,
+        .queue_capacity = 4096,
+        .local_queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    const saved = common.getCurrentAffinity() catch {
+        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (affinity save failed)\n");
+        return;
+    };
+    defer common.setAffinity(&saved) catch {};
+
+    common.pinCurrentThreadToCpu(map.s1[0]) catch {
+        try out_writer.writeAll("tokio_parity scenario=flood_1m_crosssocket SKIPPED (pin failed)\n");
+        return;
+    };
+
+    var ctx = NoopCtx{};
+    var wg = pool.waitGroup();
+    const start = std.time.nanoTimestamp();
+    for (0..flood_count) |_| {
+        _ = try pool.submit(noopTask, @ptrCast(&ctx), .{
+            .wait_group = &wg,
+            .backpressure = .block,
+        });
+    }
+    wg.wait();
+    const end = std.time.nanoTimestamp();
+
+    const elapsed_ns: u64 = @intCast(end - start);
+    const ops_per_sec = @as(f64, @floatFromInt(flood_count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    var buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(buf[0..], "tokio_parity scenario=flood_1m_crosssocket tasks={d} elapsed_ns={d} ops_per_sec={d:.0}\n", .{ flood_count, elapsed_ns, ops_per_sec });
     try out_writer.writeAll(line);
 }
 
@@ -235,4 +381,22 @@ pub fn main() !void {
     try benchFloodBatched(stdout);
     try benchContended(stdout);
     try benchContendedBatched(stdout);
+
+    // Pinned variants require socket topology.  On non-Linux / single-socket
+    // hosts the discoverSocketMap call may error or produce empty slices;
+    // each scenario guards itself and prints a SKIPPED line.
+    if (builtin.os.tag == .linux) {
+        var map = discoverSocketMap(std.heap.smp_allocator) catch null;
+        if (map) |*m| {
+            defer m.deinit();
+            try benchFloodCrosssocket(stdout, m.*);
+            try benchContendedBatchedSymmetric(stdout, m.*);
+            try benchContendedBatchedAsymmetric(stdout, m.*);
+            try benchContendedBatchedCrosssocket(stdout, m.*);
+        } else {
+            try stdout.writeAll("tokio_parity pinned-variants SKIPPED (socket discovery failed)\n");
+        }
+    } else {
+        try stdout.writeAll("tokio_parity pinned-variants SKIPPED (non-Linux)\n");
+    }
 }

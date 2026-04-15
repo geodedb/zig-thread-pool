@@ -496,3 +496,85 @@ pub fn noopTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     const marker: *volatile u8 = @ptrCast(raw_ctx);
     marker.* +%= 1;
 }
+
+// --- Affinity helpers for producer-pinning benches (Slice 0) ---
+//
+// Cross-socket L3 coherence cost dominates batched-submit scenarios on
+// multi-socket hosts.  Without explicit producer pinning, std.Thread.spawn
+// lets the kernel scatter producers across sockets, so two runs of the same
+// bench at the same SHA differ by topology noise alone.  These helpers are
+// Linux-only; on other OSes they return error.Unsupported so callers can
+// gracefully skip pinning.
+
+pub fn pinCurrentThreadToCpu(cpu_id: u32) !void {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var set: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const bits_per_word = @sizeOf(usize) * 8;
+    const word_idx: usize = cpu_id / bits_per_word;
+    if (word_idx >= set.len) return error.CpuIdOutOfRange;
+    const bit_idx: u6 = @intCast(cpu_id % bits_per_word);
+    set[word_idx] |= @as(usize, 1) << bit_idx;
+    try std.os.linux.sched_setaffinity(0, &set);
+}
+
+pub fn cpuSocketId(cpu_id: u32) !u32 {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu_id}) catch return error.SocketIdUnavailable;
+    var file = std.fs.openFileAbsolute(path, .{}) catch return error.SocketIdUnavailable;
+    defer file.close();
+    var read_buf: [32]u8 = undefined;
+    const len = file.readAll(&read_buf) catch return error.SocketIdUnavailable;
+    const trimmed = std.mem.trim(u8, read_buf[0..len], " \r\n\t");
+    return std.fmt.parseInt(u32, trimmed, 10) catch error.SocketIdUnavailable;
+}
+
+/// Enumerate the CPUs belonging to a given socket.  Caller owns and frees.
+/// Returns an empty slice if no CPUs match (e.g. socket id not present).
+pub fn cpusInSocket(allocator: std.mem.Allocator, socket_id: u32) ![]u32 {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var list = std.ArrayList(u32){};
+    errdefer list.deinit(allocator);
+    var miss_streak: u32 = 0;
+    var cpu: u32 = 0;
+    while (cpu < 4096 and miss_streak < 16) : (cpu += 1) {
+        const sid = cpuSocketId(cpu) catch {
+            miss_streak += 1;
+            continue;
+        };
+        miss_streak = 0;
+        if (sid == socket_id) try list.append(allocator, cpu);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Discover how many distinct sockets (physical packages) exist.
+pub fn socketCount() !u32 {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var seen: u64 = 0;
+    var miss_streak: u32 = 0;
+    var cpu: u32 = 0;
+    while (cpu < 4096 and miss_streak < 16) : (cpu += 1) {
+        const sid = cpuSocketId(cpu) catch {
+            miss_streak += 1;
+            continue;
+        };
+        miss_streak = 0;
+        if (sid >= 64) continue;
+        seen |= @as(u64, 1) << @intCast(sid);
+    }
+    return @popCount(seen);
+}
+
+pub fn getCurrentAffinity() !std.os.linux.cpu_set_t {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var set: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const rc = std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set);
+    if (rc != 0) return error.Unexpected;
+    return set;
+}
+
+pub fn setAffinity(set: *const std.os.linux.cpu_set_t) !void {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    try std.os.linux.sched_setaffinity(0, set);
+}
