@@ -2,7 +2,7 @@
 
 ## Repository Summary
 
-`thread-pool` is a Zig `0.15.2` library that exposes a bounded thread pool with
+`thread-pool` is a Zig `0.16.0` library that exposes a bounded thread pool with
 `global_queue`, `work_stealing`, and `lane_extension` scheduler variants behind
 one API.
 

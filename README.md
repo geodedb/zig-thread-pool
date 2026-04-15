@@ -4,7 +4,7 @@
 
 ## Status
 
-- Current Zig target: `0.15.2`
+- Current Zig target: `0.16.0`
 - Scheduler variants shipped: `global_queue`, `work_stealing`
 - Current default: `global_queue`
 - Benchmark baseline: [benchmarks/results/baseline.json](benchmarks/results/baseline.json)

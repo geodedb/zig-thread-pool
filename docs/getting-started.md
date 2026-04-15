@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Zig `0.15.2`
+- Zig `0.16.0`
 - Git submodules initialized if you want direct Tokio/Go comparisons:
 
 ```bash
