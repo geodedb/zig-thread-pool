@@ -92,10 +92,10 @@ if [[ "$PHASE" == "after" ]]; then
                   $a.scenario_name, $a.scheduler_variant,
                   ($b.throughput_ops_per_sec | tostring),
                   ($a.ops_after | tostring),
-                  ((($a.ops_after - $b.throughput_ops_per_sec) / $b.throughput_ops_per_sec * 100) | tostring + "%"),
+                  (if $b.throughput_ops_per_sec == 0 then "div/0" else ((($a.ops_after - $b.throughput_ops_per_sec) / $b.throughput_ops_per_sec * 100) | tostring + "%") end),
                   ($b.submit_latency_p95_ns | tostring),
                   ($a.p95_after | tostring),
-                  ((($a.p95_after - $b.submit_latency_p95_ns) / $b.submit_latency_p95_ns * 100) | tostring + "%")
+                  (if $b.submit_latency_p95_ns == 0 then "div/0" else ((($a.p95_after - $b.submit_latency_p95_ns) / $b.submit_latency_p95_ns * 100) | tostring + "%") end)
                 ]
             end
           | "| " + join(" | ") + " |"
@@ -126,10 +126,10 @@ if [[ "$PHASE" == "after" ]]; then
                   $a.scenario_name, $a.scheduler_variant,
                   ($b.throughput_ops_per_sec | tostring),
                   ($a.ops_after | tostring),
-                  ((($a.ops_after - $b.throughput_ops_per_sec) / $b.throughput_ops_per_sec * 100) | tostring + "%"),
+                  (if $b.throughput_ops_per_sec == 0 then "div/0" else ((($a.ops_after - $b.throughput_ops_per_sec) / $b.throughput_ops_per_sec * 100) | tostring + "%") end),
                   ($b.submit_latency_p95_ns | tostring),
                   ($a.p95_after | tostring),
-                  ((($a.p95_after - $b.submit_latency_p95_ns) / $b.submit_latency_p95_ns * 100) | tostring + "%")
+                  (if $b.submit_latency_p95_ns == 0 then "div/0" else ((($a.p95_after - $b.submit_latency_p95_ns) / $b.submit_latency_p95_ns * 100) | tostring + "%") end)
                 ]
             end
           | "| " + join(" | ") + " |"

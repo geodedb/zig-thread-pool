@@ -6,17 +6,19 @@ Plan: `docs/superpowers/plans/2026-04-15-appsec-remediation.md`
 ## Baselines
 
 - `BASELINE-bench.json` — output of `zig build bench` on the starting commit.
-- `BASELINE-realistic.json` — output of `zig build bench-realistic`.
+- `BASELINE-realistic.json` — output of `zig build bench-realistic -Doptimize=ReleaseFast`.
 
 ## Per-step artifacts
 
-Each remediation step produces four files:
+Each remediation step produces five files:
 
 - `STEP-<N>-<name>-before-bench.json`
 - `STEP-<N>-<name>-after-bench.json`
 - `STEP-<N>-<name>-before-realistic.json`
 - `STEP-<N>-<name>-after-realistic.json`
 - `STEP-<N>-<name>-diff.md` — markdown delta table.
+
+Update the Status and Regression class columns in the table below after each step's diff is reviewed.
 
 ## Step progress
 
