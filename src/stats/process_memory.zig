@@ -28,28 +28,6 @@ const MACH_TASK_BASIC_INFO: task_flavor_t = 20;
 extern fn mach_task_self() mach_port_t;
 extern fn task_info(target_task: mach_port_t, flavor: task_flavor_t, task_info_out: [*]integer_t, task_info_out_cnt: *mach_msg_type_number_t) kern_return_t;
 
-const HANDLE = ?*anyopaque;
-const BOOL = i32;
-const DWORD = u32;
-const SIZE_T = usize;
-
-const PROCESS_MEMORY_COUNTERS_EX = extern struct {
-    cb: DWORD,
-    PageFaultCount: DWORD,
-    PeakWorkingSetSize: SIZE_T,
-    WorkingSetSize: SIZE_T,
-    QuotaPeakPagedPoolUsage: SIZE_T,
-    QuotaPagedPoolUsage: SIZE_T,
-    QuotaPeakNonPagedPoolUsage: SIZE_T,
-    QuotaNonPagedPoolUsage: SIZE_T,
-    PagefileUsage: SIZE_T,
-    PeakPagefileUsage: SIZE_T,
-    PrivateUsage: SIZE_T,
-};
-
-extern fn GetCurrentProcess() HANDLE;
-extern fn GetProcessMemoryInfo(process: HANDLE, counters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
-
 pub fn sample() !types.ProcessMemoryStats {
     return switch (builtin.os.tag) {
         .linux => try sampleLinux(),
@@ -103,16 +81,15 @@ fn sampleMacos() !types.ProcessMemoryStats {
 }
 
 fn sampleWindows() !types.ProcessMemoryStats {
-    var counters = std.mem.zeroes(PROCESS_MEMORY_COUNTERS_EX);
-    counters.cb = @sizeOf(PROCESS_MEMORY_COUNTERS_EX);
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, counters.cb) == 0) {
+    const windows = std.os.windows;
+    const counters = windows.GetProcessMemoryInfo(windows.GetCurrentProcess()) catch {
         return error.ProcessMemoryUnavailable;
-    }
+    };
 
     return .{
         .rss_current_bytes = @as(u64, @intCast(counters.WorkingSetSize)),
         .rss_peak_bytes = @as(u64, @intCast(counters.PeakWorkingSetSize)),
-        .private_current_bytes = @as(u64, @intCast(counters.PrivateUsage)),
+        .private_current_bytes = @as(u64, @intCast(counters.PagefileUsage)),
         .private_peak_bytes = @as(u64, @intCast(counters.PeakPagefileUsage)),
     };
 }
