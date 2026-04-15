@@ -57,12 +57,13 @@ test "batch submission with wait group completes" {
 
 test "blocking tasks do not wedge the pool" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
-        .min_threads = 3,
-        .max_threads = 3,
+        .min_threads = 4,
+        .max_threads = 4,
         .queue_capacity = 128,
         .local_queue_capacity = 32,
         .scheduler_variant = .work_stealing,
         .allow_blocking_lane = true,
+        .blocking_workers = 1,
         .worker_scratch_cap_bytes = 1024,
         .idle_park_after_ns = 100_000,
         .idle_purge_after_ns = 500_000,
@@ -81,4 +82,95 @@ test "blocking tasks do not wedge the pool" {
     wg.wait();
 
     try std.testing.expectEqual(@as(u64, 38), counter.value.load(.acquire));
+}
+
+test "blocking lane rejected when allow_blocking_lane is false" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 16,
+        .local_queue_capacity = 8,
+        .scheduler_variant = .work_stealing,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const result = pool.submit(common.counterTask, @ptrCast(&counter), .{ .lane = .blocking });
+    try std.testing.expectError(error.BlockingLaneDisabled, result);
+}
+
+test "default-lane submissions unaffected by blocking_workers = 0" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 128,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 64), counter.value.load(.acquire));
+}
+
+test "blocking worker isolates CPU pool from stalled blocking task" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 128,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    // One blocking task that sleeps 200ms — would hog a worker if no isolation.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 200 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+
+    // 100 CPU tasks that should all complete well before the blocking task.
+    for (0..100) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 101), counter.value.load(.acquire));
+}
+
+test "lane_extension variant accepted with blocking_workers > 0" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .lane_extension,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100_000 };
+    for (0..4) |_| {
+        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    }
+    for (0..16) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 20), counter.value.load(.acquire));
 }

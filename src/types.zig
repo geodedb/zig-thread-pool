@@ -113,12 +113,26 @@ pub const Config = struct {
     deinit_timeout_ns: u64 = 30_000_000_000,
     scheduler_variant: SchedulerVariant = .global_queue,
     queue_kind: QueueKind = .ring,
-    /// Advisory flag indicating the caller intends to submit blocking tasks.
-    /// Currently metadata-only: all lanes share the same worker set.
-    /// A future lane_extension scheduler may use this to reserve a dedicated
-    /// blocking worker subset. Setting this to false does not prevent submitting
-    /// tasks with `.lane = .blocking`.
+    /// When true, tasks submitted with `.lane = .blocking` are accepted and
+    /// routed to a dedicated blocking-lane inject queue served by the workers
+    /// reserved via `blocking_workers`. When false, `.lane = .blocking`
+    /// submissions return `error.BlockingLaneDisabled`. Independent of
+    /// `scheduler_variant` — the default `global_queue` and `work_stealing`
+    /// variants also honor the flag.
     allow_blocking_lane: bool = false,
+    /// Number of workers carved out of `max_threads` to serve the blocking
+    /// lane. Not additive: if `max_threads = 8` and `blocking_workers = 2`,
+    /// the pool spawns 8 threads, 2 of which serve blocking and 6 of which
+    /// serve the default lane. Blocking workers drain the blocking-lane
+    /// inject queue and never touch default-lane work (Slice L1 — dynamic
+    /// rebalancing lands in Slice L3). Default workers only drain the
+    /// default-lane queue.
+    ///
+    /// Must be strictly less than `max_threads` (at least one default worker
+    /// required). `blocking_workers > 0` requires `allow_blocking_lane = true`.
+    /// Default 0 preserves pre-lane-extension behavior byte-for-byte.
+    /// See `docs/superpowers/specs/2026-04-15-lane-extension-scheduler-design.md`.
+    blocking_workers: u32 = 0,
     timestamp_mode: TimestampMode = .full,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
@@ -163,10 +177,16 @@ pub const Config = struct {
         if (self.local_queue_capacity == 0) {
             return error.InvalidLocalQueueCapacity;
         }
-        if (self.scheduler_variant == .lane_extension) return error.UnsupportedSchedulerVariant;
+        if (self.scheduler_variant == .lane_extension and self.blocking_workers == 0)
+            return error.LaneExtensionRequiresBlockingWorkers;
         if (self.inject_batch_size == 0) return error.InvalidInjectBatchSize;
         if (self.hot_spinners >= self.max_threads) return error.InvalidHotSpinners;
         if (self.hot_spinners > 0 and self.wake_every_n_tasks == 0) return error.InvalidWakeThreshold;
+        if (self.blocking_workers >= self.max_threads) return error.InvalidBlockingWorkers;
+        if (self.blocking_workers > 0 and !self.allow_blocking_lane)
+            return error.BlockingLaneWithoutFlag;
+        if (self.allow_blocking_lane and self.blocking_workers == 0)
+            return error.AllowBlockingLaneRequiresWorkers;
     }
 };
 
@@ -302,10 +322,55 @@ test "Config validation rejects impossible bounds" {
     try std.testing.expectError(error.InvalidThreadBounds, cfg.validate());
 }
 
-test "Config validation rejects lane_extension variant" {
+test "Config validation rejects lane_extension without blocking_workers" {
     var cfg = Config{ .max_threads = 2, .min_threads = 1, .scheduler_variant = .lane_extension };
     cfg = cfg.normalized();
-    try std.testing.expectError(error.UnsupportedSchedulerVariant, cfg.validate());
+    try std.testing.expectError(error.LaneExtensionRequiresBlockingWorkers, cfg.validate());
+}
+
+test "Config validation accepts lane_extension with blocking_workers" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .scheduler_variant = .lane_extension,
+        .blocking_workers = 1,
+        .allow_blocking_lane = true,
+    };
+    cfg = cfg.normalized();
+    try cfg.validate();
+}
+
+test "Config validation rejects blocking_workers >= max_threads" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .blocking_workers = 4,
+        .allow_blocking_lane = true,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.InvalidBlockingWorkers, cfg.validate());
+}
+
+test "Config validation rejects blocking_workers without allow_blocking_lane" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .blocking_workers = 1,
+        .allow_blocking_lane = false,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.BlockingLaneWithoutFlag, cfg.validate());
+}
+
+test "Config validation rejects allow_blocking_lane without workers" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .blocking_workers = 0,
+        .allow_blocking_lane = true,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.AllowBlockingLaneRequiresWorkers, cfg.validate());
 }
 
 test "WaitGroup blocks until count reaches zero" {

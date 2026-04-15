@@ -221,6 +221,13 @@ const Worker = struct {
     /// owner writes to it. Sentinel value `LIFO_SLOT_EMPTY` (0xFFFF_FFFF)
     /// means "no cached task".
     lifo_slot: std.atomic.Value(QueueEntry) = std.atomic.Value(QueueEntry).init(LIFO_SLOT_EMPTY),
+    /// Which lane this worker serves. Set once at spawn and never mutated
+    /// in Slice L1 (dynamic rebalancing in L3 may soften this). Workers
+    /// with `serves_lane = .blocking` drain the blocking-lane inject queue
+    /// and only steal from other `.blocking` workers; default workers drain
+    /// the default-lane queue and only steal from `.default` workers. See
+    /// docs/superpowers/specs/2026-04-15-lane-extension-scheduler-design.md.
+    serves_lane: types.TaskLane = .default,
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -264,6 +271,16 @@ const Counters = extern struct {
     cancelled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     _pad1: [cache_line_size - 2 * field_size]u8 = undefined,
 
+    // === Hot write group (blocking-lane submit path) ===
+    // Parallel to `queued_tasks`, but only touched by `.lane = .blocking`
+    // submits and their matching `runTask`/`cancelDescriptor` decrements.
+    // Keeping blocking-lane counter-traffic off the default-lane cacheline
+    // is a prerequisite for the park handshake: a default worker's SC load
+    // of `queued_tasks` must not see blocking-lane increments, else it
+    // would unpark repeatedly on cross-lane submits with nothing to do.
+    queued_tasks_blocking: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    _pad1b: [cache_line_size - field_size]u8 = undefined,
+
     // === Diagnostic/cold counters ===
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queue_depth_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -280,6 +297,7 @@ const Counters = extern struct {
         std.debug.assert(@offsetOf(Counters, "queued_tasks") == 0);
         std.debug.assert(@offsetOf(Counters, "submitted") == cache_line_size);
         std.debug.assert(@offsetOf(Counters, "active_tasks") == 2 * cache_line_size);
+        std.debug.assert(@offsetOf(Counters, "queued_tasks_blocking") == 3 * cache_line_size);
     }
 };
 
@@ -294,6 +312,12 @@ const Core = struct {
     free_indices: []u32,
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(QueueEntry),
+    /// Blocking-lane inject queue. Present iff `config.blocking_workers > 0`.
+    /// Fed by `.lane = .blocking` submits; drained by workers whose
+    /// `serves_lane == .blocking`. When `blocking_workers == 0` this stays
+    /// null and the default-lane path is byte-for-byte identical to pre-L1
+    /// behavior (A/B regression gate).
+    blocking_inject: ?BoundedRing(QueueEntry) = null,
     sync: Sync = .{},
     counters: Counters align(std.atomic.cache_line) = .{},
     worker_stats_buffer: []types.WorkerStats,
@@ -315,6 +339,10 @@ const Core = struct {
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
             .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
             .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
+            .blocking_inject = if (normalized.blocking_workers > 0)
+                try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity)
+            else
+                null,
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, normalized.max_threads),
         };
         errdefer self.deinitOwned();
@@ -333,6 +361,9 @@ const Core = struct {
         self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.recordOwnedAlloc(self.inject_queue.capacity() * @sizeOf(u32));
+        if (self.blocking_inject) |*bi| {
+            self.recordOwnedAlloc(bi.capacity() * @sizeOf(u32));
+        }
 
         for (self.descriptors, 0..) |*descriptor, idx| {
             descriptor.* = .{};
@@ -347,11 +378,12 @@ const Core = struct {
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
 
-        for (self.workers, self.local_queues) |*worker, *lq| {
+        for (self.workers, self.local_queues, 0..) |*worker, *lq, idx| {
             lq.* = try LocalQueue.init(allocator, normalized.local_queue_capacity, normalized.queue_kind);
             worker.* = .{
                 .scratch = WorkerScratch.init(allocator, self.accounting, normalized.worker_scratch_cap_bytes),
                 .last_idle_started_ns = std.atomic.Value(u64).init(nowNs()),
+                .serves_lane = if (idx < normalized.blocking_workers) .blocking else .default,
             };
             self.recordOwnedAlloc(lq.capacity() * @sizeOf(u32));
         }
@@ -366,7 +398,7 @@ const Core = struct {
             std.log.warn("thread-pool deinit timed out after {d}ms with {d} active tasks and {d} queued", .{
                 self.config.deinit_timeout_ns / std.time.ns_per_ms,
                 self.counters.active_tasks.load(.acquire),
-                self.counters.queued_tasks.load(.acquire),
+                self.totalQueuedTasks(),
             });
             self.joinAllWorkers();
         };
@@ -412,7 +444,7 @@ const Core = struct {
         var i: usize = 0;
         while (i < tasks.len) {
             if (self.state.load(.acquire) != .running) {
-                if (pending_notify > 0) self.notifySubmits(pending_notify);
+                if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
                 if (submitted == 0) return error.ShutdownInProgress;
                 return .{ .submitted = submitted };
             }
@@ -423,24 +455,32 @@ const Core = struct {
             } else |err| switch (err) {
                 error.QueueFull, error.TaskPoolExhausted => {
                     if (options.backpressure == .return_error) {
-                        if (pending_notify > 0) self.notifySubmits(pending_notify);
+                        if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
                         if (submitted == 0) return err;
                         return .{ .submitted = submitted };
                     }
                     if (deadline != 0 and nowNs() >= deadline) {
-                        if (pending_notify > 0) self.notifySubmits(pending_notify);
+                        if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
                         if (submitted == 0) return error.Timeout;
                         return .{ .submitted = submitted };
                     }
                     if (pending_notify > 0) {
-                        self.notifySubmits(pending_notify);
+                        self.notifySubmits(pending_notify, options.lane);
                         pending_notify = 0;
                     }
                     self.waitForCapacity(deadline);
                 },
+                error.BlockingLaneDisabled => {
+                    // Config rejects this lane. Flush pending then propagate
+                    // the error regardless of backpressure — no amount of
+                    // waiting will unblock a disabled lane.
+                    if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
+                    if (submitted == 0) return err;
+                    return .{ .submitted = submitted };
+                },
             }
         }
-        if (pending_notify > 0) self.notifySubmits(pending_notify);
+        if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
         return .{ .submitted = submitted };
     }
 
@@ -485,7 +525,7 @@ const Core = struct {
 
         const deadline = if (timeout_ns) |ns| nowNs() + ns else 0;
         while (true) {
-            const queued = self.counters.queued_tasks.load(.acquire);
+            const queued = self.totalQueuedTasks();
             const active = self.counters.active_tasks.load(.acquire);
             if (queued == 0 and active == 0) break;
             if (deadline != 0 and nowNs() >= deadline) return error.Timeout;
@@ -598,7 +638,7 @@ const Core = struct {
             .completed = aggregate_completed,
             .cancelled = self.counters.cancelled.load(.acquire),
             .active_tasks = self.counters.active_tasks.load(.acquire),
-            .queue_depth_current = self.counters.queued_tasks.load(.acquire),
+            .queue_depth_current = self.totalQueuedTasks(),
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
             .steals = aggregate_steals,
             .steal_failures = aggregate_steal_failures,
@@ -620,7 +660,7 @@ const Core = struct {
 
     pub fn purgeWorkerCaches(self: *Core) !void {
         if (self.counters.active_tasks.load(.acquire) != 0) return error.PoolBusy;
-        if (self.counters.queued_tasks.load(.acquire) != 0) return error.PoolBusy;
+        if (self.totalQueuedTasks() != 0) return error.PoolBusy;
         for (self.workers) |*worker| {
             worker.scratch.purge();
         }
@@ -649,15 +689,29 @@ const Core = struct {
 
     fn enqueueTask(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
         const handle = try self.enqueuePush(task_fn, ctx, options);
-        self.notifySubmits(1);
+        self.notifySubmits(1, options.lane);
         return handle;
     }
 
     /// Per-task push path without the submitter-side notify atomics.
-    /// Callers are responsible for calling `notifySubmits(n)` with the
-    /// number of successful pushes (single `notifySubmits(1)` for plain
-    /// `submit`, batched `notifySubmits(count)` for `submitBatch`).
+    /// Callers are responsible for calling `notifySubmits(n, lane)` with the
+    /// number of successful pushes (single `notifySubmits(1, lane)` for plain
+    /// `submit`, batched `notifySubmits(count, lane)` for `submitBatch`).
+    ///
+    /// Lane routing rules (Slice L1):
+    /// - `.lane = .blocking` with `!allow_blocking_lane` → `error.BlockingLaneDisabled`
+    /// - `.lane = .blocking` with `blocking_workers > 0` → blocking-lane inject queue;
+    ///   never routed through LIFO slot or local queues.
+    /// - `.lane = .blocking` with `blocking_workers == 0` → falls back to default
+    ///   inject queue (user opted in via allow_blocking_lane but reserved no workers).
+    /// - `.lane = .default` with TLS submitter being a blocking worker → skips
+    ///   LIFO/local path (a blocking worker's caches must not hold default-lane work);
+    ///   goes straight to the default inject queue.
     fn enqueuePush(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+        if (options.lane == .blocking and !self.config.allow_blocking_lane) {
+            return error.BlockingLaneDisabled;
+        }
+
         const descriptor_index = self.acquireDescriptor() orelse return error.TaskPoolExhausted;
         errdefer self.releaseDescriptor(descriptor_index);
 
@@ -676,28 +730,43 @@ const Core = struct {
 
         const entry = packEntry(descriptor_index, descriptor.generation);
         var queued = false;
-        if (self.config.scheduler_variant == .work_stealing and tls_worker_index != null) {
-            const wi = tls_worker_index.?;
-            // Try the LIFO slot first. Owner-only write; if the slot is empty,
-            // a plain store is sufficient — no stealer writes to this slot.
-            // If the slot is full, fall through to the local ring.
-            const w = &self.workers[wi];
-            if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
-                w.lifo_slot.store(entry, .release);
-                queued = true;
-            } else {
-                const was_empty = w.owned_queue_len == 0;
-                queued = self.local_queues[wi].tryPushBottom(entry);
-                if (queued) {
-                    w.owned_queue_len += 1;
-                    if (was_empty) self.markWorkerNonEmpty(wi);
-                    updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
+
+        if (options.lane == .blocking) {
+            // Blocking-lane submit: go directly to the blocking inject queue.
+            // Config.validate enforces allow_blocking_lane → blocking_workers > 0,
+            // so blocking_inject is guaranteed non-null here.
+            if (self.blocking_inject) |*bi| {
+                queued = bi.tryPush(entry);
+            } else unreachable;
+        } else {
+            // Default-lane submit: LIFO/local fast path, gated on TLS worker
+            // being a default-lane worker. work_stealing and lane_extension
+            // both use per-worker queues; global_queue skips them.
+            const uses_local = self.config.scheduler_variant == .work_stealing or
+                self.config.scheduler_variant == .lane_extension;
+            if (uses_local and tls_worker_index != null) {
+                const wi = tls_worker_index.?;
+                const w = &self.workers[wi];
+                if (w.serves_lane == .default) {
+                    if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
+                        w.lifo_slot.store(entry, .release);
+                        queued = true;
+                    } else {
+                        const was_empty = w.owned_queue_len == 0;
+                        queued = self.local_queues[wi].tryPushBottom(entry);
+                        if (queued) {
+                            w.owned_queue_len += 1;
+                            if (was_empty) self.markWorkerNonEmpty(wi);
+                            updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
+                        }
+                    }
                 }
             }
+            if (!queued) {
+                queued = self.inject_queue.tryPush(entry);
+            }
         }
-        if (!queued) {
-            queued = self.inject_queue.tryPush(entry);
-        }
+
         if (!queued) {
             if (options.wait_group) |wait_group| wait_group.done();
             return error.QueueFull;
@@ -713,32 +782,48 @@ const Core = struct {
             types.TaskHandle.invalid();
     }
 
-    /// Batched submitter-side notify: bumps `counters.submitted` and
-    /// `queued_tasks` by `count` (single seq_cst fetchAdd for the park
-    /// handshake), then wakes at most one parked worker.
+    /// Batched submitter-side notify: bumps `counters.submitted` and the
+    /// lane's `queued_tasks*` counter by `count` (single seq_cst fetchAdd
+    /// for the park handshake), then wakes at most one parked worker that
+    /// serves `lane`.
     ///
-    /// Must be called after `enqueuePush` has succeeded `count` times since
-    /// the last notify. A single seq_cst fetchAdd(count) carries the same
-    /// SC total-order guarantee as `count` individual fetchAdds — a parking
-    /// worker's SC load of `queued_tasks` either observes the bumped value
-    /// (and bails out of park) or precedes it, and the `is_parked` SC pair
-    /// excludes IRIW regardless of batch size.
+    /// Must be called after `enqueuePush` has succeeded `count` times for
+    /// the same lane since the last notify. A single seq_cst fetchAdd(count)
+    /// carries the same SC total-order guarantee as `count` individual
+    /// fetchAdds — a parking worker's SC load of the lane counter either
+    /// observes the bumped value (and bails out of park) or precedes it,
+    /// and the `is_parked` SC pair excludes IRIW regardless of batch size.
+    ///
+    /// Lane scope: when `blocking_workers == 0` the wake scan covers all
+    /// workers (byte-for-byte identical to the pre-lane-extension path —
+    /// A/B regression gate). When `blocking_workers > 0` the scan covers
+    /// only workers in `lane`'s range, avoiding cross-lane wakeups that
+    /// would spin-loop through `nextTask` and re-park immediately.
     ///
     /// Waking exactly one worker per notify — not `count` — matches the
-    /// single-submit path and avoids a thundering-herd on `inject_queue`'s
+    /// single-submit path and avoids a thundering-herd on the inject queue's
     /// head cacheline. Measured: a wake-up-to-`count` variant regressed
     /// flood_1m_batched throughput ~50% vs this wake-one variant.
-    fn notifySubmits(self: *Core, count: u64) void {
+    fn notifySubmits(self: *Core, count: u64, lane: types.TaskLane) void {
         if (count == 0) return;
         _ = self.counters.submitted.fetchAdd(count, .monotonic);
-        const queue_depth = self.counters.queued_tasks.fetchAdd(count, .seq_cst) +% count;
+        const lane_counter = self.queuedTasksCounter(lane);
+        const queue_depth = lane_counter.fetchAdd(count, .seq_cst) +% count;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
 
+        // Scan range by lane. For `blocking_workers == 0` the default-lane
+        // path lands the same [0..workers.len) scan as pre-L1.
+        const nb: usize = self.config.blocking_workers;
+        const scan_start: usize = if (lane == .blocking) 0 else nb;
+        const scan_end: usize = if (lane == .blocking) nb else self.workers.len;
+        const scan_len = scan_end - scan_start;
+        if (scan_len == 0) return;
+
         const submitted = self.counters.submitted.load(.monotonic);
-        const hint_idx: usize = @intCast(submitted % self.workers.len);
+        const rel_hint: usize = @intCast(submitted % scan_len);
         var off: usize = 0;
-        while (off < self.workers.len) : (off += 1) {
-            const idx = (hint_idx + off) % self.workers.len;
+        while (off < scan_len) : (off += 1) {
+            const idx = scan_start + ((rel_hint + off) % scan_len);
             const w = &self.workers[idx];
             if (w.is_parked.load(.seq_cst) == 1) {
                 w.park_mutex.lock();
@@ -796,7 +881,16 @@ const Core = struct {
         // PLUS {popped-by-nextTask, not-yet-claimed-by-runTask-CAS}. Park
         // handshake and shutdown's drain loop both still see 0 iff every
         // submitted item has been claimed (real) or discarded (duplicate).
-        if (self.config.scheduler_variant == .work_stealing) {
+        //
+        // Lane routing (Slice L1): the inject queue this worker drains is
+        // the one matching its `serves_lane`. Steal targets are restricted
+        // to same-lane workers via `laneMask`. Cross-lane steal is deferred
+        // to Slice L3 (dynamic rebalancing).
+        const lane_inject = self.laneInjectQueue(worker.serves_lane);
+        const lane_bits = self.laneMask(worker.serves_lane);
+        const uses_local = self.config.scheduler_variant == .work_stealing or
+            self.config.scheduler_variant == .lane_extension;
+        if (uses_local) {
             // LIFO slot first: owner-only swap-to-empty. Most-recently-submitted
             // task runs next. This is the hot path for "task spawns task".
             const cached = worker.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
@@ -819,7 +913,7 @@ const Core = struct {
             {
                 var buf: [32]QueueEntry = undefined;
                 const cap = @min(self.config.inject_batch_size, buf.len);
-                const n = self.inject_queue.popMany(buf[0..cap]);
+                const n = lane_inject.popMany(buf[0..cap]);
                 if (n > 0) {
                     const first = buf[0];
                     const was_empty = worker.owned_queue_len == 0;
@@ -828,7 +922,7 @@ const Core = struct {
                     while (i < n) : (i += 1) {
                         if (!lq.tryPushBottom(buf[i])) {
                             while (i < n) : (i += 1) {
-                                _ = self.inject_queue.tryPush(buf[i]);
+                                _ = lane_inject.tryPush(buf[i]);
                             }
                             break;
                         }
@@ -846,9 +940,10 @@ const Core = struct {
             // Steal-peek bitmap: read ONE u64 instead of probing each
             // victim's head/tail cachelines. Owner-side updates this
             // mask only on 0↔1 transitions, so stealer-side reads rarely
-            // coincide with writer-side writes.
+            // coincide with writer-side writes. Lane mask restricts
+            // steal victims to same-lane workers (Slice L1).
             const self_bit: u64 = @as(u64, 1) << @intCast(worker_index);
-            var mask = self.workers_nonempty.load(.acquire) & ~self_bit;
+            var mask = self.workers_nonempty.load(.acquire) & lane_bits & ~self_bit;
             while (mask != 0) {
                 const victim_index: usize = @ctz(mask);
                 mask &= mask - 1; // clear lowest set bit
@@ -865,8 +960,10 @@ const Core = struct {
                     var pushed_count: usize = 0;
                     for (stolen[1..n]) |entry| {
                         if (!lq.tryPushBottom(entry)) {
-                            // Local deque full — put overflow on the inject queue so it isn't lost.
-                            _ = self.inject_queue.tryPush(entry);
+                            // Local deque full — put overflow on the lane's inject
+                            // queue so it isn't lost. Same lane only because the
+                            // victim is necessarily same-lane (laneMask gate above).
+                            _ = lane_inject.tryPush(entry);
                         } else {
                             pushed_count += 1;
                         }
@@ -885,10 +982,21 @@ const Core = struct {
             return null;
         }
 
-        if (self.inject_queue.pop()) |entry| {
+        // global_queue variant: no LIFO/local; drain the lane's inject queue.
+        if (lane_inject.pop()) |entry| {
             return entry;
         }
         return null;
+    }
+
+    /// Returns the inject queue this worker should drain based on its lane.
+    /// When `blocking_workers == 0`, all workers are `.default` and this
+    /// always returns `&inject_queue` — no change vs pre-L1.
+    inline fn laneInjectQueue(self: *Core, lane: types.TaskLane) *BoundedRing(QueueEntry) {
+        return switch (lane) {
+            .default => &self.inject_queue,
+            .blocking => if (self.blocking_inject) |*bi| bi else unreachable,
+        };
     }
 
     fn runTask(self: *Core, worker_index: usize, entry: QueueEntry) void {
@@ -924,7 +1032,7 @@ const Core = struct {
         if (descriptor.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire)) |_| {
             return;
         }
-        self.decrementQueued();
+        self.decrementQueued(descriptor.options.lane);
 
         // Task 2 sentinel: catches tight-overlap sibling where two workers
         // both pass the state CAS (shouldn't happen — CAS is serializing —
@@ -1064,7 +1172,8 @@ const Core = struct {
         // reads that store's specific value — if the SC load observes an earlier
         // value, no HB edge forms and the IRIW scenario is permitted.
         worker.is_parked.store(1, .seq_cst);
-        if (self.counters.queued_tasks.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
+        const lane_counter = self.queuedTasksCounter(worker.serves_lane);
+        if (lane_counter.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
             worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .release);
@@ -1086,7 +1195,7 @@ const Core = struct {
     fn shouldExit(self: *Core) bool {
         const state = self.state.load(.acquire);
         if (state == .running) return false;
-        return self.counters.queued_tasks.load(.acquire) == 0 and self.counters.active_tasks.load(.acquire) == 0;
+        return self.totalQueuedTasks() == 0 and self.counters.active_tasks.load(.acquire) == 0;
     }
 
     fn cancelQueuedTasks(self: *Core) !void {
@@ -1098,7 +1207,14 @@ const Core = struct {
         while (self.inject_queue.pop()) |entry| {
             self.cancelDescriptor(entry);
         }
-        if (self.config.scheduler_variant == .work_stealing) {
+        if (self.blocking_inject) |*bi| {
+            while (bi.pop()) |entry| {
+                self.cancelDescriptor(entry);
+            }
+        }
+        const uses_local = self.config.scheduler_variant == .work_stealing or
+            self.config.scheduler_variant == .lane_extension;
+        if (uses_local) {
             // Drain LIFO slots too.
             for (self.workers) |*w| {
                 const cached = w.lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire);
@@ -1130,7 +1246,7 @@ const Core = struct {
         if (descriptor.state.cmpxchgStrong(.queued, .cancelled, .acq_rel, .acquire)) |_| {
             return;
         }
-        self.decrementQueued();
+        self.decrementQueued(descriptor.options.lane);
         if (claim_sentinel_enabled) {
             descriptor.claimed_by.store(-1, .release);
         }
@@ -1224,6 +1340,11 @@ const Core = struct {
             lq.deinit();
         }
         self.inject_queue.deinit();
+        if (self.blocking_inject) |*bi| {
+            self.recordOwnedFree(bi.capacity() * @sizeOf(u32));
+            bi.deinit();
+            self.blocking_inject = null;
+        }
         self.recordOwnedFree(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.allocator.free(self.worker_stats_buffer);
         self.recordOwnedFree(self.free_indices.len * @sizeOf(u32));
@@ -1236,8 +1357,46 @@ const Core = struct {
         self.allocator.free(self.workers);
     }
 
-    fn decrementQueued(self: *Core) void {
-        _ = self.counters.queued_tasks.fetchSub(1, .release);
+    fn decrementQueued(self: *Core, lane: types.TaskLane) void {
+        const counter = self.queuedTasksCounter(lane);
+        _ = counter.fetchSub(1, .release);
+    }
+
+    /// Returns a pointer to the `queued_tasks` counter for the given lane.
+    /// Lane-specific counters exist to avoid a livelock in the park
+    /// handshake: a default worker's SC load of its lane's counter must
+    /// not see blocking-lane submits, else it unparks spuriously on
+    /// cross-lane work and spin-loops.
+    inline fn queuedTasksCounter(self: *Core, lane: types.TaskLane) *std.atomic.Value(u64) {
+        return switch (lane) {
+            .default => &self.counters.queued_tasks,
+            .blocking => &self.counters.queued_tasks_blocking,
+        };
+    }
+
+    /// Sum of queued tasks across both lanes — for shutdown drain, stats
+    /// snapshots, and deinit timeout diagnostics. Not used by the park
+    /// handshake (which is per-lane for the reason above).
+    inline fn totalQueuedTasks(self: *const Core) u64 {
+        return self.counters.queued_tasks.load(.acquire) +
+            self.counters.queued_tasks_blocking.load(.acquire);
+    }
+
+    /// Bitmask of workers serving `lane`. Bits [0..blocking_workers) are
+    /// blocking workers; bits [blocking_workers..max_threads) are default.
+    /// When `blocking_workers == 0`, all valid worker bits are in `.default`.
+    /// Used to restrict steal-scan and wake-scan to same-lane workers.
+    inline fn laneMask(self: *const Core, lane: types.TaskLane) u64 {
+        const nb = self.config.blocking_workers;
+        if (nb == 0) return switch (lane) {
+            .default => ~@as(u64, 0),
+            .blocking => 0,
+        };
+        const blocking_mask: u64 = (@as(u64, 1) << @intCast(nb)) - 1;
+        return switch (lane) {
+            .blocking => blocking_mask,
+            .default => ~blocking_mask,
+        };
     }
 };
 
