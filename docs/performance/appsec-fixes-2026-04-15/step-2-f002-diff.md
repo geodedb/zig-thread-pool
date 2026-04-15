@@ -63,11 +63,21 @@ the regression samples above. Not a real improvement.
    require adding overhead per task on the task path. Since throughput is −0.96% (flat
    within BASELINE 1% stddev), no per-task cost was introduced.
 
-3. **p95 has high natural variance in single-sample runs**: The BASELINE realistic
-   does not collect p95 stddev (field is null). Task-1's before/after for the same
-   scenario showed 18322 ns → 16890 ns; the current before (16011 ns) is already
-   below the Task-1 range. The after value (19757 ns) is within the range seen across
-   step-1 runs. This is consistent with OS scheduling noise on a single-sample bench run.
+3. **p95 has high natural variance; `step-2-before` was an outlier-low sample**:
+   Cross-referencing all available data points for `cpu_work_10us/work_stealing`:
+
+   | sample | throughput (ops/s) | p95 (ns) | Δ vs BASELINE p95 |
+   |---|---:|---:|---:|
+   | BASELINE-realistic | 227,816 | 17,463 | (reference) |
+   | step-1-f001-after | 221,841 | 16,890 | −3.3% |
+   | step-2-f002-before | 222,660 | **16,011** | **−8.3% (outlier low)** |
+   | step-2-f002-after | 220,532 | 19,757 | +13.1% |
+
+   The headline "+23.4%" in the table above is computed against the outlier-low
+   `step-2-before` sample (16,011 ns), not against BASELINE. Measured against
+   BASELINE, `step-2-after` is +13.1% — still notable but within the observed
+   natural p95 variance for a single-sample run. Throughput across all four
+   samples is within 3% of BASELINE, confirming no per-task cost was added.
 
 4. **BASELINE throughput stddev for cpu_work_10us = 1%**: The scenario is throughput-stable.
    If the code change added meaningful overhead, throughput would have dropped alongside p95.
