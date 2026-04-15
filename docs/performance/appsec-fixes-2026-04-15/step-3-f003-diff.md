@@ -39,10 +39,21 @@ stddev 37% and 25% respectively — both noisy scenarios. Deltas are within the 
 `producer_contention/global_queue` (+28.9% throughput, +11.4% p95): BASELINE stddev = 12%
 (noisy). The throughput improvement and p95 increase together are consistent with scheduling
 variance in a highly contended scenario — more tasks complete per second but late-arriving
-waiters see longer queues. The p95 before value (5067 ns) and after value (5647 ns) are both
-within the BASELINE noise band. No code regression attributable to F-003: the `global_queue`
-variant uses the same `acquireDescriptor`/`releaseDescriptor` paths, which on x86_64 produce
-identical codegen for `.monotonic` u32 load/store vs plain load/store.
+waiters see longer queues.
+
+**Explicit band arithmetic for the p95 +11.4%**: BASELINE p95 = 5,493 ns; applying the ±12%
+throughput-stddev band as a rough p95 noise envelope gives roughly [4,834, 6,152] ns:
+
+| sample | p95 (ns) | inside band? |
+|---|---:|---|
+| BASELINE | 5,493 | (reference) |
+| step-3 before | 5,067 | yes (7.8% below BASELINE) |
+| step-3 after | 5,647 | yes (2.8% above BASELINE) |
+
+Both samples are inside the BASELINE noise band; the headline "+11.4%" is computed between
+two in-band samples, not against a stable baseline. No code regression attributable to F-003:
+the `global_queue` variant uses the same `acquireDescriptor`/`releaseDescriptor` paths, which
+on x86_64 produce identical codegen for `.monotonic` u32 load/store vs plain load/store.
 
 `producer_contention/work_stealing` (+12.4% throughput, −12.8% p95): improvement;
 BASELINE stddev 7% — these are genuine improvements consistent with lucky scheduling
