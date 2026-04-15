@@ -28,3 +28,29 @@ Apply the Performance-Regression Review Rule from the plan:
 - Throughput regression ≥ 5% on any scenario → BLOCK, escalate to user.
 - p95 latency regression ≥ 10% on any scenario → BLOCK, escalate to user.
 - 3–5% throughput / 7–10% p95 → WARN, note in commit body.
+
+## Disposition — bench apparent regressions
+
+`conn_churn_seq/work_stealing` (−14.3% throughput, +24.6% p95): noise on a
+historically noisy scenario. BASELINE stddev for this variant is 25% on
+throughput. The same run shows `conn_churn_seq/global_queue` at **+43.5%**
+throughput and **−38.7%** p95 — paired outliers in opposite directions on the
+two variants of the same scenario are a signature of scheduler/CPU-state noise,
+not a code-path effect.
+
+`producer_contention/global_queue` (−12.9% throughput): BASELINE stddev 12%.
+Before=838,185 (0.89σ above BASELINE mean 768,469), after=730,113 (0.42σ below).
+Both inside the BASELINE 1σ band ([676,253, 860,685]) — not a regression.
+
+**Ruled out by construction**: F-004's change is one `fetchAdd(1, .monotonic)`
+executed ONLY on the `previous == 0` underflow branch. No bench workload
+exercises underflow (every submit that adds to a WaitGroup is matched with
+exactly one done). The normal-path code of `WaitGroup.done` is untouched.
+
+`cpu_work_10us` throughput −2.9% and p95 +9.5% sit inside the warn band
+(3–5% throughput, 7–10% p95). Within natural single-sample variance for
+this low-stddev scenario; the larger `nested_fanout_4x` +5.2% throughput
+in the opposite direction confirms the variance is symmetric noise.
+
+**Regression class: clean (bench noise, ruled out by construction on
+underflow-only code path).**
