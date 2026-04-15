@@ -344,7 +344,7 @@ const Core = struct {
     workers: []Worker,
     local_queues: []LocalQueue,
     descriptors: []TaskDescriptor,
-    free_indices: []u32,
+    free_indices: []std.atomic.Value(u32),
     free_top_tagged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inject_queue: BoundedRing(QueueEntry),
     /// Blocking-lane inject queue. Present iff `config.blocking_workers > 0`.
@@ -400,7 +400,7 @@ const Core = struct {
             .workers = try allocator.alloc(Worker, total_worker_slots),
             .local_queues = try allocator.alloc(LocalQueue, total_worker_slots),
             .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
-            .free_indices = try allocator.alloc(u32, normalized.queue_capacity),
+            .free_indices = try allocator.alloc(std.atomic.Value(u32), normalized.queue_capacity),
             .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
             .blocking_inject = if (normalized.blocking_workers > 0)
                 try BoundedRing(QueueEntry).init(allocator, if (normalized.blocking_queue_capacity > 0)
@@ -424,7 +424,7 @@ const Core = struct {
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
         self.recordOwnedAlloc(self.local_queues.len * @sizeOf(LocalQueue));
         self.recordOwnedAlloc(self.descriptors.len * @sizeOf(TaskDescriptor));
-        self.recordOwnedAlloc(self.free_indices.len * @sizeOf(u32));
+        self.recordOwnedAlloc(self.free_indices.len * @sizeOf(std.atomic.Value(u32)));
         self.recordOwnedAlloc(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.recordOwnedAlloc(self.inject_queue.capacity() * @sizeOf(u32));
         if (self.blocking_inject) |*bi| {
@@ -435,10 +435,12 @@ const Core = struct {
             descriptor.* = .{};
             // Build a singly-linked freelist: each slot points to the next.
             // The last slot uses the sentinel 0xFFFFFFFF (empty).
-            self.free_indices[idx] = if (idx + 1 < normalized.queue_capacity)
-                @as(u32, @intCast(idx + 1))
-            else
-                0xFFFFFFFF;
+            self.free_indices[idx] = std.atomic.Value(u32).init(
+                if (idx + 1 < normalized.queue_capacity)
+                    @as(u32, @intCast(idx + 1))
+                else
+                    0xFFFFFFFF,
+            );
         }
 
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
@@ -1718,7 +1720,7 @@ const Core = struct {
             const head = @as(u32, @truncate(tagged));
             if (head == free_sentinel) return null;
             const aba = @as(u32, @truncate(tagged >> 32));
-            const next = self.free_indices[head];
+            const next = self.free_indices[head].load(.monotonic);
             const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, next);
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
                 continue;
@@ -1753,7 +1755,7 @@ const Core = struct {
             const tagged = self.free_top_tagged.load(.acquire);
             const head = @as(u32, @truncate(tagged));
             const aba = @as(u32, @truncate(tagged >> 32));
-            self.free_indices[descriptor_index] = head;
+            self.free_indices[descriptor_index].store(head, .monotonic);
             const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, descriptor_index);
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
                 continue;
@@ -1817,7 +1819,7 @@ const Core = struct {
         }
         self.recordOwnedFree(self.worker_stats_buffer.len * @sizeOf(types.WorkerStats));
         self.allocator.free(self.worker_stats_buffer);
-        self.recordOwnedFree(self.free_indices.len * @sizeOf(u32));
+        self.recordOwnedFree(self.free_indices.len * @sizeOf(std.atomic.Value(u32)));
         self.allocator.free(self.free_indices);
         self.recordOwnedFree(self.descriptors.len * @sizeOf(TaskDescriptor));
         self.allocator.free(self.descriptors);
