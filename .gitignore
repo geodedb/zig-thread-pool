@@ -3,6 +3,7 @@
 zig-cache/
 zig-out/
 .remember/
+.cache/
 
 # Editor directories
 .vscode/
@@ -33,6 +34,7 @@ test_*
 # Logs
 *.log
 *.tmp
+benchmarks/external/tokio_runtime_bench/target/
 
 # Core dumps
 core

@@ -1,0 +1,261 @@
+{
+  "generated_at_unix_s": 1776261987,
+  "host_os": "linux",
+  "host_arch": "x86_64",
+  "runtimes": [
+    {
+      "runtime_name": "zig_thread_pool",
+      "runtime_version": "zig 0.15.2",
+      "source_commit": "6715f8ab0f4a828030804cfe4432a73c957f0774",
+      "generated_at_unix_s": 1776261967,
+      "host_os": "linux",
+      "host_arch": "x86_64",
+      "rows": [
+        {
+          "scenario_name": "flood_1m",
+          "task_count": 1000000,
+          "submitter_count": 1,
+          "worker_count": 56,
+          "median_elapsed_ns": 1865710830,
+          "median_ops_per_sec": 535988.7416208009,
+          "stddev_ops_per_sec": 13478.321714818041,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 1984932858,
+              "ops_per_sec": 503795.37825152976
+            },
+            {
+              "elapsed_ns": 1878556747,
+              "ops_per_sec": 532323.5518953423
+            },
+            {
+              "elapsed_ns": 1866462868,
+              "ops_per_sec": 535772.7802383476
+            },
+            {
+              "elapsed_ns": 1865710830,
+              "ops_per_sec": 535988.7416208009
+            },
+            {
+              "elapsed_ns": 1855323733,
+              "ops_per_sec": 538989.4939698915
+            },
+            {
+              "elapsed_ns": 1846500767,
+              "ops_per_sec": 541564.8982505946
+            }
+          ]
+        },
+        {
+          "scenario_name": "contended_spawn_8x",
+          "task_count": 100000,
+          "submitter_count": 8,
+          "worker_count": 56,
+          "median_elapsed_ns": 116419905,
+          "median_ops_per_sec": 858959.6426830961,
+          "stddev_ops_per_sec": 49178.690618738205,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 126187290,
+              "ops_per_sec": 792472.8393802576
+            },
+            {
+              "elapsed_ns": 119997955,
+              "ops_per_sec": 833347.5349642417
+            },
+            {
+              "elapsed_ns": 118232716,
+              "ops_per_sec": 845789.5866995053
+            },
+            {
+              "elapsed_ns": 116419905,
+              "ops_per_sec": 858959.6426830961
+            },
+            {
+              "elapsed_ns": 112388105,
+              "ops_per_sec": 889773.8777604622
+            },
+            {
+              "elapsed_ns": 105248886,
+              "ops_per_sec": 950128.8213159805
+            }
+          ]
+        }
+      ]
+    }
+,
+    {
+      "runtime_name": "tokio",
+      "runtime_version": "tokio 1.52.0",
+      "source_commit": "5f7be0ac42cb3e1b739da1562f98a797cd55a606",
+      "generated_at_unix_s": 1776261980,
+      "host_os": "linux",
+      "host_arch": "x86_64",
+      "rows": [
+        {
+          "scenario_name": "flood_1m",
+          "task_count": 1000000,
+          "submitter_count": 1,
+          "worker_count": 56,
+          "median_elapsed_ns": 1656001654,
+          "median_ops_per_sec": 603864.1311646902,
+          "stddev_ops_per_sec": 23310.45586391995,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 1757067872,
+              "ops_per_sec": 569129.9783779781
+            },
+            {
+              "elapsed_ns": 1753985978,
+              "ops_per_sec": 570129.9853834978
+            },
+            {
+              "elapsed_ns": 1742016082,
+              "ops_per_sec": 574047.5132995931
+            },
+            {
+              "elapsed_ns": 1656001654,
+              "ops_per_sec": 603864.1311646902
+            },
+            {
+              "elapsed_ns": 1650900415,
+              "ops_per_sec": 605730.0554982295
+            },
+            {
+              "elapsed_ns": 1642869946,
+              "ops_per_sec": 608690.9085133389
+            }
+          ]
+        },
+        {
+          "scenario_name": "contended_spawn_8x",
+          "task_count": 100000,
+          "submitter_count": 8,
+          "worker_count": 56,
+          "median_elapsed_ns": 152270345,
+          "median_ops_per_sec": 656726.6922525197,
+          "stddev_ops_per_sec": 39386.31351279003,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 169058606,
+              "ops_per_sec": 591510.8515682425
+            },
+            {
+              "elapsed_ns": 161838274,
+              "ops_per_sec": 617900.8063321288
+            },
+            {
+              "elapsed_ns": 161587406,
+              "ops_per_sec": 618860.1109173076
+            },
+            {
+              "elapsed_ns": 152270345,
+              "ops_per_sec": 656726.6922525197
+            },
+            {
+              "elapsed_ns": 146658834,
+              "ops_per_sec": 681854.5959529448
+            },
+            {
+              "elapsed_ns": 143839063,
+              "ops_per_sec": 695221.4364744576
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_name": "go",
+      "runtime_version": "go1.27-devel_a1e7a415 Tue Apr 14 20:34:30 2026 -0700 linux/amd64",
+      "source_commit": "a1e7a41560e1f64aa49d30ccbdea5b0e715663c6",
+      "generated_at_unix_s": 1776261987,
+      "host_os": "linux",
+      "host_arch": "amd64",
+      "rows": [
+        {
+          "scenario_name": "flood_1m",
+          "task_count": 1000000,
+          "submitter_count": 1,
+          "worker_count": 56,
+          "median_elapsed_ns": 944412399,
+          "median_ops_per_sec": 1058859.457011428,
+          "stddev_ops_per_sec": 95895.42225958899,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 1144167656,
+              "ops_per_sec": 873997.7876109442
+            },
+            {
+              "elapsed_ns": 1047489481,
+              "ops_per_sec": 954663.5246831658
+            },
+            {
+              "elapsed_ns": 988311890,
+              "ops_per_sec": 1011826.3375339945
+            },
+            {
+              "elapsed_ns": 944412399,
+              "ops_per_sec": 1058859.457011428
+            },
+            {
+              "elapsed_ns": 908602798,
+              "ops_per_sec": 1100590.9317043507
+            },
+            {
+              "elapsed_ns": 879086505,
+              "ops_per_sec": 1137544.4786289833
+            }
+          ]
+        },
+        {
+          "scenario_name": "contended_spawn_8x",
+          "task_count": 100000,
+          "submitter_count": 8,
+          "worker_count": 56,
+          "median_elapsed_ns": 30183096,
+          "median_ops_per_sec": 3313112.743636372,
+          "stddev_ops_per_sec": 310925.3188115531,
+          "sample_count": 6,
+          "warmup_discarded": 1,
+          "samples": [
+            {
+              "elapsed_ns": 35010848,
+              "ops_per_sec": 2856257.580507619
+            },
+            {
+              "elapsed_ns": 32923840,
+              "ops_per_sec": 3037312.780040238
+            },
+            {
+              "elapsed_ns": 32337919,
+              "ops_per_sec": 3092344.934131352
+            },
+            {
+              "elapsed_ns": 30183096,
+              "ops_per_sec": 3313112.743636372
+            },
+            {
+              "elapsed_ns": 27626848,
+              "ops_per_sec": 3619667.3612567023
+            },
+            {
+              "elapsed_ns": 27000097,
+              "ops_per_sec": 3703690.397853015
+            }
+          ]
+        }
+      ]
+    }
+
+  ]
+}

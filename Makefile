@@ -7,7 +7,7 @@ CURRENT ?= benchmarks/results/latest.json
 
 .PHONY: all build check fmt test test-unit test-integration test-stress test-all
 .PHONY: test-release-safe test-release-fast test-release-small clean dev ci
-.PHONY: bench scale-bench bench-save bench-compare tools cross-check example
+.PHONY: bench scale-bench bench-save bench-compare bench-runtime-zig bench-runtime-compare tools cross-check example
 
 all: build test-unit
 
@@ -55,6 +55,12 @@ bench-save:
 
 bench-compare:
 	$(ZIG) build compare-bench -- --baseline $(BASELINE) --current $(CURRENT)
+
+bench-runtime-zig:
+	$(ZIG) build bench-runtime-zig -- --output benchmarks/results/runtime-zig-latest.json
+
+bench-runtime-compare:
+	$(ZIG) build bench-runtime-compare -- --output benchmarks/results/runtime-comparison-latest.json
 
 tools:
 	$(ZIG) build tools

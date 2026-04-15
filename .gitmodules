@@ -1,0 +1,8 @@
+[submodule "third_party/tokio"]
+	path = third_party/tokio
+	url = https://github.com/tokio-rs/tokio.git
+	shallow = true
+[submodule "third_party/go"]
+	path = third_party/go
+	url = https://github.com/golang/go.git
+	shallow = true

@@ -4,6 +4,45 @@ Rolling record of micro-benchmark numbers as the Tokio-parity plan progresses.
 All numbers from local dev machine unless noted. CI baselines tracked in
 `benchmarks/results/baseline.json`.
 
+## 2026-04-15 direct runtime comparison — vendored Tokio and Go
+
+**Status:** shipped in the working tree and recorded in
+`benchmarks/results/runtime-comparison-latest.json`.
+
+This is the first repo-local direct comparison run that measures this pool,
+Tokio, and Go from pinned source trees in the same workflow instead of
+comparing against external numbers by assumption.
+
+### Command
+
+```bash
+zig build bench-runtime-compare -Doptimize=ReleaseFast -- --output benchmarks/results/runtime-comparison-latest.json
+```
+
+### Snapshot
+
+- worker count: `56`
+- warmup discard: `1`
+- retained samples: `6`
+
+| Scenario | Zig thread-pool median | Tokio median | Go median |
+|---|---:|---:|---:|
+| `flood_1m` | 535,989 ops/s | 603,864 ops/s | 1,058,859 ops/s |
+| `contended_spawn_8x` | 858,960 ops/s | 656,727 ops/s | 3,313,113 ops/s |
+
+### Interpretation
+
+- `flood_1m`: Tokio is about `1.13x` faster than this pool on this host.
+- `contended_spawn_8x`: this pool is about `1.31x` faster than Tokio here.
+- Go remains the throughput leader on both shared scenarios.
+
+### Operational impact
+
+- Claims about Tokio and Go performance should now cite this direct benchmark
+  path first.
+- The comparison workflow depends on initialized submodules and a local Go
+  toolchain bootstrap from `third_party/go`.
+
 ## 2026-04-14 late session — scratch fast path + idle queue attempt
 
 **Status:** implemented in the current working tree only, not on `main`.

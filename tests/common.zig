@@ -48,6 +48,22 @@ pub fn sleepTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
 }
 
+pub const GateTaskContext = struct {
+    counter: *Counter,
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+pub fn gateTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const ctx: *GateTaskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.started.store(true, .release);
+    while (!ctx.release.load(.acquire)) {
+        std.Thread.sleep(100_000);
+    }
+    _ = ctx.counter.value.fetchAdd(1, .monotonic);
+}
+
 pub const RecursiveContext = struct {
     pool: *thread_pool.ThreadPool,
     counter: *Counter,

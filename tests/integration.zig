@@ -2,6 +2,15 @@ const std = @import("std");
 const thread_pool = @import("thread_pool");
 const common = @import("common.zig");
 
+fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
+    const deadline = std.time.nanoTimestamp() + (5 * std.time.ns_per_s);
+    while (std.time.nanoTimestamp() < deadline) {
+        if (ctx.started.load(.acquire)) return;
+        std.Thread.sleep(100_000);
+    }
+    return error.Timeout;
+}
+
 test "multi-producer contention completes all tasks on work stealing scheduler" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 4,
@@ -195,13 +204,23 @@ test "blocking_backpressure config forces return_error on full blocking queue" {
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
+    var gate = common.GateTaskContext{ .counter = &counter };
     // Long sleep so the blocking worker stays occupied while we fill the queue.
     var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100 * std.time.ns_per_ms };
 
-    // First submit: consumed by the blocking worker. Next 2 fill the queue.
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    // Deterministically occupy the blocking worker, then fill the queue.
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate), .{ .wait_group = &wg, .lane = .blocking });
+    try waitUntilGateStarted(&gate);
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{
+        .wait_group = &wg,
+        .lane = .blocking,
+        .backpressure = .return_error,
+    });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{
+        .wait_group = &wg,
+        .lane = .blocking,
+        .backpressure = .return_error,
+    });
 
     // The caller asks to .block, but blocking_backpressure = .return_error
     // forces QueueFull.
@@ -212,6 +231,7 @@ test "blocking_backpressure config forces return_error on full blocking queue" {
     );
     try std.testing.expectError(error.QueueFull, result);
 
+    gate.release.store(true, .release);
     wg.wait();
 }
 
@@ -233,12 +253,23 @@ test "full blocking queue does not block default-lane submitters" {
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
+    var gate = common.GateTaskContext{ .counter = &counter };
     var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 50 * std.time.ns_per_ms };
 
-    // Saturate the blocking lane: 1 in flight + 2 queued.
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
-    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    // Saturate the blocking lane deterministically: 1 gated task in flight +
+    // 2 queued.
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate), .{ .wait_group = &wg, .lane = .blocking });
+    try waitUntilGateStarted(&gate);
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{
+        .wait_group = &wg,
+        .lane = .blocking,
+        .backpressure = .return_error,
+    });
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{
+        .wait_group = &wg,
+        .lane = .blocking,
+        .backpressure = .return_error,
+    });
 
     // Default-lane submissions: must complete quickly regardless of the
     // blocking-lane saturation.
@@ -250,6 +281,7 @@ test "full blocking queue does not block default-lane submitters" {
     // 64 non-contended submits should take far less than one blocking sleep.
     try std.testing.expect(elapsed_submit_ns < 25 * std.time.ns_per_ms);
 
+    gate.release.store(true, .release);
     wg.wait();
     // 3 blocking + 64 default = 67 tasks.
     try std.testing.expectEqual(@as(u64, 67), counter.value.load(.acquire));
@@ -273,11 +305,18 @@ test "blocking_queue_capacity sized independently of queue_capacity" {
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
+    var gate = common.GateTaskContext{ .counter = &counter };
     var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100 * std.time.ns_per_ms };
 
-    // 1 in flight + 4 queued = 5 accepted. The 6th must fail with QueueFull.
-    for (0..5) |_| {
-        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg, .lane = .blocking });
+    // 1 gated task in flight + 4 queued = 5 accepted. The 6th must fail.
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate), .{ .wait_group = &wg, .lane = .blocking });
+    try waitUntilGateStarted(&gate);
+    for (0..4) |_| {
+        _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{
+            .wait_group = &wg,
+            .lane = .blocking,
+            .backpressure = .return_error,
+        });
     }
     const overflow = pool.submit(
         common.sleepTask,
@@ -290,6 +329,7 @@ test "blocking_queue_capacity sized independently of queue_capacity" {
     for (0..256) |_| {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
     }
+    gate.release.store(true, .release);
     wg.wait();
     // 5 blocking sleepers + 256 default counters = 261.
     try std.testing.expectEqual(@as(u64, 261), counter.value.load(.acquire));

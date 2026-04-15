@@ -146,6 +146,23 @@ pub fn build(b: *std.Build) void {
     const tokio_bench_step = b.step("bench-tokio-parity", "Tokio rt_multi_threaded parity benchmarks");
     tokio_bench_step.dependOn(&run_tokio_bench.step);
 
+    const runtime_compare_zig = b.addExecutable(.{
+        .name = "thread-pool-runtime-compare-zig",
+        .root_module = importedModule(b, "benchmarks/runtime_compare_zig.zig", target, .ReleaseFast, module),
+    });
+    b.installArtifact(runtime_compare_zig);
+    const run_runtime_compare_zig = b.addRunArtifact(runtime_compare_zig);
+    if (b.args) |args| run_runtime_compare_zig.addArgs(args);
+    const runtime_compare_zig_step = b.step("bench-runtime-zig", "Comparable runtime benchmark for this Zig thread pool");
+    runtime_compare_zig_step.dependOn(&run_runtime_compare_zig.step);
+
+    const runtime_compare = b.addSystemCommand(&.{ "bash", "scripts/run-runtime-comparison.sh" });
+    runtime_compare.addArg("--zig-bin");
+    runtime_compare.addFileArg(runtime_compare_zig.getEmittedBin());
+    if (b.args) |args| runtime_compare.addArgs(args);
+    const runtime_compare_step = b.step("bench-runtime-compare", "Run direct side-by-side benchmarks against vendored Tokio and Go runtimes");
+    runtime_compare_step.dependOn(&runtime_compare.step);
+
     // Aggregate "bench-micro" step
     const micro_all_step = b.step("bench-micro", "All micro-benchmarks");
     micro_all_step.dependOn(&run_micro_submit.step);
@@ -156,6 +173,7 @@ pub fn build(b: *std.Build) void {
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);
     tools_step.dependOn(&compare_exe.step);
+    tools_step.dependOn(&runtime_compare_zig.step);
 
     const cross_step = b.step("cross-check", "Compile smoke targets for Linux, macOS, and Windows");
     const cross_targets = [_]std.Target.Query{
