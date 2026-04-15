@@ -329,3 +329,46 @@ with steal_batch_size=8.
 **Status:** Option D CLOSED. Reorder is not a productive axis for
 flood_1m_batched. Options F (rate limiter) and a new "sharded
 inject" variant remain as open candidates.
+
+## Iteration 5 (2026-04-15) — Option G CLOSED
+
+Bumped `inject_batch_size` default 32 → 64 and widened the
+popMany buf in `nextTask` to `[64]QueueEntry`. Post-gen-tag,
+this is the simplest remaining attack on the 16.64% popMany
+hotspot.
+
+**Stress:** 20/20 PASS at `-Doptimize=ReleaseFast` (180s
+outer-timeout).
+
+**Performance (n=10 paired BSSB, medians):**
+
+| Scenario                   | A (main 5d8c46f) | B (batch=64) | Δ        |
+|----------------------------|------------------|--------------|----------|
+| flood_1m                   | 381,611          | 366,874      | **-3.9%**|
+| flood_1m_batched           | 813,090          | 829,436      | +2.0%    |
+| contended_spawn_8x         | 715,031          | 742,470      | +3.8%    |
+| contended_spawn_8x_batched | 632,406          | 607,817      | **-3.9%**|
+
+**Verdict:** `flood_1m_batched` +2.0% is well below the +15%
+gate. Two regressions on `flood_1m` and `contended_spawn_8x_batched`
+on top of it. Mixed signal; closing without landing.
+
+**Hypothesis for the non-win:** If popMany's self-time was
+dominated by CAS contention, bigger batches (fewer calls) should
+have reduced that linearly. That didn't happen. Likely the
+dominant cost in popMany is either:
+
+- sequence-spin waits (producer hasn't finished writing the slot
+  yet) — bigger batches widen this window
+- cacheline misses on the slot reads themselves — bigger batches
+  mean more misses per call, not fewer
+
+Either would explain why bumping the batch size doesn't help.
+
+**Status:** Option G CLOSED. Combined with Option D closure
+(iter 4), both straightforward attacks on the popMany hotspot
+have failed. Next iteration should **re-profile post-gen-tag**
+before picking the next attack — the widening from u32 to u64
+queue slots may have shifted where the time goes. After that,
+either sharded-inject (high ceiling, big change) or an
+unrelated hotspot surfaced by the fresh profile.
