@@ -55,18 +55,18 @@ uses the vendored Go checkout instead of the host installation.
 ## Current Direct Runtime Snapshot
 
 From `benchmarks/results/runtime-comparison-latest.json` on 2026-04-15
-(`6` retained samples after `1` warmup discard, `56` workers):
+(`10` retained samples after `1` warmup discard, `56` workers):
 
 | Scenario | Zig thread-pool | Tokio | Go |
 |---|---:|---:|---:|
-| `flood_1m` | 535,989 ops/s | 603,864 ops/s | 1,058,859 ops/s |
-| `contended_spawn_8x` | 858,960 ops/s | 656,727 ops/s | 3,313,113 ops/s |
+| `flood_1m` | 1,141,058 ops/s | 428,545 ops/s | 768,076 ops/s |
+| `contended_spawn_8x` | 836,904 ops/s | 582,075 ops/s | 2,899,822 ops/s |
 
 Interpretation:
 
-- Tokio is about `1.13x` ahead of this pool on `flood_1m` on this host.
-- This pool is about `1.31x` ahead of Tokio on `contended_spawn_8x` here.
-- Go remains materially ahead on both scenarios.
+- This pool is `1.49x` ahead of Go and `2.66x` ahead of Tokio on `flood_1m`.
+- Go remains `3.46x` ahead on `contended_spawn_8x` (architectural: goroutines submit to local P queues, our external submitters use the shared inject queue).
+- Wake coalescing (`wake_coalesce_batch=32`, default) reduced scan+signal cost from per-submit to every 32nd submit.
 
 ## Docs Entry Points
 

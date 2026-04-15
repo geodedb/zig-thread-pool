@@ -1,13 +1,13 @@
 {
-  "generated_at_unix_s": 1776261987,
+  "generated_at_unix_s": 1776272352,
   "host_os": "linux",
   "host_arch": "x86_64",
   "runtimes": [
     {
       "runtime_name": "zig_thread_pool",
       "runtime_version": "zig 0.15.2",
-      "source_commit": "6715f8ab0f4a828030804cfe4432a73c957f0774",
-      "generated_at_unix_s": 1776261967,
+      "source_commit": "b050d554834e8a8dae481e0c87eb3d960311d682",
+      "generated_at_unix_s": 1776272309,
       "host_os": "linux",
       "host_arch": "x86_64",
       "rows": [
@@ -16,35 +16,51 @@
           "task_count": 1000000,
           "submitter_count": 1,
           "worker_count": 56,
-          "median_elapsed_ns": 1865710830,
-          "median_ops_per_sec": 535988.7416208009,
-          "stddev_ops_per_sec": 13478.321714818041,
-          "sample_count": 6,
+          "median_elapsed_ns": 876379294,
+          "median_ops_per_sec": 1141058.4513421878,
+          "stddev_ops_per_sec": 96168.19294195542,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 1984932858,
-              "ops_per_sec": 503795.37825152976
+              "elapsed_ns": 1069229443,
+              "ops_per_sec": 935252.9586112417
             },
             {
-              "elapsed_ns": 1878556747,
-              "ops_per_sec": 532323.5518953423
+              "elapsed_ns": 999584075,
+              "ops_per_sec": 1000416.0980655879
             },
             {
-              "elapsed_ns": 1866462868,
-              "ops_per_sec": 535772.7802383476
+              "elapsed_ns": 993639445,
+              "ops_per_sec": 1006401.270633937
             },
             {
-              "elapsed_ns": 1865710830,
-              "ops_per_sec": 535988.7416208009
+              "elapsed_ns": 894761227,
+              "ops_per_sec": 1117616.5996294338
             },
             {
-              "elapsed_ns": 1855323733,
-              "ops_per_sec": 538989.4939698915
+              "elapsed_ns": 882639775,
+              "ops_per_sec": 1132965.0309493474
             },
             {
-              "elapsed_ns": 1846500767,
-              "ops_per_sec": 541564.8982505946
+              "elapsed_ns": 876379294,
+              "ops_per_sec": 1141058.4513421878
+            },
+            {
+              "elapsed_ns": 858936772,
+              "ops_per_sec": 1164230.0488213352
+            },
+            {
+              "elapsed_ns": 855457697,
+              "ops_per_sec": 1168964.8751854063
+            },
+            {
+              "elapsed_ns": 827944944,
+              "ops_per_sec": 1207809.7791971057
+            },
+            {
+              "elapsed_ns": 821422715,
+              "ops_per_sec": 1217399.983880407
             }
           ]
         },
@@ -53,35 +69,51 @@
           "task_count": 100000,
           "submitter_count": 8,
           "worker_count": 56,
-          "median_elapsed_ns": 116419905,
-          "median_ops_per_sec": 858959.6426830961,
-          "stddev_ops_per_sec": 49178.690618738205,
-          "sample_count": 6,
+          "median_elapsed_ns": 119488030,
+          "median_ops_per_sec": 836903.9141410232,
+          "stddev_ops_per_sec": 38587.82845734062,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 126187290,
-              "ops_per_sec": 792472.8393802576
+              "elapsed_ns": 123959739,
+              "ops_per_sec": 806713.5410796566
             },
             {
-              "elapsed_ns": 119997955,
-              "ops_per_sec": 833347.5349642417
+              "elapsed_ns": 121622327,
+              "ops_per_sec": 822217.4535437067
             },
             {
-              "elapsed_ns": 118232716,
-              "ops_per_sec": 845789.5866995053
+              "elapsed_ns": 119847742,
+              "ops_per_sec": 834392.0238397149
             },
             {
-              "elapsed_ns": 116419905,
-              "ops_per_sec": 858959.6426830961
+              "elapsed_ns": 119762725,
+              "ops_per_sec": 834984.3409124166
             },
             {
-              "elapsed_ns": 112388105,
-              "ops_per_sec": 889773.8777604622
+              "elapsed_ns": 119660366,
+              "ops_per_sec": 835698.5971445215
             },
             {
-              "elapsed_ns": 105248886,
-              "ops_per_sec": 950128.8213159805
+              "elapsed_ns": 119488030,
+              "ops_per_sec": 836903.9141410232
+            },
+            {
+              "elapsed_ns": 117913467,
+              "ops_per_sec": 848079.5497260717
+            },
+            {
+              "elapsed_ns": 117671935,
+              "ops_per_sec": 849820.3076205044
+            },
+            {
+              "elapsed_ns": 117529456,
+              "ops_per_sec": 850850.5306108113
+            },
+            {
+              "elapsed_ns": 105033267,
+              "ops_per_sec": 952079.3064544017
             }
           ]
         }
@@ -92,7 +124,7 @@
       "runtime_name": "tokio",
       "runtime_version": "tokio 1.52.0",
       "source_commit": "5f7be0ac42cb3e1b739da1562f98a797cd55a606",
-      "generated_at_unix_s": 1776261980,
+      "generated_at_unix_s": 1776272337,
       "host_os": "linux",
       "host_arch": "x86_64",
       "rows": [
@@ -101,35 +133,51 @@
           "task_count": 1000000,
           "submitter_count": 1,
           "worker_count": 56,
-          "median_elapsed_ns": 1656001654,
-          "median_ops_per_sec": 603864.1311646902,
-          "stddev_ops_per_sec": 23310.45586391995,
-          "sample_count": 6,
+          "median_elapsed_ns": 2333475707,
+          "median_ops_per_sec": 428545.27990164334,
+          "stddev_ops_per_sec": 45502.360748616775,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 1757067872,
-              "ops_per_sec": 569129.9783779781
+              "elapsed_ns": 2592110026,
+              "ops_per_sec": 385786.09317103116
             },
             {
-              "elapsed_ns": 1753985978,
-              "ops_per_sec": 570129.9853834978
+              "elapsed_ns": 2557372347,
+              "ops_per_sec": 391026.35999528156
             },
             {
-              "elapsed_ns": 1742016082,
-              "ops_per_sec": 574047.5132995931
+              "elapsed_ns": 2519955505,
+              "ops_per_sec": 396832.40359436424
             },
             {
-              "elapsed_ns": 1656001654,
-              "ops_per_sec": 603864.1311646902
+              "elapsed_ns": 2391508032,
+              "ops_per_sec": 418146.20173519035
             },
             {
-              "elapsed_ns": 1650900415,
-              "ops_per_sec": 605730.0554982295
+              "elapsed_ns": 2334608105,
+              "ops_per_sec": 428337.414685708
             },
             {
-              "elapsed_ns": 1642869946,
-              "ops_per_sec": 608690.9085133389
+              "elapsed_ns": 2333475707,
+              "ops_per_sec": 428545.27990164334
+            },
+            {
+              "elapsed_ns": 2119770920,
+              "ops_per_sec": 471749.08881191746
+            },
+            {
+              "elapsed_ns": 2045415882,
+              "ops_per_sec": 488898.1301065306
+            },
+            {
+              "elapsed_ns": 2006791674,
+              "ops_per_sec": 498307.82784082845
+            },
+            {
+              "elapsed_ns": 1976798033,
+              "ops_per_sec": 505868.5729681723
             }
           ]
         },
@@ -138,35 +186,51 @@
           "task_count": 100000,
           "submitter_count": 8,
           "worker_count": 56,
-          "median_elapsed_ns": 152270345,
-          "median_ops_per_sec": 656726.6922525197,
-          "stddev_ops_per_sec": 39386.31351279003,
-          "sample_count": 6,
+          "median_elapsed_ns": 171799131,
+          "median_ops_per_sec": 582075.1212065212,
+          "stddev_ops_per_sec": 48264.35656593445,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 169058606,
-              "ops_per_sec": 591510.8515682425
+              "elapsed_ns": 200212674,
+              "ops_per_sec": 499468.8797773112
             },
             {
-              "elapsed_ns": 161838274,
-              "ops_per_sec": 617900.8063321288
+              "elapsed_ns": 192865245,
+              "ops_per_sec": 518496.73589453613
             },
             {
-              "elapsed_ns": 161587406,
-              "ops_per_sec": 618860.1109173076
+              "elapsed_ns": 183755099,
+              "ops_per_sec": 544202.5856381814
             },
             {
-              "elapsed_ns": 152270345,
-              "ops_per_sec": 656726.6922525197
+              "elapsed_ns": 181918135,
+              "ops_per_sec": 549697.8077529214
             },
             {
-              "elapsed_ns": 146658834,
-              "ops_per_sec": 681854.5959529448
+              "elapsed_ns": 172419169,
+              "ops_per_sec": 579981.9160478612
             },
             {
-              "elapsed_ns": 143839063,
-              "ops_per_sec": 695221.4364744576
+              "elapsed_ns": 171799131,
+              "ops_per_sec": 582075.1212065212
+            },
+            {
+              "elapsed_ns": 169113264,
+              "ops_per_sec": 591319.6731866046
+            },
+            {
+              "elapsed_ns": 168679269,
+              "ops_per_sec": 592841.0799551188
+            },
+            {
+              "elapsed_ns": 167606913,
+              "ops_per_sec": 596634.1018404175
+            },
+            {
+              "elapsed_ns": 147126470,
+              "ops_per_sec": 679687.3465393413
             }
           ]
         }
@@ -176,7 +240,7 @@
       "runtime_name": "go",
       "runtime_version": "go1.27-devel_a1e7a415 Tue Apr 14 20:34:30 2026 -0700 linux/amd64",
       "source_commit": "a1e7a41560e1f64aa49d30ccbdea5b0e715663c6",
-      "generated_at_unix_s": 1776261987,
+      "generated_at_unix_s": 1776272352,
       "host_os": "linux",
       "host_arch": "amd64",
       "rows": [
@@ -185,35 +249,51 @@
           "task_count": 1000000,
           "submitter_count": 1,
           "worker_count": 56,
-          "median_elapsed_ns": 944412399,
-          "median_ops_per_sec": 1058859.457011428,
-          "stddev_ops_per_sec": 95895.42225958899,
-          "sample_count": 6,
+          "median_elapsed_ns": 1301953714,
+          "median_ops_per_sec": 768076.4602050977,
+          "stddev_ops_per_sec": 93598.58624527701,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 1144167656,
-              "ops_per_sec": 873997.7876109442
+              "elapsed_ns": 1504614074,
+              "ops_per_sec": 664622.2558197338
             },
             {
-              "elapsed_ns": 1047489481,
-              "ops_per_sec": 954663.5246831658
+              "elapsed_ns": 1469862458,
+              "ops_per_sec": 680335.7651304813
             },
             {
-              "elapsed_ns": 988311890,
-              "ops_per_sec": 1011826.3375339945
+              "elapsed_ns": 1439192394,
+              "ops_per_sec": 694834.1334827816
             },
             {
-              "elapsed_ns": 944412399,
-              "ops_per_sec": 1058859.457011428
+              "elapsed_ns": 1409418846,
+              "ops_per_sec": 709512.2949704052
             },
             {
-              "elapsed_ns": 908602798,
-              "ops_per_sec": 1100590.9317043507
+              "elapsed_ns": 1385750078,
+              "ops_per_sec": 721630.845183326
             },
             {
-              "elapsed_ns": 879086505,
-              "ops_per_sec": 1137544.4786289833
+              "elapsed_ns": 1301953714,
+              "ops_per_sec": 768076.4602050977
+            },
+            {
+              "elapsed_ns": 1236826581,
+              "ops_per_sec": 808520.7864723275
+            },
+            {
+              "elapsed_ns": 1194759682,
+              "ops_per_sec": 836988.4045015841
+            },
+            {
+              "elapsed_ns": 1168945749,
+              "ops_per_sec": 855471.6939220419
+            },
+            {
+              "elapsed_ns": 1022087195,
+              "ops_per_sec": 978390.1069223356
             }
           ]
         },
@@ -222,35 +302,51 @@
           "task_count": 100000,
           "submitter_count": 8,
           "worker_count": 56,
-          "median_elapsed_ns": 30183096,
-          "median_ops_per_sec": 3313112.743636372,
-          "stddev_ops_per_sec": 310925.3188115531,
-          "sample_count": 6,
+          "median_elapsed_ns": 34484880,
+          "median_ops_per_sec": 2899821.602974985,
+          "stddev_ops_per_sec": 202917.7553588875,
+          "sample_count": 10,
           "warmup_discarded": 1,
           "samples": [
             {
-              "elapsed_ns": 35010848,
-              "ops_per_sec": 2856257.580507619
+              "elapsed_ns": 42764572,
+              "ops_per_sec": 2338384.2120529115
             },
             {
-              "elapsed_ns": 32923840,
-              "ops_per_sec": 3037312.780040238
+              "elapsed_ns": 37011886,
+              "ops_per_sec": 2701834.7565428037
             },
             {
-              "elapsed_ns": 32337919,
-              "ops_per_sec": 3092344.934131352
+              "elapsed_ns": 36558581,
+              "ops_per_sec": 2735335.925647661
             },
             {
-              "elapsed_ns": 30183096,
-              "ops_per_sec": 3313112.743636372
+              "elapsed_ns": 35748951,
+              "ops_per_sec": 2797284.876974432
             },
             {
-              "elapsed_ns": 27626848,
-              "ops_per_sec": 3619667.3612567023
+              "elapsed_ns": 35207719,
+              "ops_per_sec": 2840286.245183904
             },
             {
-              "elapsed_ns": 27000097,
-              "ops_per_sec": 3703690.397853015
+              "elapsed_ns": 34484880,
+              "ops_per_sec": 2899821.602974985
+            },
+            {
+              "elapsed_ns": 34400690,
+              "ops_per_sec": 2906918.4368104246
+            },
+            {
+              "elapsed_ns": 34182717,
+              "ops_per_sec": 2925454.9894322325
+            },
+            {
+              "elapsed_ns": 33992030,
+              "ops_per_sec": 2941866.07860725
+            },
+            {
+              "elapsed_ns": 33144305,
+              "ops_per_sec": 3017109.5758381416
             }
           ]
         }

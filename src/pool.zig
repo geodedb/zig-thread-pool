@@ -800,7 +800,25 @@ const Core = struct {
 
     fn enqueueTask(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
         const handle = try self.enqueuePush(task_fn, ctx, options);
-        self.notifySubmits(1, options.lane);
+
+        // Always update counters so the SC park handshake sees queued work.
+        const prev_submitted = self.counters.submitted.fetchAdd(1, .monotonic);
+        const lane_counter = self.queuedTasksCounter(options.lane);
+        const queue_depth = lane_counter.fetchAdd(1, .seq_cst) +% 1;
+        updatePeak(&self.counters.queue_depth_peak, queue_depth);
+
+        // Coalesce wake scans: only do the expensive worker scan + futex
+        // signal every `wake_coalesce_batch` submits. Between flushes, parked
+        // workers that attempt to re-park bail immediately via the SC
+        // queued_tasks handshake (they see > 0 and return without sleeping).
+        // Using the pool-wide submitted counter avoids TLS state that leaks
+        // across pool lifetimes. The first submit (prev_submitted=0) always
+        // wakes to ensure at least one worker is active.
+        const batch: u64 = self.config.wake_coalesce_batch;
+        if (batch <= 1 or prev_submitted % batch == 0) {
+            self.scanAndWake(options.lane);
+        }
+
         return handle;
     }
 
@@ -921,9 +939,13 @@ const Core = struct {
         const lane_counter = self.queuedTasksCounter(lane);
         const queue_depth = lane_counter.fetchAdd(count, .seq_cst) +% count;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
+        self.scanAndWake(lane);
+    }
 
-        // Scan range by lane. For `blocking_workers == 0` the default-lane
-        // path lands the same [0..workers.len) scan as pre-L1.
+    /// Scan workers in `lane` for one parked worker and signal it.
+    /// Extracted from notifySubmits so enqueueTask can call it
+    /// independently after coalesced counter updates.
+    fn scanAndWake(self: *Core, lane: types.TaskLane) void {
         const nb: usize = self.config.blocking_workers;
         const scan_start: usize = if (lane == .blocking) 0 else nb;
         const scan_end: usize = if (lane == .blocking) nb else self.workers.len;
