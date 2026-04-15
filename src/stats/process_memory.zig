@@ -38,12 +38,18 @@ pub fn sample() !types.ProcessMemoryStats {
 }
 
 fn sampleLinux() !types.ProcessMemoryStats {
-    var file = try std.fs.openFileAbsolute("/proc/self/status", .{});
-    defer file.close();
+    const posix = std.posix;
+    const fd = try posix.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    defer posix.close(fd);
 
     var buffer: [16 * 1024]u8 = undefined;
-    const len = try file.readAll(&buffer);
-    const contents = buffer[0..len];
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.read(fd, buffer[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    const contents = buffer[0..total];
 
     return .{
         .rss_current_bytes = parseProcStatusKiB(contents, "VmRSS:") * 1024,

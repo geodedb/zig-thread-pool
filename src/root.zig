@@ -7,6 +7,8 @@
 
 const std = @import("std");
 
+pub const sync = @import("sync.zig");
+pub const clock = @import("clock.zig");
 pub const types = @import("types.zig");
 pub const ThreadPool = @import("pool.zig").ThreadPool;
 pub const TaskContext = @import("pool.zig").TaskContext;

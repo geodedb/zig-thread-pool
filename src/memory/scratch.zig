@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("../sync.zig");
 
 pub const Accounting = struct {
     total_alloc_bytes: *std.atomic.Value(u64),
@@ -43,7 +44,7 @@ pub const WorkerScratch = struct {
     /// owning-worker task path remains lock-free; this only prevents
     /// external quiescent purge and the worker's own idle-time purge from
     /// racing each other and double-freeing the backing buffer.
-    purge_mutex: std.Thread.Mutex = .{},
+    purge_mutex: sync.Mutex = .{},
     /// Invariant: the worker task fast path is single-thread-owned. `purge()`
     /// is only legal once the pool is quiescent (`active_tasks == 0 &&
     /// queued_tasks == 0`) or from the owning worker's idle path after it has

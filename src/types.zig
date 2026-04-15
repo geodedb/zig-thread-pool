@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 
 pub const SchedulerVariant = enum {
     global_queue,
@@ -301,8 +302,8 @@ pub const CancellationToken = struct {
 
 pub const WaitGroup = struct {
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
 
     pub fn add(self: *WaitGroup, delta: u32) void {
         _ = self.pending.fetchAdd(delta, .monotonic);

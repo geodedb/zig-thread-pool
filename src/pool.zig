@@ -1,4 +1,6 @@
 const std = @import("std");
+const sync = @import("sync.zig");
+const clock = @import("clock.zig");
 const types = @import("types.zig");
 const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
 const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
@@ -202,8 +204,8 @@ const Worker = struct {
     completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_idle_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scratch_init_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    park_mutex: std.Thread.Mutex = .{},
-    park_cond: std.Thread.Condition = .{},
+    park_mutex: sync.Mutex = .{},
+    park_cond: sync.Condition = .{},
     /// 1 when this worker is parked, 0 otherwise. Fast-path check before
     /// acquiring park_mutex during signal — saves a futex syscall when the
     /// worker isn't actually parked.
@@ -242,8 +244,8 @@ const Worker = struct {
 /// Synchronization primitives for task completion. Worker parking uses
 /// per-Worker park_mutex/park_cond to avoid contention on a shared mutex.
 const Sync = struct {
-    completion_mutex: std.Thread.Mutex = .{},
-    completion_cond: std.Thread.Condition = .{},
+    completion_mutex: sync.Mutex = .{},
+    completion_cond: sync.Condition = .{},
     /// Backpressure primitives: blocked submitters (when queue/descriptor
     /// pool is full) sleep on a lane-scoped condvar rather than polling with
     /// a fixed-interval `Thread.sleep`. `releaseDescriptor` signals the
@@ -255,11 +257,11 @@ const Sync = struct {
     /// blocking queue cannot thundering-herd wake default-lane submitters,
     /// and vice versa. When `blocking_workers == 0` the blocking primitives
     /// are initialized but never touched.
-    default_backpressure_mutex: std.Thread.Mutex = .{},
-    default_backpressure_cond: std.Thread.Condition = .{},
+    default_backpressure_mutex: sync.Mutex = .{},
+    default_backpressure_cond: sync.Condition = .{},
     default_backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    blocking_backpressure_mutex: std.Thread.Mutex = .{},
-    blocking_backpressure_cond: std.Thread.Condition = .{},
+    blocking_backpressure_mutex: sync.Mutex = .{},
+    blocking_backpressure_cond: sync.Condition = .{},
     blocking_backpressure_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
@@ -705,14 +707,14 @@ const Core = struct {
         };
     }
 
-    inline fn backpressureMutex(self: *Core, lane: types.TaskLane) *std.Thread.Mutex {
+    inline fn backpressureMutex(self: *Core, lane: types.TaskLane) *sync.Mutex {
         return switch (lane) {
             .default => &self.sync.default_backpressure_mutex,
             .blocking => &self.sync.blocking_backpressure_mutex,
         };
     }
 
-    inline fn backpressureCond(self: *Core, lane: types.TaskLane) *std.Thread.Condition {
+    inline fn backpressureCond(self: *Core, lane: types.TaskLane) *sync.Condition {
         return switch (lane) {
             .default => &self.sync.default_backpressure_cond,
             .blocking => &self.sync.blocking_backpressure_cond,
@@ -1022,7 +1024,7 @@ const Core = struct {
         const timeout_ns = self.config.blocking_promotion_timeout_ns;
         const nb: usize = self.config.blocking_workers;
         while (!self.watchdog_stop.load(.acquire)) {
-            std.Thread.sleep(interval_ns);
+            clock.sleep(interval_ns);
             if (self.watchdog_stop.load(.acquire)) break;
 
             self.reapRetiredOverflow();
@@ -1867,7 +1869,7 @@ pub const ThreadPool = struct {
 };
 
 fn nowNs() u64 {
-    const ts = std.time.nanoTimestamp();
+    const ts = clock.nanoTimestamp();
     return if (ts < 0) 0 else @as(u64, @intCast(ts));
 }
 

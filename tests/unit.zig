@@ -978,3 +978,87 @@ test "g3: Stats.submitted reports exact spawn count" {
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(N, stats.submitted);
 }
+
+test "sync.Mutex lock/unlock is thread-safe" {
+    var m: thread_pool.sync.Mutex = .{};
+    var counter: u64 = 0;
+    const N = 4;
+    const IterPerThread = 1000;
+    const Worker = struct {
+        fn run(mutex: *thread_pool.sync.Mutex, c: *u64) void {
+            var i: usize = 0;
+            while (i < IterPerThread) : (i += 1) {
+                mutex.lock();
+                c.* += 1;
+                mutex.unlock();
+            }
+        }
+    };
+    var threads: [N]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &m, &counter });
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u64, N * IterPerThread), counter);
+}
+
+test "sync.Mutex tryLock succeeds when unlocked, fails when locked" {
+    var m: thread_pool.sync.Mutex = .{};
+    try std.testing.expect(m.tryLock());
+    try std.testing.expect(!m.tryLock());
+    m.unlock();
+    try std.testing.expect(m.tryLock());
+    m.unlock();
+}
+
+test "sync.Condition signal wakes waiter" {
+    var m: thread_pool.sync.Mutex = .{};
+    var c: thread_pool.sync.Condition = .{};
+    var ready: bool = false;
+
+    const Ctx = struct { m: *thread_pool.sync.Mutex, c: *thread_pool.sync.Condition, ready: *bool };
+    const ctx = Ctx{ .m = &m, .c = &c, .ready = &ready };
+
+    const Waiter = struct {
+        fn run(x: Ctx) void {
+            x.m.lock();
+            defer x.m.unlock();
+            while (!x.ready.*) x.c.wait(x.m);
+        }
+    };
+    var t = try std.Thread.spawn(.{}, Waiter.run, .{ctx});
+
+    // Yield a handful of times to let the waiter park; no external sleep.
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) std.Thread.yield() catch {};
+
+    m.lock();
+    ready = true;
+    c.signal();
+    m.unlock();
+
+    t.join();
+}
+
+test "sync.Semaphore permits balance" {
+    var s: thread_pool.sync.Semaphore = .{};
+    s.post();
+    s.post();
+    s.wait();
+    s.wait();
+    // Non-hang = success.
+}
+
+test "clock.nanoTimestamp increases over time" {
+    const a = thread_pool.clock.nanoTimestamp();
+    thread_pool.clock.sleep(1 * std.time.ns_per_ms);
+    const b = thread_pool.clock.nanoTimestamp();
+    try std.testing.expect(b > a);
+}
+
+test "clock.sleep sleeps at least the requested duration" {
+    const want_ns: u64 = 5 * std.time.ns_per_ms;
+    const start = thread_pool.clock.nanoTimestamp();
+    thread_pool.clock.sleep(want_ns);
+    const elapsed = thread_pool.clock.nanoTimestamp() - start;
+    // Allow 0.5ms slop for scheduler jitter.
+    try std.testing.expect(elapsed >= @as(i96, @intCast(want_ns - 500_000)));
+}
