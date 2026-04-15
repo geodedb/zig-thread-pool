@@ -377,3 +377,114 @@ it made non-hinted workers drain-last.
 The `drain_hint` field from the spec was NOT retained in-tree;
 the closed-out design doc stands on its own. A future iteration
 that re-opens this attack should re-derive from the design.
+
+### Post-mortem — SEGV is a null task_fn dereference (2026-04-15)
+
+Partial diagnosis from a diagnostic-reproducer iteration (all
+pool.zig instrumentation reverted, never committed). Findings:
+
+- **Fault site:** `src/pool.zig:953` —
+  `descriptor.task_fn.?(descriptor.ctx.?, &runtime)`. The SEGV is
+  "Segmentation fault at address 0x0": a null function pointer
+  call. Not a use-after-free of the descriptor arena itself; the
+  descriptor struct is live but `task_fn` has been cleared to
+  null.
+- **Only two `task_fn` writers exist:**
+  - `enqueuePush` (pool.zig:~620) — writes the non-null task_fn
+    *before* storing `state = .queued` via
+    `descriptor.state.store(.queued, .release)` (pool.zig:653).
+    So state=.queued synchronizes-with a non-null task_fn by
+    the standard release-acquire pairing.
+  - `releaseDescriptor` (pool.zig:1167) — writes `task_fn = null`
+    *after* state has transitioned through
+    `.running → .completed → .free`.
+- **Key diagnostic:** Adding an `@atomicLoad(?TaskFn, ...,
+  .acquire)` probe *immediately after* the successful CAS
+  `.queued → .running` (pool.zig:905) shows `task_fn` as non-null
+  at probe time, yet the call at line 953 faults ~10% of runs
+  (4 failures in 40 ReleaseFast runs with the probe installed,
+  both in `double_dequeue_race` and `park_handshake` tests). The
+  only explanation consistent with this observation is **another
+  thread writes `task_fn = null` via `releaseDescriptor` between
+  the probe and the call** — i.e. another thread already ran the
+  task and released the descriptor in the same CAS-filter window.
+- **Implication — true double-dispatch:** For `releaseDescriptor`
+  to fire, some *other* worker must have successfully transitioned
+  the descriptor `queued → running → completed → free` while our
+  worker was between the acquire-probe and the call. That requires
+  the other worker to have also won the CAS `.queued → .running`
+  for the same descriptor+generation. The phase-H CAS filter is
+  designed to prevent exactly this (it's atomic — only one winner),
+  yet two winners are occurring under Option C's reorder.
+- **Signature matches Option D.** Both attacks move inject drain
+  *after* bitmap-steal. The brainstorm already noted this reorder
+  is suspicious; the post-mortem confirms the mechanism is a
+  double-CAS-win on the same descriptor, not a ring-level use-
+  after-free.
+
+### Root cause — still unresolved
+
+The individual queue protocols are each correct:
+
+- `BoundedRing.popMany` (Vyukov MPMC) claims slots atomically
+  via head CAS + per-slot sequence; no descriptor index can be
+  emitted to two consumers from the inject queue.
+- `RingQueue.stealHalf` (Chase-Lev-like SPMC) uses top CAS +
+  bottom load with the standard steal/pop protocol; no descriptor
+  can be stolen twice.
+- `BoundedRing.pop` (used only by `cancelQueuedTasks` during
+  shutdown) holds `state != .running` invariant at entry.
+
+The double-dispatch must arise at the *seam* — a descriptor
+whose index is live in the inject ring AND in some worker's
+local deque concurrently. Most plausible mechanism: the inject
+drain's push-to-local step (`lq.tryPushBottom(buf[i])` in
+`tryDrainInject`) does not preclude the same index already
+existing in the local ring through some earlier path. Under the
+today-order (drain before steal), the local-ring ingress
+temporally precedes any steal attempt; under Option C's reorder,
+a non-hinted worker can `stealHalf` a local ring while the
+hint-drain concurrently pushes fresh indices into it. If the
+stealer samples a slot that was earlier emitted by inject and
+subsequently re-emitted by inject (descriptor was recycled, a
+classic A/B/A on descriptor indices with generation reuse), both
+workers could race to CAS the same index in the current
+generation.
+
+This is still a hypothesis. Confirmation requires either:
+
+- A descriptor-level dispatch counter (monotonic counter per
+  `(index, generation)` pair, panic on ≥2), or
+- A debugger-driven core dump analysis (not available in this
+  environment — no gdb/lldb installed).
+
+### What NOT to do next
+
+- **Do not reopen Options C or D as-designed.** Both reorder
+  bitmap-steal before inject drain for some worker set. Both
+  SEGV. Root cause is unfixed.
+- **Do not assume `@atomicLoad(.acquire)` on `task_fn` fixes the
+  race.** An earlier 20/20-PASS observation under ReleaseFast
+  was noise — the `n=40` re-run returned to ~10% failure. The
+  probe is diagnostic only.
+
+### Candidate forward paths (ranked)
+
+1. **Descriptor dispatch counter.** Add an atomic u32 counter
+   per descriptor; bump-on-dispatch before CAS, panic if pre-CAS
+   counter already >0 (i.e. someone else dispatched this
+   generation). Confirms / refutes the double-dispatch hypothesis
+   cheaply. Instrumentation only — does not land in production.
+2. **Hint-only with pre-park drain.** Non-hinted workers never
+   touch inject in `nextTask`; the hinted worker and the
+   about-to-park worker drain. Avoids the reorder entirely.
+   Needs a fresh design doc; the Option C failure mode here
+   should be cited in its correctness proof.
+3. **Non-reorder attacks on inject head contention.** E.g. a
+   sharded inject queue (Option B from the brainstorm) that
+   splits head-CAS pressure across N rings rather than serializing
+   drain differently. No reorder, no dispatch-count risk.
+
+All reorder-based attacks remain blocked on path 1 (dispatch
+counter) confirming the double-dispatch hypothesis and
+identifying the specific seam — or a debugger becoming available.
