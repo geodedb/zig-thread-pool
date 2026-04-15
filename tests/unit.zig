@@ -234,21 +234,33 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     try std.testing.expectError(error.Timeout, result);
 }
 
-test "WaitGroup done underflow guard present in all build modes" {
+test "WaitGroup done underflow guard present in debug build modes" {
     // Verify the WaitGroup correctly tracks pending count down to zero.
-    // The underflow guard (@panic) fires if done() is called when pending == 0.
-    // We cannot catch @panic in-process, so we verify the counter reaches
-    // exactly zero and that no further done() should be called.
+    // The underflow guard (@panic) fires if done() is called when pending == 0
+    // in Debug and ReleaseSafe (std.debug.runtime_safety == true).
+    // In ReleaseFast the invariant is restored silently (F-004 fix).
     var wg = thread_pool.types.WaitGroup{};
     wg.add(1);
     try std.testing.expectEqual(@as(u32, 1), wg.pendingCount());
     wg.done();
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
-    // At this point, calling wg.done() would trigger:
+    // At this point, calling wg.done() in Debug/ReleaseSafe would trigger:
     //   @panic("WaitGroup: done() called more times than add()")
-    // This panic fires in ALL build modes (Debug, ReleaseSafe, ReleaseFast,
-    // ReleaseSmall), unlike the previous std.debug.assert which was stripped
-    // in release builds.
+    // In ReleaseFast it returns early after restoring pending to 0.
+}
+
+test "F-004: WaitGroup.done underflow does not crash ReleaseFast" {
+    // This test only runs under ReleaseFast (runtime_safety == false)
+    // where the fix makes double-done resilient. In Debug/ReleaseSafe
+    // the panic is preserved as a caller-bug catcher.
+    if (std.debug.runtime_safety) return error.SkipZigTest;
+
+    var wg = thread_pool.types.WaitGroup{};
+    wg.add(1);
+    wg.done();
+    wg.done(); // pre-fix: would crash; post-fix: must return cleanly
+    // pending must be saturated at 0, not wrapped negative
+    try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
 }
 
 test "local_queue_capacity zero rejected for all scheduler variants" {

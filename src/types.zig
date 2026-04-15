@@ -312,7 +312,15 @@ pub const WaitGroup = struct {
     pub fn done(self: *WaitGroup) void {
         const previous = self.pending.fetchSub(1, .acq_rel);
         if (previous == 0) {
-            @panic("WaitGroup: done() called more times than add()");
+            // F-004: restore invariant so repeated misuse can't push
+            // pending arbitrarily negative. Loud panic in Debug/ReleaseSafe
+            // catches the caller bug in testing; in ReleaseFast the library
+            // keeps running rather than crashing the host process.
+            _ = self.pending.fetchAdd(1, .monotonic);
+            if (std.debug.runtime_safety) {
+                @panic("WaitGroup: done() called more times than add()");
+            }
+            return;
         }
         if (previous == 1) {
             self.mutex.lock();
@@ -519,6 +527,19 @@ test "WaitGroup blocks until count reaches zero" {
     try std.testing.expectEqual(@as(u32, 1), wg.pendingCount());
     wg.done();
     wg.wait();
+    try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
+}
+
+test "F-004: WaitGroup.done underflow does not crash ReleaseFast" {
+    // Only runs under ReleaseFast (runtime_safety == false).
+    // In Debug/ReleaseSafe the panic is preserved as a caller-bug catcher.
+    if (std.debug.runtime_safety) return error.SkipZigTest;
+
+    var wg = WaitGroup{};
+    wg.add(1);
+    wg.done();
+    wg.done(); // pre-fix: would crash; post-fix: must return cleanly
+    // pending must be saturated at 0, not wrapped negative
     try std.testing.expectEqual(@as(u32, 0), wg.pendingCount());
 }
 
