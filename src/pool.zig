@@ -758,18 +758,25 @@ const Core = struct {
                 return descriptor_index;
             }
 
-            if (self.inject_queue.pop()) |descriptor_index| {
-                var moved: usize = 1;
-                while (moved < self.config.inject_batch_size) : (moved += 1) {
-                    const extra = self.inject_queue.pop() orelse break;
-                    if (!lq.tryPushBottom(extra)) {
-                        _ = self.inject_queue.tryPush(extra);
-                        break;
+            {
+                var buf: [32]u32 = undefined;
+                const cap = @min(self.config.inject_batch_size, buf.len);
+                const n = self.inject_queue.popMany(buf[0..cap]);
+                if (n > 0) {
+                    const first = buf[0];
+                    var i: usize = 1;
+                    while (i < n) : (i += 1) {
+                        if (!lq.tryPushBottom(buf[i])) {
+                            while (i < n) : (i += 1) {
+                                _ = self.inject_queue.tryPush(buf[i]);
+                            }
+                            break;
+                        }
                     }
+                    const local_len = @as(u32, @intCast(lq.len()));
+                    updatePeakU32(&worker.local_queue_peak, local_len);
+                    return first;
                 }
-                const local_len = @as(u32, @intCast(lq.len()));
-                updatePeakU32(&worker.local_queue_peak, local_len);
-                return descriptor_index;
             }
 
             // Use worker_index mixed with submitted count for pseudo-random start.
