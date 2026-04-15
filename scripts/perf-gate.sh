@@ -6,6 +6,32 @@
 
 set -euo pipefail
 
+# Pin zig to the project's required version. The project's minimum_zig_version
+# is 0.15.2 (see build.zig.zon). The ambient `zig` on the host may be newer
+# (e.g. 0.16.0), which would produce noisy "compiler ABI drift" numbers when
+# comparing before/after. We resolve zig via mise so every perf-gate run is
+# reproducible regardless of the caller's shell state.
+#
+# If you don't have mise, install it (https://mise.jdx.dev) or override with:
+#     ZIG=/path/to/zig/0.15.2 ./scripts/perf-gate.sh ...
+ZIG="${ZIG:-}"
+if [[ -z "$ZIG" ]]; then
+    if command -v mise >/dev/null 2>&1; then
+        ZIG_RUNNER=(mise x zig@0.15.2 -- zig)
+    elif command -v zig >/dev/null 2>&1; then
+        ZIG_RUNNER=(zig)
+        actual_ver="$(zig version 2>/dev/null || echo unknown)"
+        if [[ "$actual_ver" != "0.15.2" ]]; then
+            echo "[perf-gate] WARNING: ambient zig is $actual_ver, project needs 0.15.2. Numbers may not compare cleanly." >&2
+        fi
+    else
+        echo "[perf-gate] ERROR: no zig found. Install mise + zig@0.15.2, or set ZIG=/path/to/zig." >&2
+        exit 4
+    fi
+else
+    ZIG_RUNNER=("$ZIG")
+fi
+
 STEP="${1:?step name required (e.g. step-1-f001)}"
 PHASE="${2:?phase required: before | after}"
 ART_DIR="docs/performance/appsec-fixes-2026-04-15"
@@ -21,10 +47,10 @@ BENCH_OUT="$ART_DIR/${STEP}-${PHASE}-bench.json"
 REAL_OUT="$ART_DIR/${STEP}-${PHASE}-realistic.json"
 
 echo "[perf-gate] $STEP $PHASE: running zig build bench ..."
-zig build bench -- --output "$BENCH_OUT"
+"${ZIG_RUNNER[@]}" build bench -- --output "$BENCH_OUT"
 
 echo "[perf-gate] $STEP $PHASE: running zig build bench-realistic ..."
-zig build bench-realistic -Doptimize=ReleaseFast -- --output "$REAL_OUT"
+"${ZIG_RUNNER[@]}" build bench-realistic -Doptimize=ReleaseFast -- --output "$REAL_OUT"
 
 if [[ "$PHASE" == "after" ]]; then
     DIFF_OUT="$ART_DIR/${STEP}-diff.md"
