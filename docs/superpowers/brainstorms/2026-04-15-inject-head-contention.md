@@ -290,3 +290,42 @@ dominated.
   contended_spawn_8x, contended_spawn_8x_batched.
 - Gate: ≥+15% flood_1m_batched CLEAN → land; +5..+15% with no
   CLEAN regression → land; otherwise document as closed ceiling.
+
+## Iteration 4 (2026-04-15) — Option D CLOSED under gen-tag
+
+With the gen-tagged queue entries fix landed at `85f0aaa`, the
+SIGSEGV prerequisite noted for Option D was resolved. Iter 4
+retried the bare reorder (bitmap-steal before inject-drain).
+
+**Stress:** 20/20 PASS at `-Doptimize=ReleaseFast` (one run in a
+first pass hit a 120s outer `timeout` ceiling — not an assertion
+failure; on the second pass with 180s ceiling, 20/20 PASS under
+wall-clock).
+
+**Performance (n=10 paired BSSB medians):**
+
+| Scenario                   | A (main 85f0aaa) | B (Option D) | Δ        |
+|----------------------------|------------------|--------------|----------|
+| flood_1m                   | 372,796          | 373,568      | +0.2%    |
+| **flood_1m_batched**       | **805,655**      | **775,165**  | **-3.8%**|
+| contended_spawn_8x         | 709,153          | 757,562      | +6.8%    |
+| contended_spawn_8x_batched | 642,339          | 683,812      | +6.4%    |
+
+**Verdict:** Headline flood_1m_batched **regresses 3.8%** vs the
++15% gate. Contended scenarios gain ~+6-7% but not enough to
+offset the regression on the primary target.
+
+**Why the regression** (hypothesis): under reorder, fewer workers
+drain inject via popMany but more workers contend on a single
+victim's SPMC top (stealHalf CAS). In `flood_1m_batched` the
+injector is an external submitter and workers otherwise have empty
+locals, so bitmap-steal-first concentrates N-1 stealers on
+whoever just drained — converting MPMC inject contention into
+SPMC steal contention with worse amortization (popMany batches 32,
+stealHalf only (len+1)/2). Inject's MPMC head with popMany batch=32
+absorbs the 56-worker contention better than one victim's top
+with steal_batch_size=8.
+
+**Status:** Option D CLOSED. Reorder is not a productive axis for
+flood_1m_batched. Options F (rate limiter) and a new "sharded
+inject" variant remain as open candidates.
