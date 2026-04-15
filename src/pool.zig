@@ -996,6 +996,12 @@ const Core = struct {
                 // the default inject queue preserves forward progress if the
                 // invariant is ever broken by a future refactor, instead of
                 // becoming ReleaseFast UB (F-006).
+                //
+                // Note: on this fallback path the task executes on a default
+                // worker instead of a blocking worker — lane isolation is
+                // violated. Acceptable only as a last-resort safety net; the
+                // invariant that would make this branch reachable is itself
+                // the real bug to fix.
                 queued = self.inject_queue.tryPush(entry);
             }
         } else {
