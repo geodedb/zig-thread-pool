@@ -228,6 +228,12 @@ const Worker = struct {
     /// the default-lane queue and only steal from `.default` workers. See
     /// docs/superpowers/specs/2026-04-15-lane-extension-scheduler-design.md.
     serves_lane: types.TaskLane = .default,
+    /// Slice L4 — timestamp (ns) when the currently-executing task was
+    /// dispatched. Zero means idle (no task running). Written unconditionally
+    /// in `runTask` when `Config.watchdog_interval_ns > 0`; skipped entirely
+    /// when the watchdog is disabled to preserve zero-overhead hot path.
+    /// The watchdog thread reads this on every tick to detect stalls.
+    current_task_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -299,6 +305,12 @@ const Counters = extern struct {
     total_alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peak_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Slice L4 — watchdog observability. Incremented each time the watchdog
+    // thread sees a default-lane worker that has been running one task for
+    // longer than `Config.blocking_promotion_timeout_ns`. Cumulative across
+    // the pool's lifetime; a single long-stalled task may be counted more
+    // than once (once per watchdog tick it remains stalled).
+    watchdog_stalls_detected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     comptime {
         // Cacheline isolation invariants: each hot-write counter owns a distinct line.
@@ -334,6 +346,16 @@ const Core = struct {
     /// 55-victim `len()` peek loop in nextTask with one u64 load.
     /// Max 64 workers (enforced by Config.validate).
     workers_nonempty: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
+    /// Slice L4 — optional watchdog thread. Spawned when
+    /// `config.watchdog_interval_ns > 0`. Walks default-lane workers every
+    /// interval looking for stalled tasks (task duration exceeds
+    /// `config.blocking_promotion_timeout_ns`). Stalls increment
+    /// `counters.watchdog_stalls_detected`. Overflow-worker spawn is deferred
+    /// to L4b; this slice lands observability only.
+    watchdog_thread: ?std.Thread = null,
+    /// Signals the watchdog thread to exit. Set by `joinAllWorkers` before
+    /// join. Read by `watchdogMain` on each tick.
+    watchdog_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
@@ -401,6 +423,10 @@ const Core = struct {
 
         for (self.workers, 0..) |*worker, idx| {
             worker.thread = try std.Thread.spawn(.{}, workerMain, .{ self, idx });
+        }
+
+        if (normalized.watchdog_interval_ns > 0) {
+            self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
         }
     }
 
@@ -579,6 +605,14 @@ const Core = struct {
                 worker.thread = null;
             }
         }
+        // Slice L4: stop and join the watchdog last — it only reads pool
+        // state, so joining after workers ensures it won't touch a partially-
+        // freed worker struct.
+        if (self.watchdog_thread) |thread| {
+            self.watchdog_stop.store(true, .release);
+            thread.join();
+            self.watchdog_thread = null;
+        }
         self.state.store(.stopped, .release);
     }
 
@@ -705,6 +739,7 @@ const Core = struct {
             .total_alloc_count = self.counters.total_alloc_count.load(.acquire),
             .live_bytes = self.counters.live_bytes.load(.acquire),
             .peak_live_bytes = self.counters.peak_live_bytes.load(.acquire),
+            .watchdog_stalls_detected = self.counters.watchdog_stalls_detected.load(.acquire),
             .task_wait_ns = merged_wait.summary(),
             .task_exec_ns = merged_exec.summary(),
             .memory = memory,
@@ -887,6 +922,41 @@ const Core = struct {
                 }
                 w.park_mutex.unlock();
                 break;
+            }
+        }
+    }
+
+    /// Slice L4 — watchdog main loop. Wakes every `watchdog_interval_ns`,
+    /// walks default-lane workers, and increments
+    /// `counters.watchdog_stalls_detected` for each worker whose current task
+    /// has been running longer than `blocking_promotion_timeout_ns`. Exits
+    /// when `watchdog_stop` is set by `joinAllWorkers`.
+    ///
+    /// Overflow-worker spawn is intentionally deferred to L4b — this slice
+    /// lands observability only so operators can size their pool based on
+    /// measured stall rates before turning on elastic promotion.
+    fn watchdogMain(self: *Core) void {
+        const interval_ns = self.config.watchdog_interval_ns;
+        const timeout_ns = self.config.blocking_promotion_timeout_ns;
+        const nb: usize = self.config.blocking_workers;
+        while (!self.watchdog_stop.load(.acquire)) {
+            // Sleep first so startup races don't fire a spurious stall on
+            // worker slots that haven't been populated yet.
+            std.Thread.sleep(interval_ns);
+            if (self.watchdog_stop.load(.acquire)) break;
+
+            const now = nowNs();
+            // Only default-lane workers [nb..workers.len) — blocking-lane
+            // stalls are expected (that's what the lane is for) and are not
+            // candidates for overflow promotion.
+            var idx: usize = nb;
+            while (idx < self.workers.len) : (idx += 1) {
+                const started = self.workers[idx].current_task_started_ns.load(.acquire);
+                if (started == 0) continue;
+                if (now <= started) continue;
+                if (now - started > timeout_ns) {
+                    _ = self.counters.watchdog_stalls_detected.fetchAdd(1, .monotonic);
+                }
             }
         }
     }
@@ -1143,12 +1213,17 @@ const Core = struct {
             }
         }
         const timestamps_enabled = self.config.timestamp_mode == .full;
-        const start_ns = if (timestamps_enabled) nowNs() else 0;
+        const watchdog_enabled = self.config.watchdog_interval_ns > 0;
+        const start_ns = if (timestamps_enabled or watchdog_enabled) nowNs() else 0;
         descriptor.start_ns = start_ns;
 
         if (timestamps_enabled) {
             const wait_ns = start_ns - descriptor.submit_ns;
             worker.wait_histogram.observe(wait_ns);
+        }
+
+        if (watchdog_enabled) {
+            worker.current_task_started_ns.store(start_ns, .release);
         }
 
         _ = worker.started.fetchAdd(1, .monotonic);
@@ -1184,6 +1259,9 @@ const Core = struct {
         // regardless of timestamp_mode. Read the clock once.
         const complete_ns = nowNs();
         worker.last_idle_started_ns.store(complete_ns, .release);
+        if (watchdog_enabled) {
+            worker.current_task_started_ns.store(0, .release);
+        }
 
         if (timestamps_enabled) {
             descriptor.complete_ns = complete_ns;

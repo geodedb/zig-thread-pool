@@ -167,6 +167,22 @@ pub const Config = struct {
     /// default work landing in a blocking worker's local queue cannot
     /// be stolen by default workers (same-lane-only steal).
     cpu_helps_blocking: bool = false,
+    /// Slice L4 — watchdog thread interval. When > 0, a dedicated thread
+    /// wakes every `watchdog_interval_ns` and walks default-lane workers
+    /// looking for tasks that have been running longer than
+    /// `blocking_promotion_timeout_ns`. Zero disables the watchdog entirely
+    /// (no thread spawned, no hot-path overhead). Requires
+    /// `max_overflow_workers > 0` when set.
+    watchdog_interval_ns: u64 = 0,
+    /// Slice L4 — how long a default-lane task may run before the watchdog
+    /// flags it as stalled. Ignored when `watchdog_interval_ns == 0`.
+    /// Default 10ms matches the Tokio "max_blocking_time" rule of thumb.
+    blocking_promotion_timeout_ns: u64 = 10_000_000,
+    /// Slice L4 — hard cap on overflow-worker slots reserved at init.
+    /// Zero disables overflow spawning (watchdog becomes observability-only).
+    /// `max_threads + max_overflow_workers` must stay ≤ 64 (the
+    /// workers_nonempty bitmap width).
+    max_overflow_workers: u32 = 0,
     timestamp_mode: TimestampMode = .full,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
@@ -232,6 +248,10 @@ pub const Config = struct {
             return error.BlockingBackpressureWithoutLane;
         if (self.cpu_helps_blocking and self.blocking_workers == 0)
             return error.CpuHelpsBlockingWithoutLane;
+        if (self.watchdog_interval_ns > 0 and self.max_overflow_workers == 0)
+            return error.WatchdogWithoutOverflowCap;
+        if (@as(u64, self.max_threads) + @as(u64, self.max_overflow_workers) > 64)
+            return error.OverflowCapExceedsBitmap;
     }
 };
 
@@ -356,6 +376,11 @@ pub const Stats = struct {
     total_alloc_count: u64 = 0,
     live_bytes: u64 = 0,
     peak_live_bytes: u64 = 0,
+    /// Slice L4 — cumulative watchdog-observed stalls. Incremented each tick
+    /// the watchdog sees a default-lane worker whose current task has been
+    /// running longer than `Config.blocking_promotion_timeout_ns`. Always
+    /// zero when `Config.watchdog_interval_ns == 0`.
+    watchdog_stalls_detected: u64 = 0,
     task_wait_ns: LatencySummary = .{},
     task_exec_ns: LatencySummary = .{},
     memory: ProcessMemoryStats = .{},
@@ -451,6 +476,26 @@ test "Config validation rejects cpu_helps_blocking without blocking_workers" {
     };
     cfg = cfg.normalized();
     try std.testing.expectError(error.CpuHelpsBlockingWithoutLane, cfg.validate());
+}
+
+test "Config validation rejects watchdog without overflow cap" {
+    var cfg = Config{
+        .max_threads = 4,
+        .min_threads = 4,
+        .watchdog_interval_ns = 1_000_000,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.WatchdogWithoutOverflowCap, cfg.validate());
+}
+
+test "Config validation rejects overflow cap that overflows bitmap" {
+    var cfg = Config{
+        .max_threads = 60,
+        .min_threads = 60,
+        .max_overflow_workers = 8,
+    };
+    cfg = cfg.normalized();
+    try std.testing.expectError(error.OverflowCapExceedsBitmap, cfg.validate());
 }
 
 test "WaitGroup blocks until count reaches zero" {

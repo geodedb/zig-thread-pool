@@ -406,6 +406,60 @@ test "cpu_helps_blocking opt-in lets default workers drain blocking lane" {
     try std.testing.expect(elapsed_ns < 400 * std.time.ns_per_ms);
 }
 
+test "watchdog detects stalled default-lane task" {
+    // Slice L4a: with watchdog_interval_ns > 0 and blocking_promotion_timeout_ns
+    // shorter than a deliberately-wedged task, the watchdog must observe the
+    // stall and increment counters.watchdog_stalls_detected at least once.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .watchdog_interval_ns = 5 * std.time.ns_per_ms,
+        .blocking_promotion_timeout_ns = 10 * std.time.ns_per_ms,
+        .max_overflow_workers = 1,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // Task runs for 100ms — well above the 10ms stall threshold, giving the
+    // watchdog (5ms interval) many opportunities to observe it.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 100 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg });
+
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.watchdog_stalls_detected >= 1);
+}
+
+test "watchdog disabled produces zero stall counts" {
+    // Slice L4a: with watchdog_interval_ns = 0 (default), no watchdog thread
+    // is spawned and the stall counter stays at zero regardless of task
+    // duration. Guards the no-effect invariant.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 50 * std.time.ns_per_ms };
+    _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{ .wait_group = &wg });
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.watchdog_stalls_detected);
+}
+
 test "default workers ignore blocking lane without cpu_helps_blocking" {
     // Slice L3: with cpu_helps_blocking = false (default), default workers must
     // NOT touch the blocking lane. Verify that with the blocking worker wedged
