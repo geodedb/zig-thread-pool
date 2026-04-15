@@ -1,17 +1,38 @@
-# Inject-Queue Head Contention — Brainstorm (Option A landed partial)
+# Inject-Queue Head Contention — Brainstorm (direction closed)
 
-> **Status:** Option A (batched pop via single head RMW) implemented,
-> fix landed, but PRIMARY GATE MISSED. Fixed n=20 balanced-order
-> paired A/B (authoritative, `ceilA_fixed_raw.txt`): flood_1m_batched
-> +3.8% overlap (905K → 940K) — below the +15% pursue gate.
-> contended_spawn_8x +9.0% CLEAN (591K → 644K), flood_1m +4.7%
-> overlap, contended_spawn_8x_batched +6.2% overlap. Landed anyway
-> because the +9% CLEAN on contended_spawn_8x is real and the
-> `popMany` primitive is reusable, with no regression on any
-> scenario. For flood_1m_batched specifically, Option B (sharded
-> inject) remains the designated next-step direction.
+> **Status (final):** Option A landed partial (commit cd15524).
+> Option B measured at N=2 and N=4, both FAIL the primary gate;
+> direction abandoned. Inject-queue head CAS is no longer the
+> binding constraint for flood_1m_batched — bottleneck lives
+> deeper. See `docs/performance/2026-04-14-option-b-abandoned/`.
 >
-> History: an earlier n=20 run measured +13.8% IQR-clean
+> **Option A (`popMany`) landed:** fixed n=20 paired A/B
+> (authoritative, `ceilA_fixed_raw.txt`): flood_1m_batched +3.8%
+> overlap, contended_spawn_8x +9.0% CLEAN, flood_1m +4.7% overlap,
+> contended_spawn_8x_batched +6.2% overlap. Landed at cd15524
+> because the +9% CLEAN on contended_spawn_8x is real and the
+> `popMany` primitive is reusable.
+>
+> **Option B (sharded inject) abandoned:** n=10 paired A/B vs
+> Option A baseline. N=4: flood_1m_batched **-7.6% CLEAN
+> (negative)**, contended_spawn_8x +8.3% CLEAN, others near-flat.
+> N=2: flood_1m_batched -1.0% overlap, contended_spawn_8x +8.8%
+> CLEAN (redundant with Option A's own +9%). Submitter-side cost of
+> rotating across N cachelines outweighs consumer-side win on
+> single-submitter flood. Direction closed.
+>
+> **Option C (MSQueue) and Option D (Treiber) not pursued** — both
+> ruled out by brainstorm analysis as not attacking the measured
+> bottleneck differently enough to justify upheaval.
+>
+> **Forward:** per brainstorm's own "if both flat/negative,
+> bottleneck lives deeper" clause, flood_1m_batched needs a new
+> profile to identify what's actually binding at ~940K. Candidates:
+> slot read cacheline footprint, runTask state CAS, task dispatch
+> overhead, wait_group.done cost. NOT a micro-optimization direction
+> until re-profile reveals a new target.
+>
+> History: Option A's initial n=20 run measured +13.8% IQR-clean
 > flood_1m_batched, but that was against a buggy `nextTask` path
 > that silently dropped items on local-queue overflow. The bug was
 > caught via `zig build test` hang, fixed, and re-measured. The
