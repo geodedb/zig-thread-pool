@@ -158,3 +158,79 @@ it isn't.
 
 **Opens:** parked-workers bitmap as iter 7's primary attack.
 If that lands, re-profile to find the next hotspot.
+
+## Iteration 7 (2026-04-15) — parked_workers bitmap CLOSED
+
+Implemented per the design above: added
+`parked_workers: std.atomic.Value(u64) align(cache_line)` to
+`Core`; SC `fetchOr`/`fetchAnd` on the worker park/unpark
+transitions; `notifySubmits` fast-paths on `bitmap == 0` and
+iterates set bits via `@ctz` when non-zero.
+
+**Stress:** 20/20 PASS at `-Doptimize=ReleaseFast` (180s
+outer-timeout). Handshake correctness holds.
+
+**Performance (n=10 paired BSSB, medians):**
+
+| Scenario                   | A (main 7794514) | B (iter7 bitmap) | Δ         |
+|----------------------------|------------------|------------------|-----------|
+| flood_1m                   | 366,403          | 363,518          | -0.79%    |
+| flood_1m_batched           | 798,890          | 688,270          | **-13.85%** |
+| contended_spawn_8x         | 720,022          | 561,714          | **-21.99%** |
+| contended_spawn_8x_batched | 649,516          | 579,778          | **-10.74%** |
+
+Per-round paired Δ on `flood_1m_batched` is uniformly negative
+(10/10 rounds show A > B, range -6.5% to -33.9%). Not noise.
+
+**Why it regressed (mechanism):** The fix replaces a 56-way scan
+of **per-worker `is_parked` cachelines** (mostly read, each line
+held in its owner's cache) with a **single shared `parked_workers`
+cacheline** that every worker RMWs on every park/unpark
+transition. Classic bouncing-cacheline anti-pattern:
+
+- Original: 56 read-miss downgrades from M→S per scan, spread
+  across 56 distinct lines. Each miss is short because the line
+  is clean in its owner's cache.
+- Bitmap: all 56 workers contend for write ownership of **one**
+  line. Every park cycle does two SC RMWs (fetchOr at entry,
+  fetchAnd at exit) on this single hot line. Submitter's SC load
+  on the same line stalls waiting for coherence settlement after
+  every park/unpark event.
+
+Worker-side cost dominates on park-heavy scenarios
+(`contended_spawn_8x` -22%); bitmap-line miss cost dominates on
+submit-heavy scenarios (`flood_1m_batched` -14%). Only
+`flood_1m` (non-batched) stays flat — submitter there pushes
+one-at-a-time so workers are almost never parked in steady
+state, bitmap fast-path fires, and the workers' park-side RMWs
+are rare.
+
+**What this teaches:** The v3 profile attributed 27.58% inclusive
+to `notifySubmits`' 56-way scan. Collapsing that scan to a single
+cacheline did NOT reduce total coherence traffic — it concentrated
+it. The original design's distribution of `is_parked` across 56
+owner-private lines was a feature, not a bug: each line is only
+bounced when its specific owner parks/unparks, not every time
+any worker does.
+
+**Status:** Iter 7 CLOSED. Bitmap is architecturally
+incompatible with 56-way shared-write traffic. Next iterations
+should explore either:
+
+1. **Reducing notifySubmits call frequency** (already one per
+   batch — hard to reduce further without breaking wake-up
+   liveness).
+2. **Bypassing the scan entirely via a "last-parked worker" hint**
+   — single-writer cacheline: when a worker parks, it CAS-writes
+   its index into `Core.last_parked_hint: u8`. Submitter reads
+   the hint, signals that worker directly, falls back to scan
+   only if hint is stale. Cost: 1 CAS per park (vs 2 SC RMWs
+   for bitmap), 1 atomic load per notify (vs 56 loads). Stale
+   hints degrade to the existing scan safely.
+3. **Moving the scan off the submit critical path** via a
+   dedicated wakeup thread. Architectural change; defer until
+   simpler options fail.
+4. **Abandoning this ceiling** and accepting ~800k/s on
+   `flood_1m_batched` as the current plateau. Before doing so,
+   re-profile to check whether a different hotspot has surfaced
+   that we haven't tried.
