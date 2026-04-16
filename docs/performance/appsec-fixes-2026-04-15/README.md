@@ -31,5 +31,6 @@ Update the Status and Regression class columns in the table below after each ste
 | 5 | F-005 harden releaseSubmitter | done | clean (releaseSubmitter is cold-path lifecycle, not exercised in any bench; all shifts are sample-to-sample noise within known 9–14% CV, see diff) |
 | 6 | F-004 soften WaitGroup.done | done | clean (bench noise, ruled out by construction on underflow-only code path) |
 | 7 | F-007 clamp parseProcStatusKiB | done | clean (bench noise, ruled out by construction on stats-sampling-only code path) |
-| 8 | TSan stress run | pending | – |
-| 9 | Fuzz harness | pending | – |
+| 8 | TSan stress run | done | clean — zero warnings across unit/integration/stress |
+| 9 | Fuzz harness | done | clean — 100 + 5000×3 iterations across 3 seeds |
+| 10 | Final perf snapshot | done | see [FINAL.md](FINAL.md) |
