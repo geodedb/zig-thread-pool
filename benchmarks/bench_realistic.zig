@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
             .local_queue_capacity = 256,
             .sleep_ns = 10_000,
             .scratch_bytes = 4096,
+            .register_submitters = true,
         },
         .{
             .name = "nested_fanout_4x",
@@ -52,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
             .queue_capacity = 4096,
             .local_queue_capacity = 256,
             .nested_children = 4,
+            .register_submitters = true,
         },
         .{
             .name = "burst_drain_burst",

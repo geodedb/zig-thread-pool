@@ -16,6 +16,7 @@ pub const ScenarioSpec = struct {
     idle_gap_ns: u64 = 0,
     nested_children: usize = 0,
     lane: thread_pool.TaskLane = .default,
+    register_submitters: bool = false,
 };
 
 pub const ResultRow = struct {
@@ -93,6 +94,7 @@ const SubmitterCtx = struct {
     submit_latencies_ns: []u64,
     wait_group: *thread_pool.WaitGroup,
     lane: thread_pool.TaskLane,
+    register: bool,
 };
 
 pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const ScenarioSpec, variants: []const thread_pool.SchedulerVariant, output_path: ?[]const u8) !void {
@@ -179,6 +181,14 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
         @intCast(@max(spec.worker_count / 4, 2))
     else
         0;
+    const submitter_queues: u32 = if (spec.register_submitters)
+        @intCast(@max(spec.submitter_count, 1))
+    else
+        0;
+    const submitter_capacity: usize = if (spec.register_submitters)
+        @max(spec.local_queue_capacity, 1024)
+    else
+        0;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = spec.worker_count,
         .max_threads = spec.worker_count,
@@ -191,6 +201,8 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
         .scheduler_variant = variant,
         .allow_blocking_lane = uses_blocking_lane,
         .blocking_workers = blocking_workers,
+        .max_submitter_queues = submitter_queues,
+        .submitter_queue_capacity = submitter_capacity,
     });
     defer pool.deinit();
 
@@ -223,12 +235,12 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
     const wall_start = nowNs();
 
     if (spec.idle_gap_ns != 0) {
-        try submitRange(allocator, &pool, tasks[0 .. spec.task_count / 2], submit_latencies_ns[0 .. spec.task_count / 2], spec.submitter_count, spec.lane);
+        try submitRange(allocator, &pool, tasks[0 .. spec.task_count / 2], submit_latencies_ns[0 .. spec.task_count / 2], spec.submitter_count, spec.lane, spec.register_submitters);
         clock.sleep(spec.idle_gap_ns);
-        try submitRange(allocator, &pool, tasks[spec.task_count / 2 ..], submit_latencies_ns[spec.task_count / 2 ..], spec.submitter_count, spec.lane);
+        try submitRange(allocator, &pool, tasks[spec.task_count / 2 ..], submit_latencies_ns[spec.task_count / 2 ..], spec.submitter_count, spec.lane, spec.register_submitters);
         clock.sleep(spec.idle_gap_ns);
     } else {
-        try submitRange(allocator, &pool, tasks, submit_latencies_ns, spec.submitter_count, spec.lane);
+        try submitRange(allocator, &pool, tasks, submit_latencies_ns, spec.submitter_count, spec.lane, spec.register_submitters);
     }
 
     const wall_end = nowNs();
@@ -290,7 +302,7 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
     };
 }
 
-fn submitRange(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, tasks: []BenchTaskCtx, submit_latencies_ns: []u64, submitter_count: usize, lane: thread_pool.TaskLane) !void {
+fn submitRange(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, tasks: []BenchTaskCtx, submit_latencies_ns: []u64, submitter_count: usize, lane: thread_pool.TaskLane, register: bool) !void {
     var wg = pool.waitGroup();
     if (submitter_count <= 1) {
         var i: usize = 0;
@@ -338,6 +350,7 @@ fn submitRange(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, task
             .submit_latencies_ns = submit_latencies_ns[offset .. offset + count],
             .wait_group = &wg,
             .lane = lane,
+            .register = register and submitter_count > 1,
         };
         offset += count;
     }
@@ -349,6 +362,11 @@ fn submitRange(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, task
 }
 
 fn submitterMain(ctx: SubmitterCtx) void {
+    const slot_opt: ?usize = if (ctx.register)
+        ctx.pool.registerSubmitter() catch null
+    else
+        null;
+    defer if (slot_opt) |slot| ctx.pool.releaseSubmitter(slot);
     for (ctx.tasks, 0..) |*task, idx| {
         const submit_started = nowNs();
         task.submitted_at_ns.* = submit_started;
