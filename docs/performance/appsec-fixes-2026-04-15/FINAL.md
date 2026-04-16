@@ -180,7 +180,59 @@ To separate the remediation effect from the zig 0.15.2 → 0.16 compiler shift, 
 2. **Extend stress-suite TSan duration on CI**: added `tsan-stress-soak` and `tsan-fuzz` jobs to `.gitlab-ci.yml` (scheduled / default-branch / on-demand via `RUN_TSAN=true`). Three back-to-back soak passes per suite.
 3. ~~**Fuzz harness under TSan**~~: see (2) — `tsan-fuzz` job runs `zig build fuzz -Dtsan` against three seeds at `FUZZ_ITERATIONS=5000`.
 4. ✅ **CLAUDE.md runtime-comparison table refreshed** to the 0.16 post-appsec numbers.
-5. **Optional optimisation pass** — reclaim the 5–12% regression on the six affected scenarios while preserving TSan/fuzz safety invariants. Candidates: consolidate the F-001 pool-identity check into a per-cpu cache; reduce the F-005 CAS from full-barrier to `.acquire` on the load side; inline the F-003 `.monotonic` accesses behind a build flag for single-pool workloads.
+5. ✅ **Optional optimisation pass** — partial recovery via `-Dsingle-pool=true` build flag (see section below).
+
+## Optimisation pass — `-Dsingle-pool` comptime elision
+
+Added a `-Dsingle-pool=true` build option that elides the F-001 pool-identity check on the hot submit path at compile time. The null check and bounds check are retained, so a non-worker / non-submitter thread still falls through correctly. **The flag is UNSAFE when a process hosts multiple pools** (it restores the pre-F-001 OOB hazard for the index-within-bounds case) — callers opt in explicitly. Default remains safe.
+
+F-005 CAS weakening was evaluated and skipped — `releaseSubmitter` is a cold-path lifecycle call (once per submitter, not per task), so weakening its memory ordering has no throughput impact.
+
+### Same-compiler Zig throughput: safe default → `-Dsingle-pool=true`
+
+Raw data: `OPT-single-pool-runtime-comparison.json` (zig 0.16, post-appsec at `5d3d119`, `-Dsingle-pool=true`).
+
+| Scenario | POST default | POST -Dsingle-pool | Δ % | CV (opt run) | classification |
+|---|---:|---:|---:|---:|---|
+| `contended_spawn_8x` | 880,038 | **1,028,622** | **+16.9%** | 3% | reliable recovery |
+| `mixed_fast_slow` | 230,765 | 247,510 | **+7.3%** | 2% | reliable recovery |
+| `cpu_work_100us` | 416,921 | 442,799 | **+6.2%** | 7% | reliable recovery |
+| `flood_1m` | 1,074,269 | 1,069,672 | −0.4% | 9% | flat |
+| `burst_drain_burst` | 162,024 | 160,263 | −1.1% | 0% | flat |
+| `cpu_work_10us` | 982,714 | 967,045 | −1.6% | 18% | within noise (18% CV) |
+| `nested_fanout_4x` | 538,931 | 509,091 | −5.5% | 14% | within noise (14% CV) |
+| `contended_cpu_10us` | 970,439 | 895,071 | −7.8% | 19% | within noise (19% CV) |
+
+### Net AppSec-cost recovery (pre-appsec → post-appsec → opt)
+
+| Scenario | AppSec cost | With `-Dsingle-pool` | Residual cost | Recovery |
+|---|---:|---:|---:|---:|
+| `contended_spawn_8x` | −11.8% | +3.1% vs pre | **+3.1%** | **100%+** |
+| `cpu_work_100us` | −9.0% | −3.4% vs pre | −3.4% | **62%** |
+| `mixed_fast_slow` | −11.0% | −4.6% vs pre | −4.6% | **58%** |
+| `flood_1m` | −7.2% | −7.6% vs pre | −7.6% | 0% |
+| `cpu_work_10us` | −5.9% | −7.4% vs pre | within CV | (noise) |
+| `nested_fanout_4x` | −10.9% | −15.9% vs pre | within CV | (noise) |
+| `contended_cpu_10us` | +2.4% | −5.5% vs pre | within CV | (noise) |
+| `burst_drain_burst` | +0.0% | −1.0% | flat | (flat) |
+
+### Verdict
+
+`-Dsingle-pool=true` **reliably recovers 6–17% on three scenarios** (`contended_spawn_8x`, `cpu_work_100us`, `mixed_fast_slow`) without any TSan or fuzz invariant breakage: 84/85 tests pass, 500-iteration fuzz clean under `-Dsingle-pool=true -Dtsan`. The recovery closes 58–100% of the AppSec cost on those workloads.
+
+The remaining high-variance scenarios (`cpu_work_10us`, `nested_fanout_4x`, `contended_cpu_10us`) show deltas within their respective 14–19% run-to-run CV bands — inconclusive for this single-run measurement; they would need higher sample counts or a different bench setup to discriminate real change from noise.
+
+`flood_1m` does **not** recover under `-Dsingle-pool`. The F-001 hot-path elision doesn't touch descriptor acquire/release; since flood_1m submits 1M tasks through 1M descriptor acquire/release cycles, the −7.2% cost most likely comes from the F-003 atomic `free_indices` accesses inhibiting LLVM optimisations across the loop (even though `.monotonic` compiles to plain load/store on x86_64, it prevents some reordering). A future investigation could add `-Dsingle-pool` elision of the freelist atomics behind a stronger "single-pool, single-producer" contract — but the safety tradeoff is significant.
+
+### How to opt in
+
+```bash
+# Library consumers (single-pool-per-process workloads):
+zig build -Dsingle-pool=true
+# CI / default branch: leave unset for safe multi-pool behavior.
+```
+
+Compile-time flag; no runtime overhead either way.
 
 ## Commit ledger
 

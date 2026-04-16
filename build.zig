@@ -3,12 +3,19 @@
 
 const std = @import("std");
 
-fn threadPoolModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{
+fn threadPoolModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Step.Options,
+) *std.Build.Module {
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addOptions("build_options", build_options);
+    return mod;
 }
 
 fn importedModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, module: *std.Build.Module) *std.Build.Module {
@@ -26,17 +33,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer on test artifacts") orelse false;
+    const single_pool = b.option(
+        bool,
+        "single-pool",
+        "Assume at most one ThreadPool per process. Elides the F-001 per-pool " ++
+            "TLS-identity check on the hot submit path. UNSAFE when multiple " ++
+            "pools coexist in one process (restores the pre-F-001 OOB hazard).",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "single_pool", single_pool);
 
     const module = b.addModule("thread_pool", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    module.addOptions("build_options", build_options);
 
     const static_lib = b.addLibrary(.{
         .name = "thread-pool",
         .linkage = .static,
-        .root_module = threadPoolModule(b, target, optimize),
+        .root_module = threadPoolModule(b, target, optimize, build_options),
     });
     b.installArtifact(static_lib);
 
@@ -45,7 +63,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Compile the library and unit tests without running them");
     const check_tests = b.addTest(.{
-        .root_module = threadPoolModule(b, target, optimize),
+        .root_module = threadPoolModule(b, target, optimize, build_options),
     });
     check_step.dependOn(&check_tests.step);
 
@@ -215,7 +233,7 @@ pub fn build(b: *std.Build) void {
         const cross_lib = b.addLibrary(.{
             .name = "thread-pool-smoke",
             .linkage = .static,
-            .root_module = threadPoolModule(b, resolved, optimize),
+            .root_module = threadPoolModule(b, resolved, optimize, build_options),
         });
         cross_step.dependOn(&cross_lib.step);
     }

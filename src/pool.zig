@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const sync = @import("sync.zig");
 const clock = @import("clock.zig");
 const types = @import("types.zig");
@@ -9,6 +10,11 @@ const WorkerScratch = @import("memory/scratch.zig").WorkerScratch;
 const Accounting = @import("memory/scratch.zig").Accounting;
 const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
 const process_memory = @import("stats/process_memory.zig");
+
+/// Compile-time flag elides the F-001 per-pool TLS identity check on the
+/// hot submit path. UNSAFE when a process hosts more than one ThreadPool
+/// (restores the pre-F-001 OOB hazard). Default: false (safe).
+const single_pool_mode = build_options.single_pool;
 
 /// TLS state scoped per pool. Each entry records the `Core *` that set it,
 /// so cross-pool submits don't index pool-A's slot into pool-B's arrays
@@ -1279,9 +1285,18 @@ const Core = struct {
     /// Returns the TLS worker index only when it belongs to this pool and the
     /// index is in-bounds for `self.workers`. Cross-pool submits return null
     /// and fall through to the shared inject queue (F-001).
+    ///
+    /// Under `-Dsingle-pool`, the pool-identity check is elided as a
+    /// comptime no-op: callers guarantee there is only one pool per process,
+    /// so any non-null TLS slot must belong to this pool. The null check and
+    /// bounds check still run (a non-worker thread has a null slot and must
+    /// fall through).
     inline fn tlsWorkerIndexFor(self: *Core) ?usize {
         const slot = tls_worker_slot;
-        if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        if (slot.pool == null) return null;
+        if (comptime !single_pool_mode) {
+            if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        }
         if (slot.index >= self.workers.len) return null;
         return slot.index;
     }
@@ -1289,9 +1304,14 @@ const Core = struct {
     /// Returns the TLS submitter index only when it belongs to this pool and
     /// the index is in-bounds for `self.submitter_queues`. Cross-pool submits
     /// return null and fall through to the shared inject queue (F-001).
+    ///
+    /// See `tlsWorkerIndexFor` for the `-Dsingle-pool` elision contract.
     inline fn tlsSubmitterIndexFor(self: *Core) ?usize {
         const slot = tls_submitter_slot;
-        if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        if (slot.pool == null) return null;
+        if (comptime !single_pool_mode) {
+            if (slot.pool != @as(*anyopaque, @ptrCast(self))) return null;
+        }
         if (slot.index >= self.submitter_queues.len) return null;
         return slot.index;
     }

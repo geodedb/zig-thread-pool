@@ -101,6 +101,12 @@ samples after `1` warmup discard, `56` workers). Raw artifact:
   throughput regression on six of eight scenarios, accepted as the price
   of closing 1 Critical + 2 High memory-safety bugs. TSan + fuzz are clean.**
   Raw data: `BISECT-e9b6b2a-runtime-comparison.json`.
+- Single-pool workloads can opt in to `-Dsingle-pool=true` to elide the
+  F-001 hot-path identity check at compile time. Reliably recovers 6–17%
+  on `contended_spawn_8x`, `cpu_work_100us`, and `mixed_fast_slow`.
+  **UNSAFE with multiple pools in one process** — restores the pre-F-001
+  OOB hazard for the index-within-bounds case. See
+  [`FINAL.md § Optimisation pass`](docs/performance/appsec-fixes-2026-04-15/FINAL.md#optimisation-pass----dsingle-pool-comptime-elision).
 
 ## Docs Entry Points
 
