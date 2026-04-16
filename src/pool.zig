@@ -265,6 +265,12 @@ const Worker = struct {
     scratch: WorkerScratch,
     wait_histogram: LatencyHistogram = .{},
     exec_histogram: LatencyHistogram = .{},
+    /// OBSERVABILITY-PIVOT / R-03: wake-latency histogram. Observed
+    /// by the worker itself at `park_cond.timedWait` return when the
+    /// wait returned because of a signal (i.e. `now - parked_at_ns` is
+    /// less than the configured `idle_park_after_ns` timeout), so the
+    /// histogram captures real wake delay rather than idle-purge ticks.
+    wake_histogram: LatencyHistogram = .{},
     busy_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     idle_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     local_queue_peak: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1081,10 +1087,13 @@ const Core = struct {
         var merged_default_exec = LatencyHistogram{};
         var merged_blocking_wait = LatencyHistogram{};
         var merged_blocking_exec = LatencyHistogram{};
+        // OBSERVABILITY-PIVOT / R-03: merged wake-latency histogram.
+        var merged_wake = LatencyHistogram{};
         const per_lane_active = self.config.allow_blocking_lane;
         for (self.workers) |*worker| {
             merged_wait.merge(&worker.wait_histogram);
             merged_exec.merge(&worker.exec_histogram);
+            merged_wake.merge(&worker.wake_histogram);
             if (per_lane_active) {
                 switch (worker.serves_lane) {
                     .default => {
@@ -1146,6 +1155,7 @@ const Core = struct {
             .default_exec_ns = if (per_lane_active) merged_default_exec.summary() else .{},
             .blocking_wait_ns = if (per_lane_active) merged_blocking_wait.summary() else .{},
             .blocking_exec_ns = if (per_lane_active) merged_blocking_exec.summary() else .{},
+            .wake_latency_ns = merged_wake.summary(),
             .memory = memory,
             .worker_stats = self.worker_stats_buffer,
         };
@@ -2042,10 +2052,31 @@ const Core = struct {
             _ = worker.wakeups.fetchAdd(1, .release);
             return;
         }
+        // OBSERVABILITY-PIVOT / R-03: capture `parked_at_ns` before the
+        // timedWait so we can measure wake latency on return. We only
+        // observe when timestamps are enabled to preserve the
+        // zero-overhead path under `-Dtimestamp-mode=disabled`.
+        const timestamps_enabled_idle = timestampsEnabled(self);
+        const parked_at_ns: u64 = if (timestamps_enabled_idle) nowNs() else 0;
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
         worker.is_parked.store(0, .release);
         worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .release);
+
+        if (timestamps_enabled_idle) {
+            // Only observe wake latency when timedWait returned before the
+            // idle-park timeout fired (i.e. a submitter signaled us). A
+            // return triggered by the timeout means "no work arrived" —
+            // that latency is bounded by the config, not scheduling, and
+            // would skew the tail of the histogram if included.
+            const now = nowNs();
+            if (now > parked_at_ns) {
+                const delta_ns = now - parked_at_ns;
+                if (delta_ns < self.config.idle_park_after_ns) {
+                    worker.wake_histogram.observe(delta_ns);
+                }
+            }
+        }
 
         if (self.config.worker_scratch_cap_bytes != 0 and self.config.idle_purge_after_ns != 0) {
             const now = nowNs();

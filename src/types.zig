@@ -780,6 +780,14 @@ pub const Stats = struct {
     /// OBSERVABILITY-PIVOT / R-02: per-lane execution latency for the
     /// blocking lane. Same activation rule as `blocking_wait_ns`.
     blocking_exec_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-03: wake latency — time elapsed between
+    /// a worker parking on `park_cond.timedWait` and that call returning
+    /// because a submitter signaled it. Timeouts (i.e. idle-purge ticks
+    /// where no signal arrived) are excluded so the summary measures
+    /// real wake-up delay rather than the configured park timeout.
+    /// Populated when `Config.timestamp_mode == .full`; zero-valued
+    /// otherwise.
+    wake_latency_ns: LatencySummary = .{},
     /// OS-level memory snapshot.  See `ProcessMemoryStats`.
     memory: ProcessMemoryStats = .{},
     /// Per-worker statistics, indexed by worker_index.  Slice points

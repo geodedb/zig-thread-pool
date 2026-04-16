@@ -574,6 +574,64 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
     try std.testing.expectEqual(@as(u64, 80), stats.task_wait_ns.count);
 }
 
+test "wake-latency histogram populates under realistic load" {
+    // OBSERVABILITY-PIVOT / R-03: when timestamps are enabled, the pool
+    // records the delta between parking on `park_cond.timedWait` and
+    // that call returning due to a signal from a submitter. Idle-timeout
+    // returns are excluded. A bursty submission pattern with a
+    // relatively-short park timeout is the most reliable way to get
+    // workers to park and wake multiple times inside a single test.
+    if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        // Short spin so workers actually park between bursts instead of
+        // busy-looping through spin_before_park_iters.
+        .spin_before_park_iters = 0,
+        // 10ms idle-park timeout — long enough that it doesn't fire
+        // during the short sleeps we use between bursts, short enough
+        // that a stuck test aborts quickly rather than hanging.
+        .idle_park_after_ns = 10_000_000,
+        .default_backpressure = .block,
+    });
+    defer pool.deinit();
+
+    // Three small bursts separated by 200us pauses give workers time to
+    // finish, idle long enough for the spin loop to expire, park, and
+    // then wake on the next burst.
+    for (0..3) |_| {
+        var wg = pool.waitGroup();
+        var counter = common.Counter{};
+        for (0..16) |_| {
+            _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        }
+        wg.wait();
+        // Sleep longer than the spin iters but shorter than the park
+        // timeout so workers do park but are not purged.
+        thread_pool.clock.sleep(200_000);
+    }
+
+    // Final burst + wait, then snapshot.
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..32) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    // At least one wake was signal-driven rather than timeout-driven —
+    // the bursty cadence plus 10ms timeout makes this reliable.
+    try std.testing.expect(stats.wake_latency_ns.count > 0);
+    // The histogram caps at `idle_park_after_ns` (10ms here) by
+    // construction, so max must be strictly less than that.
+    try std.testing.expect(stats.wake_latency_ns.max_ns < 10_000_000);
+    // min can be 0 if the first observation rounded into bucket 0, so we
+    // only require that mean is populated.
+    try std.testing.expect(stats.wake_latency_ns.mean_ns > 0);
+}
+
 test "per-lane histograms zero when allow_blocking_lane=false" {
     // OBSERVABILITY-PIVOT / R-02: single-lane configs must leave the
     // per-lane fields at the zero `LatencySummary` so operators can
