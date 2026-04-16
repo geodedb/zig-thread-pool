@@ -174,6 +174,11 @@ pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const Sce
 }
 
 pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec, variant: thread_pool.SchedulerVariant) !ResultRow {
+    const uses_blocking_lane = spec.lane == .blocking;
+    const blocking_workers: u32 = if (uses_blocking_lane)
+        @intCast(@max(spec.worker_count / 4, 2))
+    else
+        0;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = spec.worker_count,
         .max_threads = spec.worker_count,
@@ -184,7 +189,8 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
         .idle_park_after_ns = 100_000,
         .idle_purge_after_ns = 500_000,
         .scheduler_variant = variant,
-        .allow_blocking_lane = spec.lane == .blocking,
+        .allow_blocking_lane = uses_blocking_lane,
+        .blocking_workers = blocking_workers,
     });
     defer pool.deinit();
 
