@@ -405,10 +405,89 @@ const Core = struct {
     /// Equals `submitter_queues.len` once the submitter-init block succeeds.
     init_submitter_count: usize = 0,
 
+    /// QS-002: `Core.init` is decomposed into four narrow helpers plus an
+    /// orchestrator.  The F-002 errdefer ladder is preserved verbatim at
+    /// the orchestrator level because the cleanup order matters:
+    ///
+    ///   1. `deinitOwned` (outer errdefer) — tears down all allocations
+    ///      bounded by init_worker_count / init_queue_count /
+    ///      init_submitter_count.
+    ///   2. spawned-workers cleanup (inner errdefer) — stops and joins
+    ///      any workers that were already spawned before the failing
+    ///      spawn.  Must run BEFORE deinitOwned or the join would touch
+    ///      freed Worker storage.
+    ///   3. watchdog cleanup (innermost errdefer) — currently a
+    ///      defensive placeholder; the watchdog spawn is the last
+    ///      fallible step.  Kept so a later maintainer doesn't
+    ///      rediscover the need when adding a post-watchdog step.
+    ///
+    /// Helpers do NOT own errdefers — they take a partially-initialised
+    /// `*Core` and either complete their slice of work or return error.
+    /// The orchestrator's outer errdefer (`deinitOwned`) catches every
+    /// partial-init failure because each helper updates the init_*
+    /// counters as it progresses.
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
         try normalized.validate();
 
+        try self.allocateStorage(allocator, normalized);
+        errdefer self.deinitOwned();
+
+        self.initDescriptorFreelist(normalized);
+        try self.initWorkers(allocator, normalized);
+
+        // F-002: spawn-aware cleanup ladder.  Must run before the outer
+        // deinitOwned errdefer would free the Worker backing storage.
+        // See the orchestrator doc above.
+        var spawned_workers: usize = 0;
+        errdefer {
+            if (spawned_workers > 0) {
+                self.state.store(.stopping, .release);
+                for (self.workers[0..spawned_workers]) |*w| {
+                    w.park_mutex.lock();
+                    w.park_cond.broadcast();
+                    w.park_mutex.unlock();
+                }
+                for (self.workers[0..spawned_workers]) |*w| {
+                    if (w.thread) |t| {
+                        t.join();
+                        w.thread = null;
+                    }
+                }
+            }
+        }
+
+        try self.spawnWorkers(normalized, &spawned_workers);
+
+        if (normalized.watchdog_interval_ns > 0) {
+            errdefer {
+                // Defensive placeholder: if Core.init is ever extended with a
+                // fallible step AFTER the watchdog spawn, this errdefer will
+                // stop and join the watchdog before deinitOwned runs. As of
+                // F-002, the watchdog spawn is the final fallible step in
+                // init, so this body is currently unreachable — but the
+                // structure is kept so the next maintainer does not have to
+                // rediscover the need when adding a post-watchdog step.
+                if (self.watchdog_thread) |t| {
+                    self.watchdog_stop.store(true, .release);
+                    t.join();
+                    self.watchdog_thread = null;
+                }
+            }
+            self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
+        }
+    }
+
+    /// QS-002 helper (1/4): allocate backing storage for the pool.
+    ///
+    /// Populates `self.*` with every dynamically-sized slice + queue.
+    /// Also wires `self.accounting` and records every allocation with
+    /// `recordOwnedAlloc`.  On any failure here the Core is not
+    /// recoverable — caller must not install the deinitOwned errdefer
+    /// yet (init_worker_count / init_queue_count / init_submitter_count
+    /// are still zero, so deinitOwned would be a no-op anyway, but
+    /// leaves a cleaner stack trace to fail here before installing it).
+    fn allocateStorage(self: *Core, allocator: std.mem.Allocator, normalized: types.Config) !void {
         const total_worker_slots = normalized.max_threads + normalized.max_overflow_workers;
         self.* = .{
             .allocator = allocator,
@@ -427,7 +506,6 @@ const Core = struct {
                 null,
             .worker_stats_buffer = try allocator.alloc(types.WorkerStats, total_worker_slots),
         };
-        errdefer self.deinitOwned();
 
         self.accounting = .{
             .total_alloc_bytes = &self.counters.total_alloc_bytes,
@@ -446,7 +524,14 @@ const Core = struct {
         if (self.blocking_inject) |*bi| {
             self.recordOwnedAlloc(bi.capacity() * @sizeOf(u32));
         }
+    }
 
+    /// QS-002 helper (2/4): initialise the descriptor freelist.
+    ///
+    /// Builds a singly-linked list through `free_indices`; the head
+    /// tagged pointer starts at 0 (ABA counter 0, head index 0).
+    /// Infallible; purely struct writes.
+    fn initDescriptorFreelist(self: *Core, normalized: types.Config) void {
         for (self.descriptors, 0..) |*descriptor, idx| {
             descriptor.* = .{};
             // Build a singly-linked freelist: each slot points to the next.
@@ -461,6 +546,21 @@ const Core = struct {
 
         // Tagged pointer: high 32 = ABA counter (starts 0), low 32 = head index.
         self.free_top_tagged = std.atomic.Value(u64).init(@as(u64, 0));
+    }
+
+    /// QS-002 helper (3/4): initialise Worker structs + per-worker
+    /// local queues + submitter queues.  Mutates
+    /// `init_worker_count` / `init_queue_count` / `init_submitter_count`
+    /// as each sub-step succeeds so that `deinitOwned` (the caller's
+    /// errdefer) can cleanly unwind a partial init.
+    ///
+    /// Ordering invariant: Worker struct is written FIRST (infallible),
+    /// then the LocalQueue is init'd (fallible).  If the LocalQueue
+    /// init fails, the Worker has valid scratch that deinitOwned can
+    /// purge.  Reversing the order would leave a partially-init'd
+    /// scratch field that would crash on `purge()`.
+    fn initWorkers(self: *Core, allocator: std.mem.Allocator, normalized: types.Config) !void {
+        const total_worker_slots = normalized.max_threads + normalized.max_overflow_workers;
 
         for (self.workers[0..normalized.max_threads], self.local_queues[0..normalized.max_threads], 0..) |*worker, *lq, idx| {
             // Initialize worker first (no allocation, cannot fail) so that
@@ -501,7 +601,18 @@ const Core = struct {
             self.submitter_free_mask = std.atomic.Value(u64).init((@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1);
             self.recordOwnedAlloc(self.submitter_queues.len * @sizeOf(LocalQueue));
         }
+    }
 
+    /// QS-002 helper (4/4): spawn worker threads (F-002 critical path).
+    ///
+    /// Writes `worker.thread` for each spawned worker and bumps
+    /// `spawned_workers_out` so the caller's errdefer ladder knows the
+    /// exact prefix of live threads to stop + join on failure.  The
+    /// pointer-argument shape is load-bearing: Zig errdefers run in
+    /// reverse, so the caller's "stop spawned workers" errdefer is
+    /// already registered when `spawnWorkers` is called and must
+    /// observe updates as the loop progresses.
+    fn spawnWorkers(self: *Core, normalized: types.Config, spawned_workers_out: *usize) !void {
         // Spawn-aware cleanup: if a later spawn fails, tell already-spawned
         // workers to exit and join them before the outer errdefer runs
         // deinitOwned and frees their backing arrays (F-002).
@@ -511,45 +622,9 @@ const Core = struct {
         // shouldExit() predicate requires totalQueuedTasks() == 0, which
         // holds here. If Core.init is ever extended to submit an internal
         // warmup task, this errdefer must be revisited to drain first.
-        var spawned_workers: usize = 0;
-        errdefer {
-            if (spawned_workers > 0) {
-                self.state.store(.stopping, .release);
-                for (self.workers[0..spawned_workers]) |*w| {
-                    w.park_mutex.lock();
-                    w.park_cond.broadcast();
-                    w.park_mutex.unlock();
-                }
-                for (self.workers[0..spawned_workers]) |*w| {
-                    if (w.thread) |t| {
-                        t.join();
-                        w.thread = null;
-                    }
-                }
-            }
-        }
-
         for (self.workers[0..normalized.max_threads], 0..) |*worker, idx| {
             worker.thread = try std.Thread.spawn(.{}, workerMain, .{ self, idx });
-            spawned_workers += 1;
-        }
-
-        if (normalized.watchdog_interval_ns > 0) {
-            errdefer {
-                // Defensive placeholder: if Core.init is ever extended with a
-                // fallible step AFTER the watchdog spawn, this errdefer will
-                // stop and join the watchdog before deinitOwned runs. As of
-                // F-002, the watchdog spawn is the final fallible step in
-                // init, so this body is currently unreachable — but the
-                // structure is kept so the next maintainer does not have to
-                // rediscover the need when adding a post-watchdog step.
-                if (self.watchdog_thread) |t| {
-                    self.watchdog_stop.store(true, .release);
-                    t.join();
-                    self.watchdog_thread = null;
-                }
-            }
-            self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
+            spawned_workers_out.* += 1;
         }
     }
 
