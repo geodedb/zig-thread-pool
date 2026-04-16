@@ -402,6 +402,16 @@ pub const Stats = struct {
     overflow_spawns: u64 = 0,
     overflow_retires: u64 = 0,
     overflow_active: u64 = 0,
+    /// REV-001 — best-effort counter-skew detector.  True when the
+    /// snapshot observed `active_tasks > submitted - completed - cancelled`,
+    /// which can only happen transiently (a snapshot caught mid-submit) or
+    /// durably (a task panicked between the `active_tasks` increment in
+    /// `runTask` and the matching decrement).  See
+    /// `docs/security/REV-001.md` for the contract.  A persistent `true`
+    /// across multiple snapshots is the operator's signal that a panicked
+    /// task skewed the counters; the pool cannot self-recover from this
+    /// condition — Zig panics are non-catchable by design.
+    accounting_skew_detected: bool = false,
     task_wait_ns: LatencySummary = .{},
     task_exec_ns: LatencySummary = .{},
     memory: ProcessMemoryStats = .{},

@@ -97,6 +97,33 @@ forced by the benchmark harness.
 5. The descriptor transitions to `completed` or `cancelled`.
 6. Detached descriptors return to the freelist immediately; waitable descriptors return after `wait`.
 
+### Task panic behaviour (REV-001)
+
+`task_fn` **must not panic**.  Zig panics are non-catchable by design —
+an integer overflow, OOB access, `@panic`, or `unreachable` in user code
+aborts the entire process.  This is the correct outcome for a production
+pool: a panicked task leaves `counters.active_tasks` incremented,
+`descriptor.claimed_by` set, and the matching `WaitGroup.pending`
+undecremented.  `Core.runTask` cannot recover because the control flow
+never returns.
+
+Callers that install a process-wide custom panic handler (e.g. a
+debugger hook or a crash reporter) must not resume execution into the
+pool after catching a panic.  If they do, the pool cannot self-heal;
+the only observable signal is
+`Stats.accounting_skew_detected = true` across multiple consecutive
+snapshots.  See `docs/security/REV-001.md` for the ADR and
+`src/pool.zig::runTask` for the contract comment.
+
+### Descriptor reuse and idempotent `wait()` (SEC-018)
+
+`releaseDescriptor` is CAS-guarded on `descriptor.state` so concurrent
+`wait()` callers on the same handle cannot double-push the slot onto the
+freelist.  Exactly one caller performs the release; others observe the
+state already `.free` (with a matching generation) and return success.
+A late `wait()` on a reused slot returns `error.InvalidHandle` via the
+generation-tag mismatch.
+
 ## Shutdown Semantics
 
 ### `drain`

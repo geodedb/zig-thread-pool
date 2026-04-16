@@ -934,12 +934,29 @@ const Core = struct {
             merged_exec.merge(&worker.exec_histogram);
         }
 
+        // REV-001 — compute best-effort counter-skew flag.  A panicked
+        // task leaves `active_tasks` incremented but never reaches the
+        // matching decrement or the `completed` bump.  A snapshot caught
+        // mid-submit will also show a transient skew, so callers must
+        // look for a *persistent* `true` to distinguish real skew from
+        // sampling noise.  See `docs/security/REV-001.md`.
+        const submitted_snap = self.counters.submitted.load(.acquire);
+        const cancelled_snap = self.counters.cancelled.load(.acquire);
+        const active_snap = self.counters.active_tasks.load(.acquire);
+        const accounted = aggregate_completed + cancelled_snap;
+        const skew = if (submitted_snap >= accounted)
+            active_snap > submitted_snap - accounted
+        else
+            // Very large wrap / test harness that reset counters mid-flight
+            // — treat as no skew rather than wrapping the subtraction.
+            false;
+
         return .{
-            .submitted = self.counters.submitted.load(.acquire),
+            .submitted = submitted_snap,
             .started = aggregate_started,
             .completed = aggregate_completed,
-            .cancelled = self.counters.cancelled.load(.acquire),
-            .active_tasks = self.counters.active_tasks.load(.acquire),
+            .cancelled = cancelled_snap,
+            .active_tasks = active_snap,
             .queue_depth_current = self.totalQueuedTasks(),
             .queue_depth_peak = self.counters.queue_depth_peak.load(.acquire),
             .steals = aggregate_steals,
@@ -957,6 +974,7 @@ const Core = struct {
             .overflow_spawns = self.counters.overflow_spawns.load(.acquire),
             .overflow_retires = self.counters.overflow_retires.load(.acquire),
             .overflow_active = self.counters.overflow_active.load(.acquire),
+            .accounting_skew_detected = skew,
             .task_wait_ns = merged_wait.summary(),
             .task_exec_ns = merged_exec.summary(),
             .memory = memory,
@@ -1557,6 +1575,23 @@ const Core = struct {
         };
     }
 
+    /// Execute a single dequeued task on `worker_index`.
+    ///
+    /// REV-001 — Task panic contract.  Between the `active_tasks.fetchAdd`
+    /// at the top of this function and the matching `fetchSub` near the
+    /// bottom, `task_fn` is invoked with the caller's context.  Zig panics
+    /// are non-catchable by design, so a panicking task aborts the
+    /// process — which is the intended behaviour for a production pool.
+    /// The narrow "survives-a-panic" case requires a custom process-wide
+    /// panic handler and is explicitly out of scope; on that path the
+    /// following state would be left skewed:
+    ///   - `counters.active_tasks` (incremented, never decremented)
+    ///   - `descriptor.claimed_by` (set, never cleared)
+    ///   - `descriptor.state` (`.running`, never advanced to `.completed`)
+    ///   - `WaitGroup.pending` (never decremented)
+    /// `Core.statsSnapshot` surfaces this as `accounting_skew_detected`
+    /// for operators whose runtime is still alive post-panic.  See
+    /// `docs/security/REV-001.md` for the full contract.
     fn runTask(self: *Core, worker_index: usize, entry: QueueEntry) void {
         var worker = &self.workers[worker_index];
         const descriptor_index = entryIndex(entry);
