@@ -44,49 +44,49 @@ include:
   # Zig formatting (Linux).
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       paths: "src/ tests/ benchmarks/ examples/"
 
   # Zig build (Linux): static lib + check-compile.
   - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
     inputs:
       stage: build
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       build_options: "build check"
 
   # Zig tests — Linux matrix across optimize modes + integration + stress.
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
 
@@ -94,7 +94,7 @@ include:
   # budget; timeout: is GitLab's job cap.
   - component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       test_step: "test"
       test_options: "--fuzz"
       fuzz_duration: "60"
@@ -104,50 +104,50 @@ include:
   # Zig build + tests on macOS (gated).
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
 
   # Zig build + tests on Windows (gated).
   - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
-      zig_version: "0.15.2"
+      zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
 
 variables:
-  ZIG_VERSION: "0.15.2"
-  ZIG_IMAGE: "registry.gitlab.com/devnw/ci-catalog/zig:0.15.2"
+  ZIG_VERSION: "0.16.0"
+  ZIG_IMAGE: "registry.gitlab.com/devnw/ci-catalog/zig:0.16.0"
 
 stages:
   - lint
@@ -172,35 +172,35 @@ stages:
   - when: manual
     allow_failure: true
 
-zig-build-macos-0.15.2:
+zig-build-macos-0.16.0:
   rules: *cross-os-rules
 
-zig-test-macos-unit-0.15.2:
+zig-test-macos-unit-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-macos-0.15.2"]
+  needs: ["zig-build-macos-0.16.0"]
 
-zig-test-macos-integration-0.15.2:
+zig-test-macos-integration-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-macos-0.15.2"]
+  needs: ["zig-build-macos-0.16.0"]
 
-zig-test-macos-stress-0.15.2:
+zig-test-macos-stress-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-macos-0.15.2"]
+  needs: ["zig-build-macos-0.16.0"]
 
-zig-build-windows-0.15.2:
+zig-build-windows-0.16.0:
   rules: *cross-os-rules
 
-zig-test-windows-unit-0.15.2:
+zig-test-windows-unit-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-windows-0.15.2"]
+  needs: ["zig-build-windows-0.16.0"]
 
-zig-test-windows-integration-0.15.2:
+zig-test-windows-integration-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-windows-0.15.2"]
+  needs: ["zig-build-windows-0.16.0"]
 
-zig-test-windows-stress-0.15.2:
+zig-test-windows-stress-0.16.0:
   rules: *cross-os-rules
-  needs: ["zig-build-windows-0.15.2"]
+  needs: ["zig-build-windows-0.16.0"]
 
 # ---------------------------------------------------------------
 # Thread-pool-specific jobs (not covered by the catalog)
@@ -211,7 +211,7 @@ cross-check:
   stage: test
   script:
     - zig build cross-check
-  needs: ["zig-build-0.15.2"]
+  needs: ["zig-build-0.16.0"]
 
 benchmark-regression:
   image: $ZIG_IMAGE
@@ -223,7 +223,7 @@ benchmark-regression:
     when: always
     paths:
       - benchmarks/results/ci-current.json
-  needs: ["zig-build-0.15.2"]
+  needs: ["zig-build-0.16.0"]
 
 bench-micro:
   image: $ZIG_IMAGE
@@ -241,7 +241,7 @@ bench-micro:
       - micro-steal.txt
       - micro-wake.txt
       - tokio-parity.txt
-  needs: ["zig-build-0.15.2"]
+  needs: ["zig-build-0.16.0"]
   allow_failure: true # advisory until thresholds are tuned
 
 scale-bench-manual:
@@ -257,17 +257,21 @@ scale-bench-manual:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - when: manual
       allow_failure: true
-  needs: ["zig-build-0.15.2"]
+  needs: ["zig-build-0.16.0"]
 
 # ---------------------------------------------------------------
 # ThreadSanitizer soak — scheduled / on-demand.
 #
-# These jobs install Zig 0.16.0 directly (the catalog image is still on
-# 0.15.2; the codebase moved to 0.16.0 on main). TSan warnings are
-# never "just noise" for a concurrency primitive — any finding is a
-# real signal. Because TSan instrumentation is expensive, we don't run
-# these on every MR. They run on schedule, default branch, or when
-# RUN_TSAN=true is set on the pipeline.
+# These jobs pin their own Zig install via scripts/install-zig.sh on a
+# stock ubuntu:24.04 image. The manual install is intentional and
+# independent of the catalog image so a TSan regression isn't masked
+# by a coincident catalog image version bump, and so the soak remains
+# reproducible from a fresh image.
+#
+# TSan warnings are never "just noise" for a concurrency primitive —
+# any finding is a real signal. Because TSan instrumentation is
+# expensive, we don't run these on every MR. They run on schedule,
+# default branch, or when RUN_TSAN=true is set on the pipeline.
 #
 # Current state on main (2026-04-15): zero warnings across test,
 # test-integration, test-stress under TSan. See
