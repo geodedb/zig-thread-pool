@@ -63,6 +63,11 @@ pub const LatencyHistogram = struct {
 
     /// Produce a summary snapshot.  Typically called on a thread-local merged
     /// histogram, so contention is not expected.
+    ///
+    /// OBSERVABILITY-PIVOT / R-01: p999_ns and p9999_ns surface the log2
+    /// bucket boundary that crosses the 99.9/99.99 percentiles.  The
+    /// quantisation is load-bearing — these are operator-facing tail
+    /// indicators, not precise ns values.
     pub fn summary(self: *const LatencyHistogram) types.LatencySummary {
         const c = self.count.load(.monotonic);
         if (c == 0) return .{};
@@ -70,9 +75,11 @@ pub const LatencyHistogram = struct {
             .count = c,
             .min_ns = self.min_ns.load(.monotonic),
             .mean_ns = self.sum_ns.load(.monotonic) / c,
-            .p50_ns = self.quantile(50),
-            .p95_ns = self.quantile(95),
-            .p99_ns = self.quantile(99),
+            .p50_ns = self.quantileScaled(50, 100),
+            .p95_ns = self.quantileScaled(95, 100),
+            .p99_ns = self.quantileScaled(99, 100),
+            .p999_ns = self.quantileScaled(999, 1000),
+            .p9999_ns = self.quantileScaled(9999, 10000),
             .max_ns = self.max_ns.load(.monotonic),
         };
     }
@@ -94,8 +101,15 @@ pub const LatencyHistogram = struct {
     }
 
     fn quantile(self: *const LatencyHistogram, percentile: u8) u64 {
+        return self.quantileScaled(percentile, 100);
+    }
+
+    /// Generalized rank-in-histogram lookup.  `numerator / denominator`
+    /// ∈ [0, 1].  Used by the R-01 p999 / p9999 summary fields.
+    fn quantileScaled(self: *const LatencyHistogram, numerator: u64, denominator: u64) u64 {
         const c = self.count.load(.monotonic);
-        const target = @max((c * percentile + 99) / 100, 1);
+        if (c == 0) return 0;
+        const target = @max((c * numerator + (denominator - 1)) / denominator, 1);
         var seen: u64 = 0;
         for (self.counts, 0..) |bucket_atomic, idx| {
             seen += bucket_atomic.load(.monotonic);

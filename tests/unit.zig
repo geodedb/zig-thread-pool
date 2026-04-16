@@ -473,6 +473,53 @@ test "Stats.steals/parks aggregate per-worker under work-stealing" {
     try std.testing.expectEqual(expected_parks, stats.parks);
 }
 
+test "latency summary exposes p999 and p9999 tail fields" {
+    // OBSERVABILITY-PIVOT / R-01: the LatencyHistogram exposes p99.9 and
+    // p99.99 derived from the same 64-bucket log2 histogram used for p50/
+    // p95/p99. The quantisation is coarse at the tails, so we only assert
+    // monotonicity (p99 <= p999 <= p9999 <= max) plus non-zeroness under
+    // realistic load. Skipped when timestamps are compiled out, since all
+    // histogram fields are intentionally zero in that build.
+    if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 4096,
+        .default_backpressure = .block,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // 2000 tasks is enough to populate tail buckets under realistic scheduling
+    // jitter without making this test slow. The histogram has 64 log2 buckets
+    // so even sparse data hits multiple bins. `.block` backpressure keeps the
+    // test deterministic if the scheduler stalls submissions.
+    for (0..2000) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2000), counter.value.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2000), stats.task_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 2000), stats.task_exec_ns.count);
+
+    // p999 / p9999 must be monotone non-decreasing with p99 and bounded by max.
+    // These are the R-01 acceptance assertions.
+    try std.testing.expect(stats.task_wait_ns.p99_ns <= stats.task_wait_ns.p999_ns);
+    try std.testing.expect(stats.task_wait_ns.p999_ns <= stats.task_wait_ns.p9999_ns);
+    try std.testing.expect(stats.task_wait_ns.p9999_ns <= stats.task_wait_ns.max_ns);
+
+    try std.testing.expect(stats.task_exec_ns.p99_ns <= stats.task_exec_ns.p999_ns);
+    try std.testing.expect(stats.task_exec_ns.p999_ns <= stats.task_exec_ns.p9999_ns);
+    try std.testing.expect(stats.task_exec_ns.p9999_ns <= stats.task_exec_ns.max_ns);
+
+    // At 2000 samples in realistic load, p9999 cannot be zero — that would
+    // indicate the summary path is silently skipping the scaled quantile.
+    try std.testing.expect(stats.task_exec_ns.p9999_ns > 0);
+}
+
 test "timestamp_mode disabled zeroes histograms" {
     // COMPTIME-ELISION: when the library is compiled with
     // -Dtimestamp-mode=full the runtime config is rejected by design.

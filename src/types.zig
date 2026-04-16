@@ -621,6 +621,17 @@ pub const LatencySummary = struct {
     p95_ns: u64 = 0,
     /// 99th-percentile latency in nanoseconds.
     p99_ns: u64 = 0,
+    /// 99.9th-percentile latency in nanoseconds (OBSERVABILITY-PIVOT / R-01).
+    /// Computed from the same 64-bucket log2 histogram as the other
+    /// percentiles; quantisation error grows at the tails and the field
+    /// is best interpreted as "which log2 bucket holds the tail" rather
+    /// than a precise ns figure.
+    p999_ns: u64 = 0,
+    /// 99.99th-percentile latency in nanoseconds (OBSERVABILITY-PIVOT / R-01).
+    /// Computed from the 64-bucket log2 histogram.  Same caveats as
+    /// `p999_ns`: on low sample counts the value degenerates to the
+    /// maximum observed bucket.
+    p9999_ns: u64 = 0,
     /// Maximum observed latency in nanoseconds.
     max_ns: u64 = 0,
 };
