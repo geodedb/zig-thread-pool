@@ -50,17 +50,21 @@ fn noop(ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = runtime;
 }
 
-pub fn main() !u8 {
-    const seed: u64 = blk: {
-        const env = std.process.getEnvVarOwned(std.heap.page_allocator, "FUZZ_SEED") catch break :blk 0xC0FFEE;
-        defer std.heap.page_allocator.free(env);
-        break :blk std.fmt.parseInt(u64, env, 0) catch 0xC0FFEE;
-    };
-    const iterations: u32 = blk: {
-        const env = std.process.getEnvVarOwned(std.heap.page_allocator, "FUZZ_ITERATIONS") catch break :blk 100;
-        defer std.heap.page_allocator.free(env);
-        break :blk std.fmt.parseInt(u32, env, 10) catch 100;
-    };
+fn envU64(init: std.process.Init.Minimal, gpa: std.mem.Allocator, key: []const u8, default: u64) u64 {
+    const val = init.environ.getAlloc(gpa, key) catch return default;
+    defer gpa.free(val);
+    return std.fmt.parseInt(u64, val, 0) catch default;
+}
+
+fn envU32(init: std.process.Init.Minimal, gpa: std.mem.Allocator, key: []const u8, default: u32) u32 {
+    const val = init.environ.getAlloc(gpa, key) catch return default;
+    defer gpa.free(val);
+    return std.fmt.parseInt(u32, val, 10) catch default;
+}
+
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    const seed = envU64(init, std.heap.page_allocator, "FUZZ_SEED", 0xC0FFEE);
+    const iterations = envU32(init, std.heap.page_allocator, "FUZZ_ITERATIONS", 100);
 
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
