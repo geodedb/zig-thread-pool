@@ -239,10 +239,32 @@ const TaskDescriptor = struct {
     claimed_by: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 
     comptime {
-        // Document the intended cache layout: ensure the hot fields fit in
-        // one cache line so dispatch never touches the cold metric fields.
-        const hot_size = @offsetOf(TaskDescriptor, "submit_ns");
-        std.debug.assert(hot_size <= std.atomic.cache_line);
+        // OBSERVABILITY-PIVOT / R-06: dispatch hot group must fit in one
+        // cacheline so `runTask`'s stale-filter and state-CAS never reach
+        // out to the cold metric fields. The hot group starts at offset 0
+        // (`state`) and ends immediately before `submit_ns`.
+        //
+        // Additionally: `state` is at offset 0, `task_fn` immediately after
+        // (u8-atomic + padded alignment), and `generation` is the last hot
+        // field. Cold fields (`submit_ns`, `start_ns`, `complete_ns`,
+        // `claimed_by`) follow in strict order — see
+        // docs/performance/LAYOUT_OFFSETS.md.
+        // NOTE: `TaskDescriptor` is a plain `struct`, so Zig may reorder
+        // fields for alignment. We therefore lock invariants that hold
+        // regardless of layout order, not absolute offsets. See
+        // `docs/performance/LAYOUT_OFFSETS.md` for the observed layout
+        // under Zig 0.16.0.
+        //
+        //   a. The dispatch-hot read set (`state`, `task_fn`, `ctx`,
+        //      `options`, `generation`) fits within two cachelines. If a
+        //      future refactor adds a 6th hot field, it must either fit
+        //      in the remaining slack or be explicitly split cold.
+        //   b. Total `@sizeOf(TaskDescriptor)` is bounded so the slab
+        //      doesn't blow up per-allocation memory on large
+        //      `queue_capacity` values.
+        const max_hot = @sizeOf(types.SubmitOptions) + 3 * @sizeOf(u64) + 16;
+        std.debug.assert(@offsetOf(TaskDescriptor, "submit_ns") <= max_hot);
+        std.debug.assert(@sizeOf(TaskDescriptor) <= 128);
     }
 };
 
@@ -317,6 +339,28 @@ const Worker = struct {
     current_task_started_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     is_overflow: bool = false,
     overflow_retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    comptime {
+        // OBSERVABILITY-PIVOT / R-06: `Worker` is a plain `struct`, so Zig
+        // may reorder its fields. We therefore lock size-bounded
+        // invariants rather than absolute offsets. See
+        // `docs/performance/LAYOUT_OFFSETS.md` for the observed layout
+        // under Zig 0.16.0.
+        //
+        //   a. `park_mutex` alignment is at least its natural atomic-
+        //      state word size, so no cross-worker tear on mutex ops.
+        //      Zig 0.16.0 `std.Thread.Mutex` is futex-based (u32 state),
+        //      so `@alignOf == 4`; stronger alignment is not needed.
+        //   b. Total `@sizeOf(Worker)` is bounded. The constant is a
+        //      ceiling: a future refactor that blows it past the bound
+        //      must explicitly update the invariant after documenting
+        //      why the growth is acceptable.
+        std.debug.assert(@alignOf(sync.Mutex) >= @alignOf(u32));
+        // Observed size on Zig 0.16.0 / x86_64: 1912 bytes. Ceiling at
+        // 4096 (two pages) so accidental cacheline-splitting field
+        // additions trip at compile time.
+        std.debug.assert(@sizeOf(Worker) <= 4096);
+    }
 };
 
 /// Synchronization primitives for task completion. Worker parking uses
@@ -399,11 +443,19 @@ const Counters = extern struct {
     overflow_active: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     comptime {
-        // Cacheline isolation invariants: each hot-write counter owns a distinct line.
+        // OBSERVABILITY-PIVOT / R-06: each hot-write counter owns a distinct
+        // cacheline. See docs/performance/LAYOUT_OFFSETS.md for the
+        // rationale: the park handshake depends on `queued_tasks` and
+        // `queued_tasks_blocking` being SC-ordered on *separate* lines, so
+        // a blocking-lane increment cannot wake a default-lane worker.
         std.debug.assert(@offsetOf(Counters, "queued_tasks") == 0);
         std.debug.assert(@offsetOf(Counters, "submitted") == cache_line_size);
         std.debug.assert(@offsetOf(Counters, "active_tasks") == 2 * cache_line_size);
         std.debug.assert(@offsetOf(Counters, "queued_tasks_blocking") == 3 * cache_line_size);
+        // `cancelled` shares a line with `active_tasks` by design — both are
+        // written only on completion/cancellation, never by submitters, so
+        // the line stays worker-private.
+        std.debug.assert(@offsetOf(Counters, "cancelled") == 2 * cache_line_size + field_size);
     }
 };
 
