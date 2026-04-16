@@ -42,8 +42,13 @@ fn benchFlood(io: std.Io) !void {
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
+
+    const slot_opt: ?usize = pool.registerSubmitter() catch null;
+    defer if (slot_opt) |slot| pool.releaseSubmitter(slot);
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
@@ -78,8 +83,13 @@ fn benchFloodBatched(io: std.Io) !void {
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
+
+    const slot_opt: ?usize = pool.registerSubmitter() catch null;
+    defer if (slot_opt) |slot| pool.releaseSubmitter(slot);
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
@@ -121,6 +131,8 @@ const ContendedSubmitterCtx = struct {
 };
 
 fn contendedSubmitterThread(ctx: *ContendedSubmitterCtx) void {
+    const slot_opt: ?usize = ctx.pool.registerSubmitter() catch null;
+    defer if (slot_opt) |slot| ctx.pool.releaseSubmitter(slot);
     for (0..ctx.count) |_| {
         _ = ctx.pool.submit(noopTask, @ptrCast(ctx.marker), .{
             .wait_group = ctx.wg,
@@ -135,6 +147,8 @@ fn benchContended(io: std.Io) !void {
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = contended_submitters,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
 
@@ -187,6 +201,8 @@ fn contendedBatchedSubmitterThread(ctx: *ContendedBatchedSubmitterCtx) void {
         // than a silently-failed scenario.
         common.pinCurrentThreadToCpu(cpu_id) catch {};
     }
+    const slot_opt: ?usize = ctx.pool.registerSubmitter() catch null;
+    defer if (slot_opt) |slot| ctx.pool.releaseSubmitter(slot);
     var batch: [flood_batch_size]thread_pool.BatchTask = undefined;
     for (&batch) |*b| {
         b.* = .{ .task_fn = noopTask, .ctx = @ptrCast(ctx.marker) };
@@ -216,6 +232,8 @@ fn benchContendedBatchedCore(
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = contended_submitters,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
 
@@ -345,6 +363,8 @@ fn benchFloodCrosssocket(io: std.Io, map: SocketMap) !void {
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
 
@@ -358,6 +378,9 @@ fn benchFloodCrosssocket(io: std.Io, map: SocketMap) !void {
         try writeLine(io, "tokio_parity scenario=flood_1m_crosssocket SKIPPED (pin failed)\n");
         return;
     };
+
+    const slot_opt: ?usize = pool.registerSubmitter() catch null;
+    defer if (slot_opt) |slot| pool.releaseSubmitter(slot);
 
     var ctx = NoopCtx{};
     var wg = pool.waitGroup();
