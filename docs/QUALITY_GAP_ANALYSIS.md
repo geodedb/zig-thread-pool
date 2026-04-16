@@ -4,27 +4,35 @@ Last updated: 2026-04-16
 
 ## Summary
 
-- **Critical:** 0 | **High:** 6 | **Medium:** 15 | **Low:** 12 | **Info:** 0
-- **Total open findings (new audit):** 32 (6 High + 15 Medium + 12 Low, 1 subsumed)
+- **Critical:** 0 | **High:** 3 open + 3 closed | **Medium:** 15 | **Low:** 12 | **Info:** 0
+- **Total open findings (new audit):** 29 open + 3 closed on 2026-04-16 (QS-002, QS-003, QS-008)
 - **Legacy Q-xxx open items carried over:** 12 (from 2026-04-11 audit pass)
-- **Formal gates (2026-04-16):** `zig fmt` clean, `zig build check` clean, `zig build test` 47 pass / 1 skip / 0 fail
+- **Formal gates (2026-04-16):** `zig fmt` clean, `zig build check` clean, `zig build test` 47 pass / 1 skip / 0 fail; `test-all` + TSan stress all pass post-closure
 
 ### Top 5 Risks (current pass, by PriorityScore)
 
 1. **QS-001** Split 2087-line src/pool.zig monolith (PriorityScore 80)
-2. **QS-003** Decompose 130-line hot-path Core.runTask (PriorityScore 64)
-3. **QS-002** Decompose 147-line Core.init with nested errdefers (PriorityScore 60)
-4. **QS-008** Document 24 undocumented public symbols in src/types.zig (PriorityScore 60)
+2. ~~**QS-003** Decompose 130-line hot-path Core.runTask~~ — **Closed 2026-04-16 (a0259e6)**
+3. ~~**QS-002** Decompose 147-line Core.init with nested errdefers~~ — **Closed 2026-04-16 (301392b)**
+4. ~~**QS-008** Document 24 undocumented public symbols in src/types.zig~~ — **Closed 2026-04-16 (429caab)**
 5. **QR-001** Add unit-level tests for lane/watchdog/overflow slices (PriorityScore 48)
+
+### Closed This Sweep (2026-04-16)
+
+| Gap-ID | Commit | Issue | Evidence |
+|--------|--------|-------|----------|
+| QS-002 | `301392b` | [#15](https://gitlab.com/devnw/zig/thread-pool/-/issues/15) | `Core.init` 147 → 60 lines; F-002 errdefer chain preserved |
+| QS-003 | `a0259e6` | [#16](https://gitlab.com/devnw/zig/thread-pool/-/issues/16) | Hot-path decomposed; +16.3% conn_churn_seq / +11.7% producer_contention paired A/B |
+| QS-008 | `429caab` | [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) | 24 public symbols documented; `grep -c '^///' src/types.zig` = 159 |
 
 ## Stack-Ranked Findings — 2026-04-16 Audit Pass
 
 | Rank | Severity | PriorityScore | Category | Finding | Component | Issue URL | Fix Summary | Effort | Status |
 |------|----------|---------------|----------|---------|-----------|-----------|-------------|--------|--------|
 | 1 | High | 80 | readability | QS-001 Split 2087-line pool.zig into worker/descriptor/lanes/watchdog/stats | src/pool.zig | [#14](https://gitlab.com/devnw/zig/thread-pool/-/issues/14) | 5-way file split, target <700 lines each | L | Open |
-| 2 | High | 64 | readability/perf | QS-003 Extract recordTaskStart/invokeTask/finalizeTask from Core.runTask | src/pool.zig:1670-1887 | [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) | Inline helpers, preserve atomic ordering | M | **Closed 2026-04-16** |
-| 3 | High | 60 | readability | QS-002 Extract allocateStorage/initDescriptorFreelist/initWorkers/spawnWorkers | src/pool.zig:408-554 | [#16](https://gitlab.com/devnw/zig/thread-pool/-/issues/16) | Target 30-40 line orchestrator | M | Open |
-| 4 | High | 60 | docs/api-contract | QS-008 Add /// to 24 undocumented public symbols in types.zig | src/types.zig:4-378 | [#21](https://gitlab.com/devnw/zig/thread-pool/-/issues/21) | Enum + struct + method doc blocks | M | Open |
+| 2 | High | 64 | readability/perf | QS-003 Extract recordTaskStart/invokeTask/finalizeTask from Core.runTask | src/pool.zig:1670-1887 | [#16](https://gitlab.com/devnw/zig/thread-pool/-/issues/16) | Inline helpers, preserve atomic ordering | M | **Closed 2026-04-16 (a0259e6)** — see `GAP_ANALYSIS_RESOLVED.md` |
+| 3 | High | 60 | readability | QS-002 Extract allocateStorage/initDescriptorFreelist/initWorkers/spawnWorkers | src/pool.zig:408-554 | [#15](https://gitlab.com/devnw/zig/thread-pool/-/issues/15) | Target 30-40 line orchestrator | M | **Closed 2026-04-16 (301392b)** — see `GAP_ANALYSIS_RESOLVED.md` |
+| 4 | High | 60 | docs/api-contract | QS-008 Add /// to 24 undocumented public symbols in types.zig | src/types.zig:4-378 | [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) | Enum + struct + method doc blocks | M | **Closed 2026-04-16 (429caab)** — see `GAP_ANALYSIS_RESOLVED.md` |
 | 5 | High | 48 | tests | QR-001 Unit tests for lane/watchdog/overflow slices | tests/unit.zig | [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) | 6 new unit tests + injectable clock | M | Open |
 | 6 | High | 48 | reliability/ci-cd | QR-002 CI gate for -Dsingle-pool + comptime safety assertion | build.zig, .gitlab-ci.yml | [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) | Add test-single-pool job | S | Open |
 | 7 | Medium | 36 | docs | QS-009 Document ThreadPool.init, registerSubmitter, releaseSubmitter | src/pool.zig:1986-2070 | [#31](https://gitlab.com/devnw/zig/thread-pool/-/issues/31) | /// on 3 methods + F-005 cite | S | Open |

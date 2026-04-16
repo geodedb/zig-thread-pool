@@ -26,8 +26,8 @@ Filtered per plateau-pivot rule: **P-04** (scanAndWake TLS hint, speculative thr
 ### Top 5 Risks (2026-04-16 cohort, by PerfScore + pivot-axis relevance)
 
 1. **PERF-METHODOLOGY** (P1, PerfScore 100) -- Benchmark methodology hardening tracker. `.full` timestamp_mode + `queue_capacity=4096` + `backpressure=.block` in `flood_1m` means the published runtime-compare table may not be apples-to-apples vs Tokio/Go. Issue #36.
-2. **PERF-OBSERVABILITY** (P1, PerfScore 80) -- Observability pivot tracker: p999/p9999, per-lane histograms, wake-latency histogram, memory budget API, layout doc. Blocks confidence in every future lane/tail-latency/memory win. Issue #46.
-3. **PERF-P-09** (P1, PerfScore 64) -- Comptime elision of `timestamp_mode`, `scheduler_variant`, `queue_kind`, `lane_extension`. Projected 3-10% on `flood_1m` with `-Dtimestamp-mode=disabled`; compounds with existing `-Dsingle-pool`. Issue #73.
+2. ~~**PERF-OBSERVABILITY** (P1, PerfScore 80)~~ — **Closed 2026-04-16** (6 commits: `3356d1d` R-01, `a39092a` R-02, `7c9d2e6` R-03, `5561a46` R-06, `e75f4e0` R-10, `f1e7b67` doc sync). Issue #46.
+3. **PERF-P-09** (P1, PerfScore 64) — **Partial 2026-04-16** (`c9a05e8`): `-Dtimestamp-mode` + `-Dscheduler-variant` landed; `-Dqueue-kind` + `-Dlane-extension` deferred. Issue #73 remains open with reduced scope.
 4. **PERF-P-11** (P1, PerfScore 48) -- Pool-wide `completion_mutex` + broadcast on waitable tasks. Dormant today but a production-user foot-gun; pairs with R-09 scoped-wait API. Issue #79.
 5. **PERF-P-01** (P1, PerfScore 48) -- `RingQueue` head/tail share a cacheline. Default `queue_kind`, so every `LocalQueue` pays unpaid cross-core coherence on every owner push + stealer CAS. Issue #55.
 

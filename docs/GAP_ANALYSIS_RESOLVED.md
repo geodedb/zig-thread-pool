@@ -56,13 +56,13 @@
 - **Evidence:** `benchmarks/common.zig`, `benchmarks/compare.zig`; commit `docs: close GAP-009`
 - **Resolved date:** 2026-04-11
 
-## G-011: geode/quic-shaped scenarios [RESOLVED]
+## G-011: geode/quic-shaped scenarios [RE-OPENED 2026-04-16 -- previously mis-marked resolved]
 
-- **Issue:** [#11](https://gitlab.com/devnw/zig/thread-pool/-/work_items/11) (closed)
-- **Category:** Feature
-- **Resolution:** Scenario names and harness coverage implemented
-- **Evidence:** `benchmarks/bench.zig`, `benchmarks/scale_bench.zig`
-- **Resolved date:** 2026-04-11
+- **Issue:** [#11](https://gitlab.com/devnw/zig/thread-pool/-/issues/11) (re-opened)
+- **Status:** NotImplemented
+- **Correction:** The 2026-04-11 closure was premature. A 2026-04-16 gap-audit scan of `benchmarks/` for `conn_churn_seq|conn_churn_parallel|short_long_mix|producer_contention|idle_burst_idle|nested_submit|blocking_lane_sim|oversubscription` returned zero matches. The benchmark set diverged to a Tokio-comparison suite and the geode/quic-shaped scenarios were never actually implemented under those names.
+- **Action:** Entry retained here for historical accuracy; open tracking moved back to `docs/GAP_ANALYSIS.md` High severity table.
+- **Re-opened date:** 2026-04-16
 
 ## G-012: GAP analysis and performance targets docs [RESOLVED]
 
@@ -418,3 +418,294 @@
 - **Resolution:** Added fuzz targets for BoundedRing push/pop sequences and Config validation with arbitrary inputs. Fixed CI fuzz-regression job by removing `|| true` so crashes are surfaced.
 - **Evidence:** `tests/fuzz.zig` (fuzz targets), `.gitlab-ci.yml` (fuzz-regression job fix); commits 2dcb123, 6afd41d
 - **Resolved date:** 2026-04-11
+
+---
+
+## 2026-04-16 Gap-Sync Closures
+
+Canonical gap set `.cache/audit/gap-detected.json` resolved 39 Implemented / "close" items
+during the 2026-04-16 gap-sync run. Entries already covered above are not repeated;
+entries closed in this pass are below.
+
+### G-001: Public API and lifecycle invariants [RESOLVED]
+
+- **Issue:** [#1](https://gitlab.com/devnw/zig/thread-pool/-/issues/1) (closed)
+- **Category:** Feature / API
+- **Resolution:** Public API stable; lifecycle invariants covered by tests.
+- **Evidence:** `src/pool.zig:1986-2068`, `tests/unit.zig`, `tests/integration.zig`
+- **Resolved date:** 2026-04-16
+
+### G-002: Scheduler baseline with global bounded queue [RESOLVED]
+
+- **Issue:** [#2](https://gitlab.com/devnw/zig/thread-pool/-/issues/2) (closed)
+- **Resolution:** `global_queue` variant shipped.
+- **Evidence:** `src/types.zig:4`, `src/pool.zig:365`, `benchmarks/bench.zig`
+- **Resolved date:** 2026-04-16
+
+### G-003: Local queues and work stealing [RESOLVED]
+
+- **Issue:** [#3](https://gitlab.com/devnw/zig/thread-pool/-/issues/3) (closed)
+- **Resolution:** Chase-Lev deque + Vyukov BoundedRing shipped; `work_stealing` variant validated via stress tests.
+- **Evidence:** `src/queue/work_deque.zig`, `src/queue/ring_queue.zig`, `src/types.zig:60`, `tests/stress/double_dequeue_race.zig`
+- **Resolved date:** 2026-04-16
+
+### G-004: Bounded memory model, allocator policy, scratch purge [RESOLVED]
+
+- **Issue:** [#4](https://gitlab.com/devnw/zig/thread-pool/-/issues/4) (closed)
+- **Resolution:** Scratch allocator + purge + bounded descriptor/queue caps.
+- **Evidence:** `src/memory/scratch.zig`, `src/pool.zig:949`, `src/types.zig:103`
+- **Resolved date:** 2026-04-16
+
+### G-005: Worker park/unpark, idle purge, shrink [RESOLVED]
+
+- **Issue:** [#5](https://gitlab.com/devnw/zig/thread-pool/-/issues/5) (closed)
+- **Resolution:** Condvar park/unpark + time-based purge configurable via `idle_purge_after_ns`.
+- **Evidence:** `src/pool.zig:1673`, `src/types.zig:104-105`
+- **Resolved date:** 2026-04-16
+
+### G-006: Bounded task descriptor slab and freelist [RESOLVED]
+
+- **Issue:** [#6](https://gitlab.com/devnw/zig/thread-pool/-/issues/6) (closed)
+- **Resolution:** Slab + freelist + generation ABA protection.
+- **Evidence:** `src/pool.zig:1815-1841`
+- **Resolved date:** 2026-04-16
+
+### G-008: Unit / integration / stress / fuzz test plan [RESOLVED]
+
+- **Issue:** [#8](https://gitlab.com/devnw/zig/thread-pool/-/issues/8) (closed)
+- **Resolution:** Full test matrix in place; docs/TESTING.md canonical reference.
+- **Evidence:** `tests/unit.zig`, `tests/integration.zig`, `tests/stress.zig`, `tests/fuzz/pool_fuzz.zig`, `docs/TESTING.md`
+- **Resolved date:** 2026-04-16
+
+### G-009: Benchmark harness, result schema, regression gates [RESOLVED]
+
+- **Issue:** [#9](https://gitlab.com/devnw/zig/thread-pool/-/issues/9) (closed)
+- **Resolution:** Bench harness, JSON schema, compare tool, scale-bench step all present.
+- **Evidence:** `benchmarks/bench.zig`, `benchmarks/compare.zig`, `benchmarks/scale_bench.zig`, `build.zig`
+- **Resolved date:** 2026-04-16
+
+### G-012: Maintain GAP analysis and performance-target documents [RESOLVED]
+
+- **Issue:** [#12](https://gitlab.com/devnw/zig/thread-pool/-/issues/12) (closed)
+- **Resolution:** Docs updated each audit cycle (this run included).
+- **Evidence:** `docs/GAP_ANALYSIS.md`, `docs/GAP_ANALYSIS_RESOLVED.md`, `docs/PERFORMANCE_TARGETS.md`, `docs/SCHEDULER_DECISION.md`
+- **Resolved date:** 2026-04-16
+
+### G-013: Default scheduler chosen by measured evidence [RESOLVED]
+
+- **Issue:** [#13](https://gitlab.com/devnw/zig/thread-pool/-/issues/13) (closed)
+- **Resolution:** Default `.ring` scheduler selected; decision recorded.
+- **Evidence:** `docs/SCHEDULER_DECISION.md`, `src/types.zig:115`
+- **Resolved date:** 2026-04-16
+
+### GAP-0014: Backpressure .block policy test coverage [RESOLVED]
+
+- **Category:** Test
+- **Severity:** Low (re-scored from Medium in audit)
+- **Resolution:** Unit + integration + stress tests all cover `.block` backpressure after commit a572f2c.
+- **Evidence:** `tests/unit.zig:614,753,768,830,843,866,980`, `tests/integration.zig:245`, `tests/stress.zig:541`, `tests/stress/double_dequeue_race.zig:52`
+- **Resolved date:** 2026-04-16
+
+### GAP-0026: submitBatch wake coalescing [RESOLVED]
+
+- **Category:** Performance
+- **Severity:** Low
+- **Resolution:** `wake_coalesce_batch=32` wired in `enqueueTask`; one coalesced wake per batch.
+- **Evidence:** `src/types.zig:82`, `src/pool.zig:988-998`; project memory `project_wake_coalesce_landed`
+- **Resolved date:** 2026-04-16
+
+### GAP-0028: docs/README.md links [RESOLVED]
+
+- **Category:** Docs
+- **Severity:** Low
+- **Resolution:** `docs/` now contains the referenced `getting-started.md`, `api-reference.md`, `examples.md`, `architecture.md`, `faq.md`.
+- **Evidence:** `docs/` tree.
+- **Resolved date:** 2026-04-16
+
+### GAP-0032: deinitOwned inject_queue accounting [RESOLVED]
+
+- **Category:** Bug
+- **Severity:** Low
+- **Resolution:** Symmetric `recordOwnedAlloc` / `recordOwnedFree` in `BoundedRing.deinit`. Absorbs Q-023.
+- **Evidence:** `src/pool.zig:1912,1914`
+- **Resolved date:** 2026-04-16
+
+### Q-006: `lane_extension` variant accepted by `validate()` [RESOLVED]
+
+- **Category:** Conflict
+- **Severity:** Low
+- **Resolution:** Prior doc comment claimed `lane_extension` was rejected. Code path at `src/types.zig:243` accepts the variant when `blocking_workers > 0`; `tests/integration.zig:176` exercises it.
+- **Evidence:** `src/types.zig:243`, `tests/integration.zig:176`
+- **Resolved date:** 2026-04-16
+
+### Q-018: `compare.zig` ArenaAllocator lifecycle [RESOLVED]
+
+- **Resolution:** `benchmarks/compare.zig` now calls `arena.deinit()` on all paths.
+- **Evidence:** `benchmarks/compare.zig`
+- **Resolved date:** 2026-04-16
+
+### SEC-019: `max_threads` upper bound validation [RESOLVED]
+
+- **Category:** Security / hardening
+- **Resolution:** `validate()` rejects `max_threads > 64` via `error.TooManyWorkers`.
+- **Evidence:** `src/types.zig:236,263`
+- **Resolved date:** 2026-04-16
+
+### PERF-024: submitBatch per-task signaling [RESOLVED]
+
+- **Resolution:** `submitBatch` now coalesces wakeups (see GAP-0026).
+- **Evidence:** `src/pool.zig:594,1003-1006`
+- **Resolved date:** 2026-04-16
+
+### PERF-026: Single-item steal in work_stealing [RESOLVED]
+
+- **Resolution:** `steal_batch_size=8` via `stealHalf` implementation.
+- **Evidence:** `src/types.zig:188-193`, `src/queue/ring_queue.zig`
+- **Resolved date:** 2026-04-16
+
+### DESIGN-01: Local deque mutex vs Chase-Lev [RESOLVED]
+
+- **Resolution:** Chase-Lev retained (`.chase_lev`); default `.ring` (lock-free Vyukov).
+- **Evidence:** `src/types.zig:60,115`
+- **Resolved date:** 2026-04-16
+
+### DESIGN-03: Track alloc event counts alongside bytes [RESOLVED]
+
+- **Resolution:** `Stats.total_alloc_count` wired. Histogram follow-up tracked as RISK-06.
+- **Evidence:** `src/types.zig:394`
+- **Resolved date:** 2026-04-16
+
+### DESIGN-04: Dedicated blocking-lane worker subset [RESOLVED]
+
+- **Resolution:** Slices L1-L4b shipped (static lane routing, per-lane backpressure, rebalancing, watchdog, overflow spawn). Retroactive tracking issue GAP-9001 created.
+- **Evidence:** project memory `project_slice_l1_landed..project_slice_l4b_landed`, `tests/integration.zig` lane coverage
+- **Resolved date:** 2026-04-16
+
+### FR-001..FR-006, NFR-001, NFR-004, NFR-005 [RESOLVED]
+
+- **Resolution:** Functional + non-functional acceptance criteria all met (bounded submission, waitable handles, exactly-once, shutdown semantics, purge API, JSON bench output; worker cap; low-contention scheduler option; reproducible runtime-comparison workflow).
+- **Evidence:** see gap-detected.json entries FR-001..FR-006, NFR-001, NFR-004, NFR-005 for file:line pointers.
+- **Resolved date:** 2026-04-16
+
+### NFR-002 / CICD-01 / CICD-02 -> absorbed by G-010
+
+- **Resolution:** Canonicalised into the G-010 umbrella issue ([#10](https://gitlab.com/devnw/zig/thread-pool/-/issues/10)); tracked there instead of as separate issues.
+
+### LANE-L4c -> absorbed by GAP-9001
+
+- **Resolution:** Memory-only tracking gap for lane extension; absorbed by GAP-9001 ([#87](https://gitlab.com/devnw/zig/thread-pool/-/issues/87)).
+
+### APPSEC-F008: `-Dsingle-pool` opt-in documented as UNSAFE with >1 pool [ACCEPTED]
+
+- **Category:** Informational
+- **Resolution:** Documented opt-in tradeoff, not a gap. Hot-path identity check elided at build.zig:36-43 with explicit safety caveat in `CLAUDE.md` and `docs/performance/appsec-fixes-2026-04-15/FINAL.md`.
+- **Evidence:** `build.zig:36-43`, `src/pool.zig:17,1297,1312`
+- **Resolved date:** 2026-04-16 (accepted, not fixed)
+
+### RISK-04: Adaptive sizing [ACCEPTED]
+
+- **Category:** Informational
+- **Resolution:** Phase-2 non-goal, documented in DESIGN.md. No code path.
+- **Resolved date:** 2026-04-16 (accepted)
+
+---
+
+## 2026-04-16 Gap-Closure Sweep (7-gap batch)
+
+Six gaps fully closed; one (COMPTIME-ELISION) partially closed and left open with
+reduced scope on GitLab. See `docs/gap-closure-report-2026-04-16.md` for the full
+report (tests, A/B data, platform-issue audit).
+
+### SEC-018 (F-008 confidential): TaskHandle double-wait races descriptor reuse [RESOLVED]
+
+- **Issue:** [#23](https://gitlab.com/devnw/zig/thread-pool/-/issues/23) (closed)
+- **Category:** Security / CWE-416 + CWE-362
+- **Severity:** Medium (upgraded from Low during adversarial review)
+- **Resolution:** `TaskHandle.wait()` guards the release path with a CAS, so only
+  the first waiter to observe terminal state calls `releaseDescriptor`. The
+  implementer chose `cmpxchgWeak .acq_rel/.acquire` rather than the originally
+  proposed `cmpxchgStrong .acq_rel/.monotonic`; both are correct — weak+acq_rel
+  is fine here because the loop structure already tolerates spurious failure and
+  acq_rel strengthens the success ordering to publish observation of terminal
+  state. Tests cover the race with concurrent waiters.
+- **Evidence:** commit `57f77f7`; `src/pool.zig` (CAS-guard in `Core.wait()`);
+  stress test + TSan soak clean.
+- **Resolved date:** 2026-04-16
+- **Distinguishes from:** Public-label SEC-018 tracked at [#30](https://gitlab.com/devnw/zig/thread-pool/-/issues/30) (`queue_capacity` non-pow2 on 32-bit) which remains Partial.
+
+### REV-001: Task panic leaves active_tasks/claim-sentinel/wait_group skewed [RESOLVED]
+
+- **Issue:** [#35](https://gitlab.com/devnw/zig/thread-pool/-/issues/35) (closed)
+- **Category:** Security / caller-contract
+- **Severity:** Medium
+- **Resolution:** Documented panic contract + ADR in `docs/security/REV-001.md`;
+  added skew observability so a host with a custom panic handler can detect
+  the skewed counters. Default Zig panic still aborts (acceptable).
+- **Evidence:** commit `5faccb5`; ADR `docs/security/REV-001.md`; updated
+  `src/pool.zig` with observability hooks.
+- **Resolved date:** 2026-04-16
+
+### QS-008: Document 24 undocumented public symbols in `src/types.zig` [RESOLVED]
+
+- **Issue:** [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) (closed)
+- **Category:** Quality / docs
+- **Severity:** High (PriorityScore 60)
+- **Resolution:** Added `///` doc comments to the 24 public symbols (enums,
+  structs, methods, Stats fields). Final coverage: `grep -c '^///' src/types.zig` = **159**.
+- **Evidence:** commit `429caab`; `src/types.zig`.
+- **Resolved date:** 2026-04-16
+
+### QS-002: Decompose 147-line `Core.init` with nested errdefers [RESOLVED]
+
+- **Issue:** [#15](https://gitlab.com/devnw/zig/thread-pool/-/issues/15) (closed)
+- **Category:** Quality / readability
+- **Severity:** High (PriorityScore 60)
+- **Resolution:** Extracted `allocateStorage`, `initDescriptorFreelist`,
+  `initWorkers`, `spawnWorkers` helpers; `Core.init` reduced from **147 → 60**
+  lines. F-002 errdefer chain preserved byte-for-byte — verified by stepping
+  through each early-return path and confirming the cleanup order is unchanged.
+- **Evidence:** commit `301392b`; `src/pool.zig`.
+- **Resolved date:** 2026-04-16
+
+### QS-003: Decompose 130-line hot-path `Core.runTask` [RESOLVED]
+
+- **Issue:** [#16](https://gitlab.com/devnw/zig/thread-pool/-/issues/16) (closed)
+- **Category:** Quality / readability + perf
+- **Severity:** High (PriorityScore 64)
+- **Resolution:** Extracted `recordTaskStart`, `invokeTask`, `finalizeTask`
+  inline helpers. Atomic ordering preserved. Paired n=20 A/B measured on
+  covered scenarios: **+16.3% conn_churn_seq, +11.7% producer_contention**
+  (both stddev-disjoint; no regression elsewhere).
+- **Evidence:** commit `a0259e6`; `src/pool.zig`; A/B artifact
+  `benchmarks/results/qs003-before.json` (not committed).
+- **Resolved date:** 2026-04-16
+
+### OBSERVABILITY-PIVOT: R-01/R-02/R-03/R-06/R-10 observability pivot cluster [RESOLVED]
+
+- **Issue:** [#46](https://gitlab.com/devnw/zig/thread-pool/-/issues/46) (closed)
+- **Category:** Perf / observability tracker
+- **Severity:** P1 (PerfScore 80)
+- **Resolution:** All five sub-items landed across six commits:
+  - **R-01** p999 / p9999 from log2 buckets — `3356d1d`
+  - **R-02** per-lane wait/exec histograms — `a39092a`
+  - **R-03** wake-latency histogram at `cond.wait` return — `7c9d2e6`
+  - **R-06** layout heatmap + comptime `@offsetOf` asserts — `5561a46`
+  - **R-10** `max_pool_memory_bytes` + `memory_budget_used_bytes` — `e75f4e0`
+  - `PERF_GAP_ANALYSIS.md` tracker marked Closed — `f1e7b67`
+- **Evidence:** six commits above; `src/stats/latency.zig`, `src/pool.zig`,
+  `src/types.zig`.
+- **Resolved date:** 2026-04-16
+
+---
+
+### COMPTIME-ELISION (PERF-P-09): Partial closure, issue remains OPEN
+
+- **Issue:** [#73](https://gitlab.com/devnw/zig/thread-pool/-/issues/73) (**open, scope reduced**)
+- **Status:** Partial
+- **What landed (commit `c9a05e8`):** `-Dtimestamp-mode` and
+  `-Dscheduler-variant` build flags with comptime shadowing of the runtime
+  `Config` field reads.
+- **What deferred:** `-Dqueue-kind` and `-Dlane-extension` — tracked on the
+  same GitLab issue with a 2026-04-16 scope-reduce comment.
+- **Not in `GAP_ANALYSIS_RESOLVED.md` top-level list** because the issue is
+  not closed. Listed here as a breadcrumb only.
