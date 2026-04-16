@@ -12,7 +12,7 @@ fn counterTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
