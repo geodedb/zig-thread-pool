@@ -216,7 +216,7 @@ zig-test-windows-stress-0.16.0:
   interruptible: true
   before_script:
     - apt-get update -qq
-    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
     - bash scripts/install-zig.sh "$ZIG_VERSION"
     - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
     - zig version
