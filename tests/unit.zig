@@ -748,7 +748,9 @@ test "non_empty_workers bitmap invariant under racing push/pop" {
     const total: u64 = 80_000;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        // Block on backpressure so the test works on CI runners with
+        // fewer cores than workers (queue fills before workers drain).
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .backpressure = .block });
     }
     wg.wait();
     try std.testing.expectEqual(total, counter.value.load(.acquire));
@@ -763,7 +765,7 @@ test "non_empty_workers bitmap invariant under racing push/pop" {
     // post-quiesce.
     var final_counter = common.Counter{};
     var final_wg = pool.waitGroup();
-    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg });
+    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg, .backpressure = .block });
     final_wg.wait();
     try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
 }
@@ -825,7 +827,7 @@ test "active_spinners: counter stays non-negative under concurrent workers" {
     const total: u64 = 40_000;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .backpressure = .block });
     }
     wg.wait();
     try std.testing.expectEqual(total, counter.value.load(.acquire));
@@ -838,7 +840,7 @@ test "active_spinners: counter stays non-negative under concurrent workers" {
     // task starves (test timeout via wg.wait semantics on single task).
     var final_counter = common.Counter{};
     var final_wg = pool.waitGroup();
-    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg });
+    _ = try pool.submit(common.counterTask, @ptrCast(&final_counter), .{ .wait_group = &final_wg, .backpressure = .block });
     final_wg.wait();
     try std.testing.expectEqual(@as(u64, 1), final_counter.value.load(.acquire));
 }
@@ -861,7 +863,7 @@ test "hot_spinners = 1 executes all submitted tasks" {
     const total: u64 = 10_000;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .backpressure = .block });
     }
     wg.wait();
     try std.testing.expectEqual(total, counter.value.load(.acquire));
@@ -975,7 +977,7 @@ test "g3: Stats.submitted reports exact spawn count" {
     var counter = common.Counter{};
     var i: u64 = 0;
     while (i < N) : (i += 1) {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg, .backpressure = .block });
     }
     wg.wait();
 
