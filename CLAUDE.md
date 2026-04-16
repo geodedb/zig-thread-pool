@@ -56,55 +56,78 @@ uses the vendored Go checkout instead of the host installation.
 
 ## Current Direct Runtime Snapshot
 
-From the 2026-04-16 post-gap-closure run under Zig 0.16.0 at commit `12713c6`
-(`6` retained samples after `1` warmup discard, `56` workers). Raw artifact:
+From the 2026-04-16 post-contended-scenarios gap-close run under Zig 0.16.0
+at commit `d357bd9` (`6` retained samples after `1` warmup discard, `56`
+workers). Raw artifact:
 `benchmarks/results/runtime-comparison-latest.json`.
 
 ### Throughput (ops/sec)
 
 | Scenario | Zig thread-pool | Tokio | Go | Zig vs Go |
 |---|---:|---:|---:|---:|
-| `flood_1m` | 963,839 | 416,659 | 772,343 | 1.25x ahead |
-| `contended_spawn_8x` | 916,337 | 586,802 | 3,832,459 | 4.18x behind |
-| `cpu_work_10us` | 1,108,351 | 621,393 | 915,517 | 1.21x ahead |
-| `cpu_work_100us` | 460,103 | 310,785 | 420,725 | 1.09x ahead |
-| `contended_cpu_10us` | 918,624 | 572,803 | 1,807,198 | 1.97x behind |
-| `nested_fanout_4x` | 525,906 | 1,215,754 | 3,175,814 | 6.04x behind |
-| `burst_drain_burst` | 164,180 | 140,736 | 145,028 | 1.13x ahead |
-| `mixed_fast_slow` | 223,581 | 224,367 | 249,514 | 1.12x behind |
+| `flood_1m` | 1,003,787 | 546,717 | 1,346,758 | 1.34x behind |
+| `contended_spawn_8x` | 912,471 | 668,275 | 3,522,449 | 3.86x behind |
+| `cpu_work_10us` | 1,122,190 | 708,482 | 797,355 | 1.41x ahead |
+| `cpu_work_100us` | 491,989 | 301,782 | 409,109 | 1.20x ahead |
+| `contended_cpu_10us` | 1,068,299 | 710,214 | 2,426,316 | 2.27x behind |
+| `nested_fanout_4x` | 573,365 | 1,918,439 | 3,550,322 | 6.19x behind |
+| `burst_drain_burst` | 162,250 | 141,537 | 146,406 | 1.11x ahead |
+| `mixed_fast_slow` | 234,390 | 246,336 | 237,386 | 1.01x behind |
 
 ### Latency (p50/p95/p99, microseconds)
 
 | Scenario | Zig | Tokio | Go |
 |---|---|---|---|
-| `cpu_work_10us` | 61/281/346 | 22/113/329 | 44/138/222 |
-| `cpu_work_100us` | 2086/3649/3791 | 3123/4715/4826 | 2107/2709/2926 |
-| `contended_cpu_10us` | 22/121/191 | 40/255/323 | 401/706/1297 |
-| `nested_fanout_4x` | 12/61/110 | 7/22/137 | 5/25/55 |
-| `burst_drain_burst` | 587/1426/1614 | 1488/2110/2835 | 1017/1364/1460 |
-| `mixed_fast_slow` | 10731/19084/20488 | 9934/17068/19425 | 7030/11198/12578 |
+| `cpu_work_10us` | 66/274/348 | 20/100/190 | 34/148/342 |
+| `cpu_work_100us` | 922/2231/2469 | 3235/4969/5114 | 1451/1920/2195 |
+| `contended_cpu_10us` | 22/179/258 | 30/255/329 | 424/734/888 |
+| `nested_fanout_4x` | 6/37/58 | 4/13/54 | 5/49/139 |
+| `burst_drain_burst` | 687/1516/1666 | 783/1418/1564 | 1075/1444/1559 |
+| `mixed_fast_slow` | 10590/17232/18128 | 9068/15292/16714 | 4036/8379/12249 |
 
 ### Interpretation
 
-- Zig wins **4 of 8** scenarios against Go on throughput (up from 3/8 in the
-  prior snapshot — `cpu_work_100us` flipped from 1.06x behind to 1.09x ahead)
-  and **6 of 8** against Tokio.
-- Zig has the best contended per-task latency: p50=22µs on `contended_cpu_10us`
-  beating both Tokio (40µs) and Go (401µs) by a wide margin, with the lowest
-  p95/p99 of all three runtimes — more predictable scheduling at the tail.
-- Go's in-runtime local-P queue continues to win `contended_spawn_8x`,
-  `contended_cpu_10us`, and `nested_fanout_4x`; Tokio wins `nested_fanout_4x`
-  and `mixed_fast_slow` via fiber amortisation.
+- Zig wins **3 of 8** scenarios against Go on throughput (`cpu_work_10us`,
+  `cpu_work_100us`, `burst_drain_burst`) and **6 of 8** against Tokio
+  (`nested_fanout_4x` and `mixed_fast_slow` are the Tokio wins — fiber
+  amortisation).
+- Zig retains the best contended per-task latency: p50=22µs on
+  `contended_cpu_10us` beating Tokio (30µs) and Go (424µs) by wide margins,
+  with the lowest p95/p99 across all three runtimes.
+- Nested-fanout p50 halved from 12µs → 6µs (Zig) as the Phase-1 submitter
+  registration (below) shifted the main thread off the shared inject queue
+  onto an SPSC slot — visible in latency as well as throughput.
+- Go's in-runtime local-P queue continues to dominate `contended_spawn_8x`,
+  `contended_cpu_10us`, and `nested_fanout_4x` on throughput.
+- **2026-04-16 contended-scenarios gap-close** (commits `6029c06..d357bd9`)
+  added `registerSubmitter()` calls in `benchmarks/runtime_compare_zig.zig`
+  for `contended_cpu_10us` (submitter threads) and for the main thread in
+  `nested_fanout_4x` and `mixed_fast_slow`, then plumbed
+  `register_submitters: bool` through `benchmarks/common.zig` so
+  `bench-realistic` uses the same fairness path. Isolated same-session
+  paired A/B deltas on the same ReleaseFast binary: `contended_spawn_8x`
+  +7.8%, `contended_cpu_10us` +4.6%, `nested_fanout_4x` +22.7%,
+  `mixed_fast_slow` +10.9%. No `src/` changes — pure harness fairness fix
+  that exercises the already-shipped per-submitter SPSC queues. Phase-2
+  profile-driven `src/` attacks were skipped: `perf_event_paranoid=3`
+  blocked `perf record` without sudo, and the three relevant closed-plane
+  memories (notifySubmits iter 7–11 + Slice 3a) already rule out the
+  plausible attack surface. See
+  [`docs/performance/contended-scenarios-2026-04-16/FINAL.md`](docs/performance/contended-scenarios-2026-04-16/FINAL.md).
 - Wake coalescing (`wake_coalesce_batch=32`) and per-submitter queues
-  (`registerSubmitter` API) remain the key architectural features driving wins.
-- **Host-state caveat:** Tokio and Go numbers moved ~10–25% lower than the
-  2026-04-15 snapshot in parallel, indicating thermal / CPU-frequency drift
-  rather than regression. Zig's position *relative to the other runtimes* is
-  the trustworthy read; absolute Zig deltas vs the 2026-04-15 snapshot are
-  not directly comparable.
+  (`registerSubmitter` API) remain the key architectural features driving
+  the Tokio wins and narrowing the Go gap.
+- **Host-state caveat:** Go throughput moved +30% to +75% higher on this
+  snapshot vs the 2026-04-15 snapshot (`flood_1m` 772K → 1.35M,
+  `contended_cpu_10us` 1.81M → 2.43M) — thermal / CPU-frequency drift, not
+  a Go change. `flood_1m` therefore flipped from Zig 1.25x ahead to 1.34x
+  behind on cross-snapshot math, but the Zig number itself moved only +4%.
+  Read multipliers within a single snapshot; absolute Zig deltas vs
+  2026-04-15 mix Phase-1 gains with host drift and cannot be cleanly
+  separated.
 - QS-003 `Core.runTask` decomposition landed at `a0259e6` with a same-session
   paired A/B showing +16.3% / +11.7% on CI-safe scenarios vs the immediate
-  predecessor commit — the post-gap-closure Zig numbers here bake those wins in.
+  predecessor commit — baked into the Zig numbers here.
 - Deltas vs the prior 0.15.2 snapshot are tracked in
   [`docs/performance/appsec-fixes-2026-04-15/FINAL.md`](docs/performance/appsec-fixes-2026-04-15/FINAL.md),
   which also carries the same-compiler bisect (pre-appsec `e9b6b2a` vs
