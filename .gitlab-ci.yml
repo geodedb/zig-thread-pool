@@ -258,3 +258,58 @@ scale-bench-manual:
     - when: manual
       allow_failure: true
   needs: ["zig-build-0.15.2"]
+
+# ---------------------------------------------------------------
+# ThreadSanitizer soak — scheduled / on-demand.
+#
+# These jobs install Zig 0.16.0 directly (the catalog image is still on
+# 0.15.2; the codebase moved to 0.16.0 on main). TSan warnings are
+# never "just noise" for a concurrency primitive — any finding is a
+# real signal. Because TSan instrumentation is expensive, we don't run
+# these on every MR. They run on schedule, default branch, or when
+# RUN_TSAN=true is set on the pipeline.
+#
+# Current state on main (2026-04-15): zero warnings across test,
+# test-integration, test-stress under TSan. See
+# docs/performance/appsec-fixes-2026-04-15/TSAN-findings.md.
+# ---------------------------------------------------------------
+
+.tsan-rules: &tsan-rules
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_TSAN == "true"'
+  - when: manual
+    allow_failure: true
+
+.tsan-base:
+  image: "ubuntu:24.04"
+  stage: test
+  interruptible: true
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential
+    - bash scripts/install-zig.sh 0.16.0
+    - export PATH="$(pwd)/zig-0.16.0:$PATH"
+    - zig version
+  rules: *tsan-rules
+
+tsan-stress-soak:
+  extends: .tsan-base
+  script:
+    # Run each suite under TSan three times; a single pass takes ~15s so
+    # three back-to-back passes give longer interleaving coverage.
+    - for i in 1 2 3; do echo "--- soak pass $i ---"; zig build test -Dtsan --summary all; done
+    - for i in 1 2 3; do echo "--- integration soak pass $i ---"; zig build test-integration -Dtsan --summary all; done
+    - for i in 1 2 3; do echo "--- stress soak pass $i ---"; zig build test-stress -Dtsan --summary all; done
+  timeout: 30m
+
+tsan-fuzz:
+  extends: .tsan-base
+  variables:
+    FUZZ_SEED: "1"
+    FUZZ_ITERATIONS: "5000"
+  script:
+    - zig build fuzz -Dtsan
+    - FUZZ_SEED=2 zig build fuzz -Dtsan
+    - FUZZ_SEED=3 zig build fuzz -Dtsan
+  timeout: 30m

@@ -127,12 +127,60 @@ The `CLAUDE.md § Current Direct Runtime Snapshot` numbers were captured at comm
 
 The two double-digit regressions (`contended_spawn_8x`, `cpu_work_10us`) are not attributable to a single cause: the intermediate per-step bench dispositions (above) show clean `work_stealing` path effects, so the shift appears to be compiler-driven (0.15.2 → 0.16). Re-running `bench-runtime-compare` on the pre-appsec commit under zig 0.16 would isolate the compiler contribution — recommended for a future CLAUDE.md refresh.
 
+## Bisect — AppSec vs compiler contribution (same 0.16 compiler)
+
+To separate the remediation effect from the zig 0.15.2 → 0.16 compiler shift, `bench-runtime-compare` was captured at **`e9b6b2a`** (origin/main, pre-AppSec, zig 0.16.0) and compared against **`8cf119d`** (post-AppSec, zig 0.16.0). Same compiler on both sides. Raw data: `BISECT-e9b6b2a-runtime-comparison.json`.
+
+### Same-compiler Zig throughput delta (pre-appsec → post-appsec)
+
+| Scenario | Pre (e9b6b2a) | Post (8cf119d) | Δ % | Attribution |
+|---|---:|---:|---:|---|
+| `burst_drain_burst` | 161,949 | 162,024 | **+0.0%** | appsec-neutral |
+| `contended_cpu_10us` | 947,480 | 970,439 | **+2.4%** | appsec-neutral-to-positive |
+| `flood_1m` | 1,158,012 | 1,074,269 | −7.2% | appsec |
+| `cpu_work_10us` | 1,044,482 | 982,714 | −5.9% | appsec |
+| `cpu_work_100us` | 458,215 | 416,921 | −9.0% | appsec |
+| `nested_fanout_4x` | 605,172 | 538,931 | −10.9% | appsec |
+| `mixed_fast_slow` | 259,377 | 230,765 | −11.0% | appsec |
+| `contended_spawn_8x` | 997,631 | 880,038 | −11.8% | appsec |
+
+### Same-compiler Zig p95 latency delta (µs)
+
+| Scenario | Pre p95 | Post p95 | Δ % |
+|---|---:|---:|---:|
+| `cpu_work_10us` | 266 | 226 | **−15.0%** (improvement) |
+| `burst_drain_burst` | 1,557 | 1,546 | −0.7% (flat) |
+| `cpu_work_100us` | 3,660 | 3,474 | **−5.1%** (improvement) |
+| `contended_cpu_10us` | 122 | 137 | +12.3% |
+| `mixed_fast_slow` | 16,311 | 18,086 | +10.9% |
+| `nested_fanout_4x` | 46 | 61 | +32.6% |
+
+### Attribution decomposition (CLAUDE.md 0.15.2 → FINAL 0.16)
+
+| Scenario | Total Δ | Compiler (0.15.2→0.16) | AppSec (pre→post) | Dominant |
+|---|---:|---:|---:|---|
+| `flood_1m` | +4.8% | +12.0% | −7.2% | **compiler** +, appsec − |
+| `contended_spawn_8x` | −16.6% | −5.5% | −11.8% | **appsec** |
+| `cpu_work_10us` | −21.5% | −16.6% | −5.9% | **compiler** |
+| `cpu_work_100us` | −8.7% | +0.3% | −9.0% | **appsec** |
+| `contended_cpu_10us` | −3.6% | −5.9% | +2.4% | **compiler** |
+| `nested_fanout_4x` | +9.9% | +23.4% | −10.9% | **compiler** + dominates |
+| `burst_drain_burst` | −1.0% | −1.1% | +0.0% | compiler (both flat) |
+| `mixed_fast_slow` | +3.1% | +15.8% | −11.0% | **compiler** + dominates |
+
+**Honest characterisation of the AppSec remediation cost:** 5–12% throughput regression on six of eight scenarios under the same compiler. This is a genuine performance cost, not noise. Scenarios that regressed: `flood_1m`, `cpu_work_10us`, `cpu_work_100us`, `nested_fanout_4x`, `mixed_fast_slow`, `contended_spawn_8x`. Two scenarios were appsec-neutral (`burst_drain_burst` flat, `contended_cpu_10us` +2.4% improvement).
+
+**Why per-step perf-gates read "clean":** each fix's narrow before→after diff fell within the high run-to-run variance of the micro-bench scenarios (25–37% BASELINE CV on `conn_churn_seq`). The cumulative effect across all seven fixes only becomes visible in an end-to-end comparison on the more stable `bench-runtime-compare` realistic scenarios. A future plan should include a full runtime-compare before each fix series begins, not just `bench` + `bench-realistic`.
+
+**Correctness-vs-performance tradeoff accepted:** the remediation closes one Critical memory-safety bug (F-001 cross-pool OOB → ReleaseFast UB), two High data-race / UAF bugs (F-002 / F-003), and three Medium robustness bugs (F-004 / F-005 / F-006). The 5–12% throughput cost is the overhead of the pool-identity check on every TLS-cached submit (F-001), the CAS claim on every `releaseSubmitter` (F-005), and the per-slot atomic access on the freelist (F-003). These are security-essential, not gratuitous. If a future optimisation pass reclaims some of this cost — e.g. per-thread-per-pool TLS without the identity check on the hottest loop — the safety properties should be preserved end-to-end (TSan clean + fuzz clean invariants).
+
 ## Recommended follow-ups
 
-1. **Bisect the `contended_spawn_8x` and `cpu_work_10us` shifts**: capture a `bench-runtime-compare` snapshot at origin/main (commit `e9b6b2a` — zig 0.16 baseline, pre-appsec) and diff it against the current FINAL numbers. If the shift lives there, it's compiler; if it lives in the appsec diffs, reopen.
-2. **Extend stress-suite TSan duration**: current runs pass in ~15s. A 30–60s soak per scenario on nightly CI would probe lower-probability interleavings.
-3. **Fuzz harness under TSan**: `zig build fuzz -Dtsan` with 5000 iterations would exercise scheduler interleavings the bounded integration suite does not reach. The harness currently pins scenarios to `work_stealing` (the variant that actually drains submitter queues); running it under `global_queue` hangs shutdown, documented in `tests/fuzz/pool_fuzz.zig` as a known limitation.
-4. **Update CLAUDE.md runtime snapshot** to reference the zig 0.16 numbers (this file) rather than the stale 0.15.2 numbers.
+1. ~~**Bisect `contended_spawn_8x` / `cpu_work_10us` shifts**: compiler vs appsec.~~ ✅ Done (see section above). `contended_spawn_8x` is AppSec-dominated; `cpu_work_10us` is compiler-dominated.
+2. **Extend stress-suite TSan duration on CI**: added `tsan-stress-soak` and `tsan-fuzz` jobs to `.gitlab-ci.yml` (scheduled / default-branch / on-demand via `RUN_TSAN=true`). Three back-to-back soak passes per suite.
+3. ~~**Fuzz harness under TSan**~~: see (2) — `tsan-fuzz` job runs `zig build fuzz -Dtsan` against three seeds at `FUZZ_ITERATIONS=5000`.
+4. ✅ **CLAUDE.md runtime-comparison table refreshed** to the 0.16 post-appsec numbers.
+5. **Optional optimisation pass** — reclaim the 5–12% regression on the six affected scenarios while preserving TSan/fuzz safety invariants. Candidates: consolidate the F-001 pool-identity check into a per-cpu cache; reduce the F-005 CAS from full-barrier to `.acquire` on the load side; inline the F-003 `.monotonic` accesses behind a build flag for single-pool workloads.
 
 ## Commit ledger
 
