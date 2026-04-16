@@ -7,6 +7,12 @@ pub const Accounting = struct {
     total_alloc_count: *std.atomic.Value(u64),
     live_bytes: *std.atomic.Value(u64),
     peak_live_bytes: *std.atomic.Value(u64),
+    /// OBSERVABILITY-PIVOT / R-10: pool-wide memory budget in bytes.
+    /// 0 means "unlimited" (preserves pre-R-10 behaviour).  When > 0,
+    /// `reserve(bytes)` must be called before `recordAlloc(bytes)` on
+    /// the growth path; `reserve` returns `error.PoolMemoryBudgetExceeded`
+    /// if the allocation would push `live_bytes` past the budget.
+    max_pool_memory_bytes: u64 = 0,
 
     pub fn recordAlloc(self: Accounting, bytes: usize) void {
         const amount = @as(u64, @intCast(bytes));
@@ -20,6 +26,21 @@ pub const Accounting = struct {
         const amount = @as(u64, @intCast(bytes));
         _ = self.total_free_bytes.fetchAdd(amount, .monotonic);
         _ = self.live_bytes.fetchSub(amount, .monotonic);
+    }
+
+    /// OBSERVABILITY-PIVOT / R-10: reservation check. Zero-budget is the
+    /// fast path (single branch, no atomic read). When a budget is set,
+    /// returns `error.PoolMemoryBudgetExceeded` if the prospective
+    /// allocation would push `live_bytes` past `max_pool_memory_bytes`.
+    /// Intended for runtime-growing allocations (scratch arenas); init-
+    /// time allocations are deterministic and bypass this check.
+    pub fn reserve(self: Accounting, bytes: usize) error{PoolMemoryBudgetExceeded}!void {
+        if (self.max_pool_memory_bytes == 0) return;
+        const amount = @as(u64, @intCast(bytes));
+        const current = self.live_bytes.load(.monotonic);
+        if (current + amount > self.max_pool_memory_bytes) {
+            return error.PoolMemoryBudgetExceeded;
+        }
     }
 
     pub fn updatePeak(counter: *std.atomic.Value(u64), value: u64) void {
@@ -108,6 +129,10 @@ pub const WorkerScratch = struct {
 
     fn ensureBuffer(self: *WorkerScratch) !void {
         if (self.cap_bytes == 0 or self.buffer != null) return;
+        // OBSERVABILITY-PIVOT / R-10: check the pool-wide memory budget
+        // before consuming allocator memory. Zero-budget (the default)
+        // takes the single-branch fast path inside `reserve`.
+        try self.accounting.reserve(self.cap_bytes);
         const buf = try self.allocator.alloc(u8, self.cap_bytes);
         self.accounting.recordAlloc(buf.len);
         self.buffer = buf;

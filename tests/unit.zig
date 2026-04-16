@@ -574,6 +574,75 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
     try std.testing.expectEqual(@as(u64, 80), stats.task_wait_ns.count);
 }
 
+test "memory_budget_used_bytes mirrors live_bytes when budget is unlimited" {
+    // OBSERVABILITY-PIVOT / R-10: default `max_pool_memory_bytes = 0`
+    // (unlimited) must preserve pre-R-10 behaviour — scratch
+    // allocations succeed unconditionally and `memory_budget_used_bytes`
+    // reports the same number as `live_bytes`.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .worker_scratch_cap_bytes = 4096,
+        // max_pool_memory_bytes defaults to 0 (unlimited)
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var ctx = common.ScratchTaskContext{ .counter = &counter, .bytes = 256 };
+    for (0..8) |_| {
+        _ = try pool.submit(common.scratchTask, @ptrCast(&ctx), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(stats.live_bytes, stats.memory_budget_used_bytes);
+    try std.testing.expect(stats.live_bytes > 0);
+}
+
+test "max_pool_memory_bytes rejects scratch growth past budget" {
+    // OBSERVABILITY-PIVOT / R-10: setting a tiny budget causes the
+    // scratch arena's `ensureBuffer` allocation to return
+    // `error.PoolMemoryBudgetExceeded`; the error bubbles out of
+    // `allocScratch` and the task gracefully continues (the scratch
+    // task uses `catch {}` so this is observable via the counter
+    // incrementing 0 for scratch allocs but the task itself still
+    // executing). Most importantly, `memory_budget_used_bytes` stays
+    // <= budget + slack.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .worker_scratch_cap_bytes = 64 * 1024,
+        // Budget is 1 byte — effectively "no scratch growth allowed".
+        // Init-time allocations (workers, queues, descriptors) are
+        // exempt from the budget per the R-10 design note.
+        .max_pool_memory_bytes = 1,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    var ctx = common.ScratchTaskContext{ .counter = &counter, .bytes = 256 };
+    for (0..4) |_| {
+        _ = try pool.submit(common.scratchTask, @ptrCast(&ctx), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    // The task always runs (scratch allocation uses `catch {}`), so
+    // the counter advances even when the scratch alloc was rejected.
+    try std.testing.expectEqual(@as(u64, 4), counter.value.load(.acquire));
+
+    const stats = pool.statsSnapshot();
+    // No scratch arena was successfully allocated because the budget
+    // (1 byte) is smaller than `worker_scratch_cap_bytes` (64 KiB).
+    // The per-worker scratch_current_bytes therefore stays at 0.
+    var scratch_total: u64 = 0;
+    for (stats.worker_stats) |ws| scratch_total += ws.scratch_current_bytes;
+    try std.testing.expectEqual(@as(u64, 0), scratch_total);
+}
+
 test "wake-latency histogram populates under realistic load" {
     // OBSERVABILITY-PIVOT / R-03: when timestamps are enabled, the pool
     // records the delta between parking on `park_cond.timedWait` and

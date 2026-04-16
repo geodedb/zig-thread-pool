@@ -222,6 +222,21 @@ pub const Config = struct {
     /// `queue_capacity` — this is transient per-task memory, not queue
     /// storage.
     worker_scratch_cap_bytes: usize = 64 * 1024,
+    /// OBSERVABILITY-PIVOT / R-10: pool-wide memory budget in bytes.
+    /// When `> 0`, scratch-arena allocations that would push
+    /// `Stats.live_bytes` above this bound return `error.PoolMemoryBudgetExceeded`
+    /// instead of hitting the allocator. `Stats.memory_budget_used_bytes`
+    /// mirrors `live_bytes` so operators can watch headroom.
+    ///
+    /// The budget is *soft* in the sense that it only gates
+    /// runtime-growing allocations (worker scratch arenas).
+    /// Init-time allocations — workers, queues, descriptors — are
+    /// deterministic from the other `Config` fields and are *not*
+    /// checked against this budget; operators who want a hard total
+    /// bound must size their other fields accordingly.
+    ///
+    /// Default `0` = unlimited (preserves pre-R-10 behaviour).
+    max_pool_memory_bytes: u64 = 0,
     /// How long a worker spins before parking on the wake condvar when
     /// no work is visible.  Lower values reduce wake latency on
     /// bursty workloads; higher values reduce CPU burn.  Tuned in
@@ -788,6 +803,14 @@ pub const Stats = struct {
     /// Populated when `Config.timestamp_mode == .full`; zero-valued
     /// otherwise.
     wake_latency_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-10: bytes currently counted against
+    /// `Config.max_pool_memory_bytes`.  Mirrors `live_bytes` — they
+    /// refer to the same accounting surface — but is exposed separately
+    /// so operators can read "budget used" without having to know the
+    /// budget happens to be implemented via the allocator-tracking
+    /// counters. Always equals `live_bytes` (even when the budget is 0
+    /// / unlimited).
+    memory_budget_used_bytes: u64 = 0,
     /// OS-level memory snapshot.  See `ProcessMemoryStats`.
     memory: ProcessMemoryStats = .{},
     /// Per-worker statistics, indexed by worker_index.  Slice points

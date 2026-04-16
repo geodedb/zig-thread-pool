@@ -640,6 +640,10 @@ const Core = struct {
             .total_alloc_count = &self.counters.total_alloc_count,
             .live_bytes = &self.counters.live_bytes,
             .peak_live_bytes = &self.counters.peak_live_bytes,
+            // OBSERVABILITY-PIVOT / R-10: thread the per-pool memory
+            // budget through to the Accounting struct so `reserve`
+            // can gate scratch allocations.
+            .max_pool_memory_bytes = normalized.max_pool_memory_bytes,
         };
 
         self.recordOwnedAlloc(self.workers.len * @sizeOf(Worker));
@@ -1208,6 +1212,9 @@ const Core = struct {
             .blocking_wait_ns = if (per_lane_active) merged_blocking_wait.summary() else .{},
             .blocking_exec_ns = if (per_lane_active) merged_blocking_exec.summary() else .{},
             .wake_latency_ns = merged_wake.summary(),
+            // OBSERVABILITY-PIVOT / R-10: mirrors `live_bytes`; see the
+            // field doc on `Stats.memory_budget_used_bytes`.
+            .memory_budget_used_bytes = self.counters.live_bytes.load(.acquire),
             .memory = memory,
             .worker_stats = self.worker_stats_buffer,
         };
