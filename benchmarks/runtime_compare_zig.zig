@@ -667,6 +667,8 @@ fn runMixedFastSlowSample(worker_count: usize) !SampleResult {
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 4096,
     });
     defer pool.deinit();
 
@@ -687,6 +689,9 @@ fn runMixedFastSlowSample(worker_count: usize) !SampleResult {
 
     var wg = pool.waitGroup();
     const start_ns = clock.nanoTimestamp();
+
+    const slot = try pool.registerSubmitter();
+    defer pool.releaseSubmitter(slot);
 
     for (mixed_ctxs, 0..) |*ctx, i| {
         submitted_at[i] = nowNs();
