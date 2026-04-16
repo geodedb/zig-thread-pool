@@ -1359,7 +1359,15 @@ const Core = struct {
                     }
                 }
             }
-            if (!queued) {
+            // Submitter-queue push is gated on `uses_local` because
+            // `tryDrainLaneForWorker` only consumes submitter_queues on the
+            // work-stealing / lane-extension path (line 1711-ish). With
+            // global_queue, workers pop straight from `lane_inject`, so
+            // anything landing in `submitter_queues` would sit there forever
+            // and deadlock callers waiting on the push with
+            // `backpressure = .block`. Keeping the drain and submit sides
+            // symmetric makes `registerSubmitter` a no-op under global_queue.
+            if (uses_local and !queued) {
                 if (self.tlsSubmitterIndexFor()) |si| {
                     queued = self.submitter_queues[si].tryPushBottom(entry);
                 }
