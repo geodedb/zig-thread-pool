@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
             .local_queue_capacity = 256,
             .sleep_ns = 10_000,
             .scratch_bytes = 4096,
+            .register_submitters = true,
         },
         .{
             .name = "cpu_work_100us",
@@ -33,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
             .local_queue_capacity = 256,
             .sleep_ns = 100_000,
             .scratch_bytes = 16384,
+            .register_submitters = true,
         },
         .{
             .name = "contended_cpu_10us",
@@ -64,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
             .local_queue_capacity = 256,
             .idle_gap_ns = 10 * std.time.ns_per_ms,
             .sleep_ns = 50_000,
+            .register_submitters = true,
         },
     };
     const variants = [_]thread_pool.SchedulerVariant{.work_stealing};
@@ -84,6 +87,8 @@ fn runMixedWorkload(allocator: std.mem.Allocator, workers: usize, output_path: ?
         .queue_capacity = 2048,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
 
@@ -126,6 +131,9 @@ fn runMixedWorkload(allocator: std.mem.Allocator, workers: usize, output_path: ?
             ctx.completed_at_ns.* = nowNs();
         }
     }.run;
+
+    const mixed_slot_opt: ?usize = pool.registerSubmitter() catch null;
+    defer if (mixed_slot_opt) |slot| pool.releaseSubmitter(slot);
 
     var wg = pool.waitGroup();
     const wall_start = nowNs();
@@ -191,6 +199,8 @@ fn runLaneIsolation(allocator: std.mem.Allocator, workers: usize, output_path: ?
         .scheduler_variant = .work_stealing,
         .allow_blocking_lane = true,
         .blocking_workers = blocking_workers,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 1024,
     });
     defer pool.deinit();
 
@@ -259,6 +269,13 @@ fn runLaneIsolation(allocator: std.mem.Allocator, workers: usize, output_path: ?
             }
         }
     }.run, .{ &pool, slow_ctxs, slow_submitted, &wg });
+
+    // Default-lane producer (main thread) registers to exercise the per-
+    // submitter SPSC queue path. The blocking-lane slow_thread above does
+    // not register — submitter_queues are consulted only on the default-
+    // lane submit path in pool.zig, so registration there is a no-op.
+    const lane_slot_opt: ?usize = pool.registerSubmitter() catch null;
+    defer if (lane_slot_opt) |slot| pool.releaseSubmitter(slot);
 
     for (fast_ctxs, 0..) |*ctx, i| {
         fast_submitted[i] = nowNs();

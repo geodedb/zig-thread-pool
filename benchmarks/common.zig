@@ -305,6 +305,8 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
 fn submitRange(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, tasks: []BenchTaskCtx, submit_latencies_ns: []u64, submitter_count: usize, lane: thread_pool.TaskLane, register: bool) !void {
     var wg = pool.waitGroup();
     if (submitter_count <= 1) {
+        const slot_opt: ?usize = if (register) pool.registerSubmitter() catch null else null;
+        defer if (slot_opt) |slot| pool.releaseSubmitter(slot);
         var i: usize = 0;
         while (i < tasks.len) : (i += 1) {
             const submit_started = nowNs();
