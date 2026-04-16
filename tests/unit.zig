@@ -99,6 +99,93 @@ test "waitable handle generation increments across reuses" {
     }
 }
 
+// SEC-018 / F-008: concurrent double-wait on the same TaskHandle.
+//
+// Pre-fix, two threads that raced on the same waitable handle could both
+// pass the "state == .completed" check and both call releaseDescriptor,
+// producing a double-push to the freelist and (depending on ABA timing) a
+// double-free the allocator never sees because the freelist is a bounded
+// pool.  Post-fix, `releaseDescriptor` is CAS-guarded on
+// `descriptor.state` so exactly one caller performs the release; the other
+// finds `.free` with a matching generation and returns success.
+test "SEC-018 concurrent double-wait on same handle is safe" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
+    defer pool.deinit();
+
+    const Barrier = struct {
+        pool_ptr: *thread_pool.ThreadPool,
+        handle: thread_pool.types.TaskHandle,
+        start_gate: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        results: [2]anyerror!void = .{ {}, {} },
+
+        fn waiter(self: *@This(), slot: usize) void {
+            // Spin until the main thread releases both waiters together so
+            // they race the completed broadcast under the completion_mutex.
+            while (self.start_gate.load(.acquire) == 0) {
+                std.atomic.spinLoopHint();
+            }
+            self.results[slot] = self.pool_ptr.wait(self.handle);
+        }
+    };
+
+    // Run multiple rounds to shake out the race; each round submits a
+    // fresh waitable handle and fires two waiter threads at it.
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        var counter = common.Counter{};
+        const handle = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .waitable = true });
+
+        var barrier = Barrier{ .pool_ptr = &pool, .handle = handle };
+
+        const t0 = try std.Thread.spawn(.{}, Barrier.waiter, .{ &barrier, @as(usize, 0) });
+        const t1 = try std.Thread.spawn(.{}, Barrier.waiter, .{ &barrier, @as(usize, 1) });
+
+        // Release both waiters simultaneously.
+        barrier.start_gate.store(1, .release);
+
+        t0.join();
+        t1.join();
+
+        // Both waiters must see success.  If the CAS guard regressed, one
+        // would return error.InvalidHandle or (worse) the pool would
+        // double-push to the freelist — the DebugAllocator check at
+        // pool.deinit() plus the task_desc_live invariant would catch the
+        // latter on the stats snapshot below.
+        try barrier.results[0];
+        try barrier.results[1];
+        try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
+    }
+
+    // After all rounds, task_desc_live must be zero — no leaked descriptors.
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
+}
+
+// SEC-018: back-to-back sequential wait() on the same handle must not
+// panic and must not double-free the descriptor slot.  Post-fix, the
+// second wait() observes `.free` with a matching generation (if the slot
+// hasn't been reused) and returns success, or observes a generation
+// mismatch and returns InvalidHandle.  Either outcome is acceptable; what
+// must NOT happen is a panic or a double freelist push.
+test "SEC-018 sequential double-wait on same handle does not panic" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    const handle = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .waitable = true });
+    try pool.wait(handle);
+
+    // Second wait() is a no-op or InvalidHandle — both are acceptable
+    // post-SEC-018.  The key invariant is "no panic, no double-free".
+    pool.wait(handle) catch |err| {
+        try std.testing.expectEqual(@as(anyerror, error.InvalidHandle), err);
+    };
+
+    try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
+}
+
 test "recursive submission through local queues does not deadlock" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.work_stealing));
     defer pool.deinit();

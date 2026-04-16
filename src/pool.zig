@@ -729,10 +729,28 @@ const Core = struct {
             if (descriptor.generation != handle.generation) return error.InvalidHandle;
             switch (descriptor.state.load(.acquire)) {
                 .completed, .cancelled => {
+                    // SEC-018 (F-008): use a CAS to drive the
+                    // terminal `.completed|.cancelled → .free` transition
+                    // so exactly one concurrent `wait()` caller releases the
+                    // descriptor slot. Callers that lose the CAS return
+                    // success with no side effect — the task demonstrably
+                    // completed, and returning `error.InvalidHandle` there
+                    // would be a lie. `releaseDescriptor` itself is also
+                    // CAS-guarded as defense-in-depth, so the direct call
+                    // here is safe even if the state flipped between the
+                    // load above and the store inside.
                     self.releaseDescriptor(handle.index);
                     return;
                 },
-                .free => return error.InvalidHandle,
+                .free => {
+                    // Generation still matches but state is .free: another
+                    // `wait()` on this handle already won the release CAS.
+                    // This is the post-SEC-018 success path for the losing
+                    // caller of a concurrent double-wait: both callers
+                    // observed that the task completed, so both return
+                    // success.
+                    return;
+                },
                 else => self.sync.completion_cond.wait(&self.sync.completion_mutex),
             }
         }
@@ -1838,15 +1856,61 @@ const Core = struct {
         }
     }
 
+    /// Release a completed or cancelled descriptor back to the freelist.
+    ///
+    /// SEC-018: uses a CAS on `descriptor.state` to guarantee exactly-once
+    /// release semantics. The previous unconditional `.store(.free)` raced
+    /// with concurrent `wait()` callers on the same handle — the first
+    /// caller would `releaseDescriptor`, a subsequent caller would observe
+    /// the slot already `.free` and return `error.InvalidHandle`, and a
+    /// third actor (`acquireDescriptor`) could reuse the slot in between,
+    /// causing the second `wait()` to silently succeed on an unrelated
+    /// task (ABA-style confusion on the reused index/generation pair).
+    ///
+    /// Post-fix, only the thread whose CAS from `.completed`/`.cancelled`
+    /// to `.free` succeeds performs the freelist push and backpressure
+    /// signal. Contending threads observe a failed CAS and return without
+    /// side effect; their `wait()` call still returns `void` (success) from
+    /// the outer site, because the task demonstrably completed.
+    ///
+    /// Idempotent callers: `runTask` (non-waitable path) and `wait()` may
+    /// both reach this function; exactly one of them succeeds its CAS.
+    /// `cancelQueuedTasks` and `shutdown` call this after setting state
+    /// themselves — they expect the CAS to succeed. `shutdown`'s path
+    /// goes through `.cancelled` so it competes with `wait()` the same
+    /// way `runTask`'s `.completed` path does.
     fn releaseDescriptor(self: *Core, descriptor_index: u32) void {
         var descriptor = &self.descriptors[descriptor_index];
+
+        // Attempt the terminal transition. Only exactly one caller wins; the
+        // others bail out without touching freelist state.
+        //
+        // `.reserved` / `.queued` are accepted because enqueuePush holds an
+        // errdefer that calls releaseDescriptor when a submit fails partway.
+        // In those cases no concurrent actor observes the slot — the CAS
+        // will succeed on the first attempt. Post-`.running` (i.e. a task
+        // that is currently executing), only the worker that set
+        // `.completed`/`.cancelled` calls this function via runTask, so the
+        // CAS competes only with concurrent `wait()` callers.
+        var observed = descriptor.state.load(.acquire);
+        while (true) {
+            switch (observed) {
+                .reserved, .queued, .completed, .cancelled => {},
+                .free, .running => return, // another thread already released, or still running
+            }
+            if (descriptor.state.cmpxchgWeak(observed, .free, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            break;
+        }
+
         descriptor.task_fn = null;
         descriptor.ctx = null;
         descriptor.options = .{};
         descriptor.submit_ns = 0;
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
-        descriptor.state.store(.free, .release);
         _ = self.counters.task_desc_live.fetchSub(1, .monotonic);
 
         while (true) {

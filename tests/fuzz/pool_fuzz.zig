@@ -43,6 +43,13 @@ const OpKind = enum(u8) {
     release,
     shutdown_drain,
     shutdown_cancel,
+    // SEC-018 / F-008: concurrent double-wait on a waitable handle.  The
+    // op spawns a pair of threads that each call `pool.wait(handle)` on
+    // the same handle.  Pre-fix, this could double-release the descriptor
+    // slot; post-fix, the release is CAS-guarded.  The invariant under
+    // test here is simply "no crash, no allocator leak" — the per-iter
+    // invariant block at the bottom of `runOne` catches both.
+    double_wait,
 };
 
 fn noop(ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
@@ -153,6 +160,26 @@ fn runOne(rng: std.Random, iter: u32, seed: u64) !void {
                     if (e == error.Timeout) return error.FuzzShutdownCancelTimeout;
                 };
                 shut_down = true;
+            },
+            .double_wait => {
+                // SEC-018: submit a waitable handle then fire two threads
+                // that race to wait on it.  Ignore submit errors (queue
+                // full, shutdown in progress) — the op is best-effort.
+                const handle = pool.submit(noop, @ptrCast(&pool), .{ .waitable = true }) catch continue;
+                const DoubleWait = struct {
+                    fn run(p: *thread_pool.ThreadPool, h: thread_pool.types.TaskHandle) void {
+                        // Success and InvalidHandle are both acceptable;
+                        // the invariant we care about is "no crash".
+                        p.wait(h) catch {};
+                    }
+                };
+                const t0 = std.Thread.spawn(.{}, DoubleWait.run, .{ &pool, handle }) catch continue;
+                const t1 = std.Thread.spawn(.{}, DoubleWait.run, .{ &pool, handle }) catch {
+                    t0.join();
+                    continue;
+                };
+                t0.join();
+                t1.join();
             },
         }
     }
