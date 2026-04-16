@@ -521,6 +521,8 @@ fn runNestedFanout4xSample(worker_count: usize) !SampleResult {
         .queue_capacity = 8192,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 4096,
     });
     defer pool.deinit();
 
@@ -560,6 +562,9 @@ fn runNestedFanout4xSample(worker_count: usize) !SampleResult {
     }
 
     const start_ns = clock.nanoTimestamp();
+
+    const slot = try pool.registerSubmitter();
+    defer pool.releaseSubmitter(slot);
 
     for (parent_ctxs, 0..) |*ctx, i| {
         parent_submitted[i] = nowNs();
