@@ -147,7 +147,6 @@ include:
 
 variables:
   ZIG_VERSION: "0.16.0"
-  ZIG_IMAGE: "registry.gitlab.com/devnw/ci-catalog/zig:0.16.0"
 
 stages:
   - lint
@@ -203,18 +202,34 @@ zig-test-windows-stress-0.16.0:
   needs: ["zig-build-windows-0.16.0"]
 
 # ---------------------------------------------------------------
-# Thread-pool-specific jobs (not covered by the catalog)
+# Thread-pool-specific jobs (not covered by the catalog).
+#
+# We install Zig directly via scripts/install-zig.sh on a stock
+# ubuntu:24.04 image rather than pulling a prebuilt catalog image.
+# The catalog publishes :0.15.2 but not :0.16.0 (as of v1.22.0); the
+# catalog-driven zig-build / zig-test jobs avoid the image entirely
+# and bootstrap zig themselves, so we mirror that pattern here.
 # ---------------------------------------------------------------
 
+.zig-host-base:
+  image: "ubuntu:24.04"
+  interruptible: true
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
+
 cross-check:
-  image: $ZIG_IMAGE
+  extends: .zig-host-base
   stage: test
   script:
     - zig build cross-check
   needs: ["zig-build-0.16.0"]
 
 benchmark-regression:
-  image: $ZIG_IMAGE
+  extends: .zig-host-base
   stage: performance
   script:
     - zig build bench -- --output benchmarks/results/ci-current.json
@@ -226,7 +241,7 @@ benchmark-regression:
   needs: ["zig-build-0.16.0"]
 
 bench-micro:
-  image: $ZIG_IMAGE
+  extends: .zig-host-base
   stage: performance
   script:
     - zig build bench-micro-submit > micro-submit.txt
@@ -245,7 +260,7 @@ bench-micro:
   allow_failure: true # advisory until thresholds are tuned
 
 scale-bench-manual:
-  image: $ZIG_IMAGE
+  extends: .zig-host-base
   stage: performance
   script:
     - timeout 120 zig build scale-bench -- --output benchmarks/results/scale-current.json
@@ -286,15 +301,8 @@ scale-bench-manual:
     allow_failure: true
 
 .tsan-base:
-  image: "ubuntu:24.04"
+  extends: .zig-host-base
   stage: test
-  interruptible: true
-  before_script:
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential
-    - bash scripts/install-zig.sh 0.16.0
-    - export PATH="$(pwd)/zig-0.16.0:$PATH"
-    - zig version
   rules: *tsan-rules
 
 tsan-stress-soak:
