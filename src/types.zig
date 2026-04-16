@@ -1,25 +1,77 @@
 const std = @import("std");
 const sync = @import("sync.zig");
 
+/// Scheduler topology selector.  Picked at `ThreadPool.init` and never
+/// changed afterwards.  All three variants share the public submit/wait
+/// API and differ only in how queues and workers are wired internally.
+///
+/// Pick `global_queue` for simplicity and the lowest RSS baseline,
+/// `work_stealing` for low-contention producer workloads, and
+/// `lane_extension` when the workload has a mix of CPU and blocking
+/// tasks that should run on dedicated worker pools.  See
+/// `docs/SCHEDULER_DECISION.md` for the benchmark-driven comparison.
 pub const SchedulerVariant = enum {
+    /// One bounded FIFO inject queue; fixed worker set drains from it.
+    /// Simplest, no local queues, no steals.
     global_queue,
+    /// Per-worker LIFO slot + bounded local queue; idle workers refill
+    /// from the inject queue and steal from peers.  Tokio-style ring
+    /// queue by default (`Config.queue_kind = .ring`).
     work_stealing,
+    /// `work_stealing` + dedicated blocking-lane workers and a separate
+    /// inject queue for `.lane = .blocking` tasks.  See Slices L1–L4
+    /// in `docs/superpowers/specs/2026-04-15-lane-extension-scheduler-design.md`.
     lane_extension,
 };
 
+/// Lane routing for a single submission.
+///
+/// `default` is the standard CPU lane.  `blocking` is rejected when
+/// `Config.allow_blocking_lane == false` (returns
+/// `error.BlockingLaneDisabled`).  When accepted, a `.blocking` task is
+/// routed to the blocking inject queue and drained only by workers
+/// whose `serves_lane == .blocking`.  Default workers do not steal
+/// blocking work; blocking workers may (always-on) drain default work
+/// when idle.  See `Config.cpu_helps_blocking` for the inverse.
 pub const TaskLane = enum {
     default,
     blocking,
 };
 
+/// Submitter behaviour when a queue is full or the descriptor pool is
+/// exhausted.
+///
+/// # .block deadlock footgun
+/// Submitting from inside a task function (`TaskContext.worker_index`
+/// is set) with `.backpressure = .block` can deadlock if the pool is
+/// saturated — the worker cannot drain the queue because it is itself
+/// blocked on the queue.  `.return_error` is the safe default for
+/// tasks that may re-submit; `.block` is for external-submitter
+/// threads that are provably off the critical path.
 pub const BackpressurePolicy = enum {
+    /// Return `error.QueueFull` / `error.TaskPoolExhausted` immediately
+    /// on the first rejection.  Zero blocking; safe from any context.
     return_error,
+    /// Block the submitter on the lane's backpressure condvar until
+    /// capacity is available.  Never safe to call from a worker thread
+    /// serving the same lane.
     block,
+    /// `.block` with a `SubmitOptions.timeout_ns` deadline.  Returns
+    /// `error.Timeout` if the deadline passes before capacity frees up.
     block_with_timeout,
 };
 
+/// Shutdown semantics selector for `ThreadPool.shutdown`.
+///
+/// `drain` waits for queued and running tasks to complete.
+/// `cancel_pending` sweeps queued tasks into the cancelled state and
+/// lets running tasks finish.  Both then join workers and release
+/// resources.  See `docs/DESIGN.md § Shutdown Semantics`.
 pub const ShutdownMode = enum {
+    /// Reject new submissions; let queued and running work finish.
     drain,
+    /// Reject new submissions; cancel queued tasks; let running
+    /// tasks finish.
     cancel_pending,
 };
 
@@ -57,6 +109,9 @@ pub const TaskState = enum(u8) {
     cancelled,
 };
 
+/// Local-queue implementation for per-worker queues in `work_stealing`
+/// and `lane_extension` schedulers.  Ignored by `global_queue` (which
+/// has no local queues).
 pub const QueueKind = enum {
     /// Chase-Lev work-stealing deque. Correct for single-item steal only.
     chase_lev,
@@ -64,15 +119,52 @@ pub const QueueKind = enum {
     ring,
 };
 
+/// Pool-wide configuration.  Constructed by the caller and passed to
+/// `ThreadPool.init`.  Normalisation happens inside
+/// `Config.normalized()` — callers may pass a partial struct with
+/// defaults.  `Config.validate()` enforces the cross-field invariants
+/// that `normalized()` cannot simply clamp (for example
+/// `lane_extension` requires `blocking_workers > 0`).
+///
+/// # ABI stability
+/// Fields are additive; existing fields keep their defaults across
+/// releases.  Adding a new field with a default preserves source
+/// compatibility for callers using `.{ ... }` struct literal init.
+///
+/// # Cross-field coupling
+/// Several fields only take effect in combination:
+///   - `blocking_workers > 0` requires `allow_blocking_lane = true`
+///     (and vice versa).
+///   - `watchdog_interval_ns > 0` requires `max_overflow_workers > 0`.
+///   - `hot_spinners > 0` requires `wake_every_n_tasks > 0`.
+///   - `blocking_queue_capacity`, `blocking_backpressure`, and
+///     `cpu_helps_blocking` are gated on `blocking_workers > 0`.
+/// `validate()` rejects inconsistent combinations with a typed error.
 pub const Config = struct {
+    /// Minimum number of worker threads spawned at `init`.  0 means
+    /// "same as `max_threads`" (the common case).  Clamped to
+    /// `max_threads` if higher.
     min_threads: usize = 0,
     /// Maximum worker threads. Hard capped at 64 because the steal-scan
     /// non-empty-workers bitmap uses a single u64. `validate()` rejects
     /// values > 64 with `error.TooManyWorkers`. 0 means "auto-detect from
     /// CPU count" in `normalized()`; detected values above 64 are clamped.
     max_threads: usize = 0,
+    /// Capacity of the pool-wide inject queue (default-lane).  Rounded
+    /// up to a power of two by `normalized()` because the underlying
+    /// `BoundedRing` uses bitmask modulo.  Must be > 0; must fit in
+    /// `u32`.  This is the hard cap on *queued* tasks; descriptors are
+    /// separately bounded by `queue_capacity + sum(local_queue_capacity)`.
     queue_capacity: usize = 1024,
+    /// Per-worker local-queue capacity.  Used by `work_stealing` and
+    /// `lane_extension`.  Rounded up to a power of two by `normalized()`.
+    /// Must be > 0.  Larger values reduce inject-queue pressure and
+    /// enable deeper batch-steals but increase the worst-case work
+    /// sitting behind an oversubscribed core.
     local_queue_capacity: usize = 256,
+    /// Max tasks a worker pulls from the inject queue per refill.  0 is
+    /// normalised to 1.  Larger values amortise the inject-queue head
+    /// CAS across more tasks but risk one worker monopolising a burst.
     inject_batch_size: usize = 32,
     /// `releaseDescriptor` signals blocked submitters on backpressure once
     /// per this many releases, rather than on every release. 0 disables
@@ -100,8 +192,22 @@ pub const Config = struct {
     /// `hot_spinners > 0` is rejected by `validate()` — would starve
     /// parked workers on long-running tasks.
     wake_every_n_tasks: u32 = 64,
+    /// Per-worker scratch arena cap in bytes.  Each worker allocates at
+    /// most this many bytes of scratch storage (via `TaskContext.allocScratch`).
+    /// The arena is purged on idle (`idle_purge_after_ns`) or explicitly
+    /// via `ThreadPool.purgeWorkerCaches`.  Not additive with
+    /// `queue_capacity` — this is transient per-task memory, not queue
+    /// storage.
     worker_scratch_cap_bytes: usize = 64 * 1024,
+    /// How long a worker spins before parking on the wake condvar when
+    /// no work is visible.  Lower values reduce wake latency on
+    /// bursty workloads; higher values reduce CPU burn.  Tuned in
+    /// tandem with `spin_before_park_iters`.
     idle_park_after_ns: u64 = 250_000,
+    /// Idle duration after which a worker purges its scratch arena.
+    /// Bounds the "cold cache holding onto per-worker memory" anti-
+    /// pattern observed in long-running daemons (see geode RSS
+    /// regression hypothesis in `docs/GAP_ANALYSIS.md`).
     idle_purge_after_ns: u64 = 5_000_000,
     /// Phase G2 (re-land 2026-04-13): default 0. Once the spin's
     /// `queued_tasks` poll was removed (the dominant cross-core read on
@@ -111,8 +217,15 @@ pub const Config = struct {
     /// reproduce the polless-spin handshake (see tests/stress.zig:516,
     /// :75, :290) but not for normal workloads.
     spin_before_park_iters: usize = 0,
+    /// Hard cap on time `ThreadPool.deinit` waits for running tasks to
+    /// finish before force-joining workers.  Defaults to 30 seconds —
+    /// long enough to absorb a drain pass on realistic workloads,
+    /// short enough to catch a hung task in CI.
     deinit_timeout_ns: u64 = 30_000_000_000,
+    /// Scheduler topology.  See `SchedulerVariant` for the trade-offs.
     scheduler_variant: SchedulerVariant = .global_queue,
+    /// Local-queue implementation.  Only meaningful for `work_stealing`
+    /// and `lane_extension`.  See `QueueKind`.
     queue_kind: QueueKind = .ring,
     /// When true, tasks submitted with `.lane = .blocking` are accepted and
     /// routed to a dedicated blocking-lane inject queue served by the workers
@@ -184,6 +297,11 @@ pub const Config = struct {
     /// `max_threads + max_overflow_workers` must stay ≤ 64 (the
     /// workers_nonempty bitmap width).
     max_overflow_workers: u32 = 0,
+    /// Per-task timestamp capture mode.  `.full` populates wait/exec
+    /// latency histograms (the `Stats.task_wait_ns` / `task_exec_ns`
+    /// output); `.disabled` elides those clock reads for a 40–80ns
+    /// per-task saving on Linux.  See `TimestampMode` for why the
+    /// complete-time read is always kept.
     timestamp_mode: TimestampMode = .full,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
@@ -191,7 +309,16 @@ pub const Config = struct {
     /// only single-item steal is correct and the runtime forces this to 1
     /// via `normalized()`.
     steal_batch_size: usize = 8,
+    /// Maximum number of registered-submitter slots.  0 disables the
+    /// `registerSubmitter` / `releaseSubmitter` API (callers submit via
+    /// the ambient inject queue instead).  Each slot backs an
+    /// independent per-submitter ring queue so one hot producer can't
+    /// monopolise the inject-queue head CAS.  Capped at 64 by
+    /// `normalized()` (bitmap width).
     max_submitter_queues: u32 = 0,
+    /// Capacity of each registered-submitter queue.  0 is normalised to
+    /// `local_queue_capacity`.  Must be > 0 when
+    /// `max_submitter_queues > 0`.  Rounded up to a power of two.
     submitter_queue_capacity: usize = 0,
 
     pub fn normalized(self: Config) Config {
@@ -265,50 +392,157 @@ pub const Config = struct {
     }
 };
 
+/// Per-submission behaviour overrides.  Constructed by the caller and
+/// passed to `ThreadPool.submit` / `trySubmit`.
+///
+/// # Backpressure + deadlock footgun
+/// `backpressure = .return_error` is the only choice that is safe from
+/// inside a task function — `.block` and `.block_with_timeout` can
+/// deadlock when the caller is itself a worker that must drain the
+/// queue to free capacity.  See `BackpressurePolicy`.
+///
+/// # Exclusivity
+/// `waitable = true` and `wait_group != null` are both allowed on the
+/// same submission; the caller may then `wait(handle)` *and* observe
+/// the wait-group.  Cancellation is observed via
+/// `cancellation_token.isCancelled()` checked inside the task function
+/// at safe points.
 pub const SubmitOptions = struct {
+    /// When true, the submission returns a valid `TaskHandle` that
+    /// can be passed to `ThreadPool.wait`.  The descriptor slot is
+    /// NOT released until the first successful `wait()` call — do
+    /// not leak waitable handles or the pool descriptor pool will
+    /// be exhausted.
     waitable: bool = false,
+    /// Optional pool-level completion counter.  `WaitGroup.add(1)` is
+    /// called on successful submission and `WaitGroup.done()` on
+    /// task completion / cancellation.  Caller-owned; must outlive
+    /// all submissions that reference it.
     wait_group: ?*WaitGroup = null,
+    /// Optional cancellation token polled inside the task function.
+    /// Caller-owned.  Setting `token.cancel()` after submission marks
+    /// queued tasks as cancelled and allows running tasks to observe
+    /// the signal and exit early.
     cancellation_token: ?*CancellationToken = null,
+    /// Behaviour when the target queue or descriptor pool is full.
+    /// See `BackpressurePolicy`.  Default `.return_error` is the
+    /// deadlock-safe choice; `.block` / `.block_with_timeout` are
+    /// only safe from non-worker threads.
     backpressure: BackpressurePolicy = .return_error,
+    /// Deadline for `.block_with_timeout`.  Ignored otherwise.
     timeout_ns: ?u64 = null,
+    /// Lane routing.  See `TaskLane`.  `.blocking` requires
+    /// `Config.allow_blocking_lane = true`.
     lane: TaskLane = .default,
 };
 
+/// Opaque handle to a waitable submission.  Produced by
+/// `ThreadPool.submit` only when `SubmitOptions.waitable == true`; all
+/// other submissions return `TaskHandle.invalid()`.
+///
+/// The handle carries `{index, generation}` — the descriptor slot and
+/// a per-slot monotonically increasing counter.  `wait()` compares
+/// `handle.generation` against the descriptor's current generation to
+/// detect stale handles (the slot was reused after a prior waiter
+/// released it).
+///
+/// # Exactly-once wait (SEC-018 / F-008)
+/// `wait()` is safe to call concurrently on the same handle.  The
+/// underlying release is CAS-guarded; exactly one caller performs
+/// the descriptor release, others observe success.  See
+/// `docs/security/REV-001.md` + `docs/DESIGN.md § Descriptor reuse`.
 pub const TaskHandle = struct {
+    /// Descriptor slot index.  `std.math.maxInt(u32)` means "invalid /
+    /// non-waitable submission".
     index: u32 = std.math.maxInt(u32),
+    /// Per-slot generation counter.  Incremented each time the slot is
+    /// re-acquired; `wait()` rejects handles whose generation no longer
+    /// matches the descriptor with `error.InvalidHandle`.
     generation: u64 = 0,
+    /// Set iff this handle was produced by a `.waitable = true` submit.
     waitable: bool = false,
 
+    /// Return an invalid handle suitable as a sentinel / default init.
     pub fn invalid() TaskHandle {
         return .{};
     }
 
+    /// True iff the handle was produced by a successful waitable
+    /// submission.  `wait()` on an invalid handle returns
+    /// `error.InvalidHandle`.
     pub fn isValid(self: TaskHandle) bool {
         return self.waitable and self.index != std.math.maxInt(u32);
     }
 };
 
+/// Caller-owned cooperative cancellation primitive.  Pass a pointer
+/// via `SubmitOptions.cancellation_token`; the task function must
+/// poll `isCancelled()` at safe cancellation points (cancellation is
+/// not preemptive).  `cancel()` also causes queued-but-not-yet-started
+/// tasks to be transitioned to `.cancelled` during drain.
 pub const CancellationToken = struct {
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Mark the token as cancelled.  Ordered with `.release` so
+    /// readers via `isCancelled()` see every preceding write.
     pub fn cancel(self: *CancellationToken) void {
         self.cancelled.store(true, .release);
     }
 
+    /// Non-blocking check.  Idiomatic use inside a task is to poll at
+    /// loop boundaries and `return` early on true.
     pub fn isCancelled(self: *const CancellationToken) bool {
         return self.cancelled.load(.acquire);
     }
 };
 
+/// A Go-style `sync.WaitGroup`: an atomic counter the caller adds to
+/// ahead of submission and the pool decrements on task completion.
+/// Callers block in `wait()` until the counter reaches zero.
+///
+/// Ownership is caller-side: the `WaitGroup` must outlive every
+/// submission that references it via `SubmitOptions.wait_group`.
+///
+/// # Exactly-once done pairing
+/// Each successful submission paired with a wait-group produces
+/// exactly one matched `add(1)` / `done()` pair.  The pool invokes
+/// `done()` once on task completion or cancellation.  Callers must
+/// not call `done()` themselves for submitted tasks — it would
+/// produce an underflow.
+///
+/// # Panic contract (REV-001)
+/// If a task panics, `done()` is NOT called and `pending` stays
+/// incremented.  Zig panics abort the process; any caller using a
+/// custom panic handler to survive must treat the wait-group as
+/// leaked.  See `docs/security/REV-001.md`.
 pub const WaitGroup = struct {
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
 
+    /// Increment the pending count by `delta`.  Must be called before
+    /// the corresponding submissions so `done()` cannot race past
+    /// zero.
     pub fn add(self: *WaitGroup, delta: u32) void {
         _ = self.pending.fetchAdd(delta, .monotonic);
     }
 
+    /// Decrement the pending count by 1 and broadcast to `wait()` on
+    /// the transition 1→0.  The pool calls this exactly once per
+    /// successful submission that carried a `wait_group` — callers
+    /// normally do not call it themselves.
+    ///
+    /// # F-004: underflow contract
+    /// Calling `done()` more times than `add()` is a caller bug.  In
+    /// Debug / ReleaseSafe this panics loudly to catch the bug early.
+    /// In ReleaseFast the library saturates `pending` at 0 and
+    /// returns — the goal is to keep a long-running daemon alive
+    /// even when a caller's accounting is off.
+    ///
+    /// # Panic contract (REV-001)
+    /// If the pool invokes `done()` on behalf of a task and the task
+    /// panics before that point, the call does NOT happen.  See the
+    /// struct-level doc above and `docs/security/REV-001.md`.
     pub fn done(self: *WaitGroup) void {
         const previous = self.pending.fetchSub(1, .acq_rel);
         if (previous == 0) {
@@ -329,6 +563,8 @@ pub const WaitGroup = struct {
         }
     }
 
+    /// Block until `pending` reaches zero.  Safe to call from multiple
+    /// threads.  Returns immediately if `pending == 0` at call time.
     pub fn wait(self: *WaitGroup) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -337,70 +573,141 @@ pub const WaitGroup = struct {
         }
     }
 
+    /// Non-blocking observation of the pending count.
     pub fn pendingCount(self: *const WaitGroup) u32 {
         return self.pending.load(.acquire);
     }
 };
 
+/// Summary statistics for a latency histogram.  Produced by
+/// `Stats.task_wait_ns` (queue wait) and `Stats.task_exec_ns`
+/// (execution).  Percentiles are computed from a 64-bucket log2
+/// histogram; quantisation error is ≤ 2× at each bucket boundary
+/// (e.g. p50 may report the bucket's upper edge when the real
+/// value is halfway through).
 pub const LatencySummary = struct {
+    /// Number of observations (events) accumulated.
     count: u64 = 0,
+    /// Minimum observed latency in nanoseconds.
     min_ns: u64 = 0,
+    /// Arithmetic mean latency in nanoseconds.
     mean_ns: u64 = 0,
+    /// 50th-percentile (median) latency in nanoseconds.
     p50_ns: u64 = 0,
+    /// 95th-percentile latency in nanoseconds.
     p95_ns: u64 = 0,
+    /// 99th-percentile latency in nanoseconds.
     p99_ns: u64 = 0,
+    /// Maximum observed latency in nanoseconds.
     max_ns: u64 = 0,
 };
 
+/// Per-worker snapshot of runtime counters.  Element of
+/// `Stats.worker_stats`.
 pub const WorkerStats = struct {
+    /// Worker index in `[0, max_threads)`.
     worker_index: usize = 0,
+    /// Cumulative nanoseconds spent executing task functions.
     busy_ns: u64 = 0,
+    /// Cumulative nanoseconds parked or spinning idle.
     idle_ns: u64 = 0,
+    /// Current depth of the per-worker local queue.
     local_queue_depth: u32 = 0,
+    /// Peak local-queue depth observed since init.
     local_queue_peak: u32 = 0,
+    /// Cumulative park events (futex_wait returns).
     parks: u64 = 0,
+    /// Cumulative wake events (futex_wake arrivals + wake_every_n_tasks).
     wakeups: u64 = 0,
+    /// Successful steals from peer local queues or the inject queue.
     steals: u64 = 0,
+    /// Failed steal attempts (empty victim or CAS race).
     steal_failures: u64 = 0,
+    /// Tasks this worker has begun executing (started).
     started: u64 = 0,
+    /// Tasks this worker has completed (started and ran to completion).
     completed: u64 = 0,
+    /// Current bytes in-use in this worker's scratch arena.
     scratch_current_bytes: u64 = 0,
+    /// Peak bytes ever in-use in this worker's scratch arena.
     scratch_peak_bytes: u64 = 0,
 };
 
+/// OS-level process memory sample.  Populated per-platform
+/// (`/proc/self/status` on Linux, `task_vm_info` on macOS, API on
+/// Windows) in `src/stats/process_memory.zig`.  All fields default
+/// to 0 on platforms where the metric is unavailable.
 pub const ProcessMemoryStats = struct {
+    /// Resident Set Size at sample time, in bytes.
     rss_current_bytes: u64 = 0,
+    /// Peak RSS observed over the process lifetime, in bytes.
     rss_peak_bytes: u64 = 0,
+    /// Private (non-shared) bytes resident at sample time.
     private_current_bytes: u64 = 0,
+    /// Peak private bytes over the process lifetime.
     private_peak_bytes: u64 = 0,
 };
 
+/// Consolidated pool-level snapshot.  Returned by
+/// `ThreadPool.statsSnapshot()`.  Counters are read per-field with
+/// `.acquire` ordering; the snapshot is NOT atomic as a group, so a
+/// snapshot captured mid-submit will show a transient skew between
+/// `submitted` and `active_tasks + completed + cancelled` — see
+/// `accounting_skew_detected`.
 pub const Stats = struct {
+    /// Lifetime submissions that returned successfully.
     submitted: u64 = 0,
+    /// Lifetime tasks the pool has begun executing.
     started: u64 = 0,
+    /// Lifetime tasks that ran to completion.
     completed: u64 = 0,
+    /// Lifetime tasks cancelled (via `CancellationToken` or
+    /// `shutdown(.cancel_pending)`).
     cancelled: u64 = 0,
+    /// Tasks currently in `.running` state.
     active_tasks: u64 = 0,
+    /// Approximate sum of queue depths at snapshot time (not atomic).
     queue_depth_current: u64 = 0,
+    /// Peak `queue_depth_current` observed since init.
     queue_depth_peak: u64 = 0,
+    /// Lifetime successful steals across all workers.
     steals: u64 = 0,
+    /// Lifetime failed steal attempts across all workers.
     steal_failures: u64 = 0,
+    /// Lifetime wake events across all workers.
     wakeups: u64 = 0,
+    /// Lifetime park events across all workers.
     parks: u64 = 0,
+    /// Task descriptors currently in use (between acquire and release).
     task_desc_live: u64 = 0,
+    /// Peak `task_desc_live` observed since init.
     task_desc_peak: u64 = 0,
+    /// Lifetime allocator bytes handed out by the pool.
     total_alloc_bytes: u64 = 0,
+    /// Lifetime allocator bytes returned to the allocator.
     total_free_bytes: u64 = 0,
+    /// Lifetime allocation events.
     total_alloc_count: u64 = 0,
+    /// `total_alloc_bytes - total_free_bytes` at snapshot time.
     live_bytes: u64 = 0,
+    /// Peak `live_bytes` observed since init.
     peak_live_bytes: u64 = 0,
     /// Slice L4 — cumulative watchdog-observed stalls. Incremented each tick
     /// the watchdog sees a default-lane worker whose current task has been
     /// running longer than `Config.blocking_promotion_timeout_ns`. Always
     /// zero when `Config.watchdog_interval_ns == 0`.
     watchdog_stalls_detected: u64 = 0,
+    /// Slice L4b — cumulative overflow-worker spawns.  Incremented each
+    /// time the watchdog promotes a stalled default-lane slot by
+    /// spawning a transient overflow worker.  Always zero when
+    /// `Config.max_overflow_workers == 0`.
     overflow_spawns: u64 = 0,
+    /// Slice L4b — cumulative overflow-worker retires (threads that
+    /// finished their spawn burst and exited).  Should equal
+    /// `overflow_spawns` after shutdown.
     overflow_retires: u64 = 0,
+    /// Slice L4b — overflow workers currently alive.  `overflow_spawns
+    /// - overflow_retires` at snapshot time.
     overflow_active: u64 = 0,
     /// REV-001 — best-effort counter-skew detector.  True when the
     /// snapshot observed `active_tasks > submitted - completed - cancelled`,
@@ -412,9 +719,18 @@ pub const Stats = struct {
     /// task skewed the counters; the pool cannot self-recover from this
     /// condition — Zig panics are non-catchable by design.
     accounting_skew_detected: bool = false,
+    /// Queue-wait latency summary (time between submit and start).
+    /// Populated when `Config.timestamp_mode == .full`; zero-valued
+    /// otherwise.
     task_wait_ns: LatencySummary = .{},
+    /// Execution latency summary (time between start and complete).
+    /// Populated when `Config.timestamp_mode == .full`.
     task_exec_ns: LatencySummary = .{},
+    /// OS-level memory snapshot.  See `ProcessMemoryStats`.
     memory: ProcessMemoryStats = .{},
+    /// Per-worker statistics, indexed by worker_index.  Slice points
+    /// into pool-owned storage; stable until the next
+    /// `statsSnapshot()` call overwrites it.
     worker_stats: []const WorkerStats = &.{},
 };
 
