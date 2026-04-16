@@ -1668,11 +1668,18 @@ const Core = struct {
     /// for operators whose runtime is still alive post-panic.  See
     /// `docs/security/REV-001.md` for the full contract.
     fn runTask(self: *Core, worker_index: usize, entry: QueueEntry) void {
-        var worker = &self.workers[worker_index];
+        const worker = &self.workers[worker_index];
         const descriptor_index = entryIndex(entry);
         const entry_gen = entryGen(entry);
-        var descriptor = &self.descriptors[descriptor_index];
+        const descriptor = &self.descriptors[descriptor_index];
 
+        // --- QS-003 gating phase (preserved verbatim) ---
+        //
+        // Stale-entry filter and the state CAS MUST remain here, before the
+        // decomposed helpers run. Gen-tagged queue entries rely on the filter
+        // to reject recycled slots; the state CAS is the single point at
+        // which exactly one worker wins this dispatch.
+        //
         // Stale-entry filter — see `QueueEntry` doc. Reject entries whose
         // generation tag predates the descriptor's current generation, so
         // a recycled slot cannot be double-dispatched through the state CAS.
@@ -1702,6 +1709,36 @@ const Core = struct {
         }
         self.decrementQueued(descriptor.options.lane);
 
+        // --- QS-003 decomposition: start / invoke / finalize ---
+        //
+        // Helpers are `inline` to keep hot-path layout identical. Claim
+        // sentinel ordering is load-bearing: record -> invoke -> finalize,
+        // with the sentinel cleared in finalizeTask BEFORE the broadcast or
+        // release (see runTask's final block below for the ordering reason).
+        const start_ns = self.recordTaskStart(worker, descriptor, worker_index, descriptor_index);
+        self.invokeTask(worker, descriptor, worker_index);
+        self.finalizeTask(worker, descriptor, descriptor_index, start_ns);
+    }
+
+    /// QS-003 hot-path helper: claim sentinel + timestamps + increments.
+    ///
+    /// Runs immediately after the caller has won the `.queued → .running`
+    /// CAS. Records:
+    ///   1. claim sentinel (debug-safety double-dequeue detector)
+    ///   2. `descriptor.start_ns` (and observability: wait histogram, watchdog)
+    ///   3. worker.started++, counters.active_tasks++
+    ///   4. idle_ns accumulator, if timestamp_mode == .full
+    ///
+    /// Returns the monotonic `start_ns` used by `finalizeTask`.
+    /// Marked `inline` so ReleaseFast lowers this back into `runTask` with
+    /// identical instruction selection to the pre-QS-003 monolith.
+    inline fn recordTaskStart(
+        self: *Core,
+        worker: *Worker,
+        descriptor: *TaskDescriptor,
+        worker_index: usize,
+        descriptor_index: u32,
+    ) u64 {
         // Task 2 sentinel: catches tight-overlap sibling where two workers
         // both pass the state CAS (shouldn't happen — CAS is serializing —
         // but the sentinel remains as a defense-in-depth assertion).
@@ -1714,6 +1751,7 @@ const Core = struct {
                 );
             }
         }
+
         const timestamps_enabled = self.config.timestamp_mode == .full;
         const watchdog_enabled = self.config.watchdog_interval_ns > 0;
         const start_ns = if (timestamps_enabled or watchdog_enabled) nowNs() else 0;
@@ -1738,6 +1776,24 @@ const Core = struct {
             }
         }
 
+        return start_ns;
+    }
+
+    /// QS-003 hot-path helper: user code invocation + scratch bookkeeping.
+    ///
+    /// Builds the `TaskContext`, checks cancellation, and either runs the
+    /// user's `task_fn` bracketed by `scratch.beginTask/finishTask`, or
+    /// marks the descriptor cancelled without running user code.
+    ///
+    /// Contract: `descriptor.task_fn` and `descriptor.ctx` are guaranteed
+    /// non-null by the submit path; the `.?` deref is load-bearing here and
+    /// must not be changed to an `orelse` fallback.
+    inline fn invokeTask(
+        self: *Core,
+        worker: *Worker,
+        descriptor: *TaskDescriptor,
+        worker_index: usize,
+    ) void {
         var runtime = TaskContext{
             .worker_index = worker_index,
             .cancellation_token = descriptor.options.cancellation_token,
@@ -1756,6 +1812,32 @@ const Core = struct {
             descriptor.state.store(.cancelled, .release);
             _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
+    }
+
+    /// QS-003 hot-path helper: post-task bookkeeping + release/broadcast.
+    ///
+    /// Ordering (load-bearing):
+    ///   1. `complete_ns = nowNs()` — always, so `idle()`'s purge timer is
+    ///      correct regardless of `timestamp_mode`.
+    ///   2. `last_idle_started_ns.store` — release so idle() readers see it.
+    ///   3. `current_task_started_ns.store(0)` when watchdog is enabled.
+    ///   4. exec histogram + busy_ns under `timestamp_mode == .full`.
+    ///   5. `active_tasks.fetchSub` BEFORE state.store(.completed) — an
+    ///      observer waking on `.completed` must see active_tasks already
+    ///      decremented, otherwise `shutdown(.drain, …)` can spin.
+    ///   6. Claim sentinel cleared BEFORE broadcast/release — otherwise a
+    ///      fast-waking observer could re-acquire the descriptor before we
+    ///      release the sentinel and trip the double-dequeue panic.
+    ///   7. Waitable descriptors broadcast; non-waitable release to freelist.
+    inline fn finalizeTask(
+        self: *Core,
+        worker: *Worker,
+        descriptor: *TaskDescriptor,
+        descriptor_index: u32,
+        start_ns: u64,
+    ) void {
+        const timestamps_enabled = self.config.timestamp_mode == .full;
+        const watchdog_enabled = self.config.watchdog_interval_ns > 0;
 
         // Always update last_idle_started_ns so the idle-purge logic in idle() works
         // regardless of timestamp_mode. Read the clock once.
