@@ -16,6 +16,65 @@ const process_memory = @import("stats/process_memory.zig");
 /// (restores the pre-F-001 OOB hazard). Default: false (safe).
 const single_pool_mode = build_options.single_pool;
 
+/// COMPTIME-ELISION / P-09: returns the comptime-known `TimestampMode` when
+/// `-Dtimestamp-mode` pinned it at build time; returns `null` when the flag
+/// is `.any` (runtime-configurable).  Callers branch with `comptime if` so
+/// the pinned variant lowers to a compile-time-folded boolean and the hot
+/// path drops the submit/start clock reads + histogram observes entirely.
+fn pinnedTimestampMode() ?types.TimestampMode {
+    return switch (build_options.timestamp_mode) {
+        .any => null,
+        .full => .full,
+        .disabled => .disabled,
+    };
+}
+
+/// COMPTIME-ELISION / P-09: comptime-known `true` when timestamps are
+/// statically enabled, `false` when statically disabled, `null` when the
+/// build flag is `.any` (fall back to `self.config.timestamp_mode`).
+const ct_timestamps_enabled: ?bool = blk: {
+    const pinned = pinnedTimestampMode() orelse break :blk null;
+    break :blk pinned == .full;
+};
+
+/// COMPTIME-ELISION / P-09: returns the pinned `SchedulerVariant`, or
+/// `null` if the flag is `.any`.  Pinned variants let `submit`, `enqueuePush`,
+/// `nextTask`, and `statsSnapshot` elide dead-path branches at comptime.
+fn pinnedSchedulerVariant() ?types.SchedulerVariant {
+    return switch (build_options.scheduler_variant) {
+        .any => null,
+        .global_queue => .global_queue,
+        .work_stealing => .work_stealing,
+        .lane_extension => .lane_extension,
+    };
+}
+
+/// COMPTIME-ELISION / P-09: comptime-known `uses_local` flag.  Returns a
+/// concrete `bool` only when the scheduler variant is pinned; returns `null`
+/// for the `.any` default so callers fall back to the runtime switch.
+const ct_uses_local: ?bool = blk: {
+    const pinned = pinnedSchedulerVariant() orelse break :blk null;
+    break :blk pinned == .work_stealing or pinned == .lane_extension;
+};
+
+/// COMPTIME-ELISION / P-09: helper that returns `true` iff timestamps are
+/// active for this pool.  Prefer comptime resolution when possible so the
+/// hot path folds the branch; fall back to the runtime `self.config` read
+/// when the flag is `.any`.
+inline fn timestampsEnabled(self: *const Core) bool {
+    if (ct_timestamps_enabled) |ct| return ct;
+    return self.config.timestamp_mode == .full;
+}
+
+/// COMPTIME-ELISION / P-09: helper that returns `true` iff the scheduler
+/// variant uses per-worker local queues.  Comptime-resolves when the
+/// variant is pinned; reads `self.config.scheduler_variant` otherwise.
+inline fn usesLocalQueues(self: *const Core) bool {
+    if (ct_uses_local) |ct| return ct;
+    return self.config.scheduler_variant == .work_stealing or
+        self.config.scheduler_variant == .lane_extension;
+}
+
 /// TLS state scoped per pool. Each entry records the `Core *` that set it,
 /// so cross-pool submits don't index pool-A's slot into pool-B's arrays
 /// (F-001). The stored pointer is compared for identity only; no deref.
@@ -429,6 +488,16 @@ const Core = struct {
     pub fn init(self: *Core, allocator: std.mem.Allocator, config: types.Config) !void {
         var normalized = config.normalized();
         try normalized.validate();
+
+        // COMPTIME-ELISION / P-09: if the caller compiled with a pinned
+        // timestamp_mode or scheduler_variant, the runtime Config must
+        // match or the elided-branch assumptions will silently break.
+        if (comptime pinnedTimestampMode()) |pinned| {
+            if (normalized.timestamp_mode != pinned) return error.BuildOptionMismatch;
+        }
+        if (comptime pinnedSchedulerVariant()) |pinned| {
+            if (normalized.scheduler_variant != pinned) return error.BuildOptionMismatch;
+        }
 
         try self.allocateStorage(allocator, normalized);
         errdefer self.deinitOwned();
@@ -1141,7 +1210,7 @@ const Core = struct {
         descriptor.task_fn = task_fn;
         descriptor.ctx = ctx;
         descriptor.options = options;
-        descriptor.submit_ns = if (self.config.timestamp_mode == .full) nowNs() else 0;
+        descriptor.submit_ns = if (timestampsEnabled(self)) nowNs() else 0;
         descriptor.start_ns = 0;
         descriptor.complete_ns = 0;
         descriptor.state.store(.queued, .release);
@@ -1173,8 +1242,10 @@ const Core = struct {
             // Default-lane submit: LIFO/local fast path, gated on TLS worker
             // being a default-lane worker. work_stealing and lane_extension
             // both use per-worker queues; global_queue skips them.
-            const uses_local = self.config.scheduler_variant == .work_stealing or
-                self.config.scheduler_variant == .lane_extension;
+            // COMPTIME-ELISION: when -Dscheduler-variant pins the variant at
+            // build time, usesLocalQueues folds to a constant and this entire
+            // block drops out of the global_queue-pinned binary.
+            const uses_local = usesLocalQueues(self);
             if (uses_local) {
                 if (self.tlsWorkerIndexFor()) |wi| {
                     const w = &self.workers[wi];
@@ -1462,8 +1533,10 @@ const Core = struct {
         // helps the default lane (always on — purely additive capacity with no
         // isolation concern), and a default worker can help the blocking lane
         // when `cpu_helps_blocking` is opted in.
-        const uses_local = self.config.scheduler_variant == .work_stealing or
-            self.config.scheduler_variant == .lane_extension;
+        // COMPTIME-ELISION: folds to `true` when -Dscheduler-variant pins
+        // work_stealing/lane_extension; folds to `false` for global_queue
+        // and the LIFO/local-queue drain block is dropped from the binary.
+        const uses_local = usesLocalQueues(self);
         if (uses_local) {
             // LIFO slot first: owner-only swap-to-empty. Most-recently-submitted
             // task runs next. This is the hot path for "task spawns task".
@@ -1752,7 +1825,11 @@ const Core = struct {
             }
         }
 
-        const timestamps_enabled = self.config.timestamp_mode == .full;
+        // COMPTIME-ELISION: both flags fold to constants when pinned at
+        // build time. The if (timestamps_enabled or watchdog_enabled) check
+        // drops entirely when -Dtimestamp-mode=disabled and watchdog is
+        // runtime-off.
+        const timestamps_enabled = timestampsEnabled(self);
         const watchdog_enabled = self.config.watchdog_interval_ns > 0;
         const start_ns = if (timestamps_enabled or watchdog_enabled) nowNs() else 0;
         descriptor.start_ns = start_ns;
@@ -1836,7 +1913,10 @@ const Core = struct {
         descriptor_index: u32,
         start_ns: u64,
     ) void {
-        const timestamps_enabled = self.config.timestamp_mode == .full;
+        // COMPTIME-ELISION: `timestamps_enabled` folds to a constant when
+        // pinned at build time; the exec_histogram observe and busy_ns
+        // fetchAdd drop from the binary under -Dtimestamp-mode=disabled.
+        const timestamps_enabled = timestampsEnabled(self);
         const watchdog_enabled = self.config.watchdog_interval_ns > 0;
 
         // Always update last_idle_started_ns so the idle-purge logic in idle() works
@@ -1970,8 +2050,7 @@ const Core = struct {
                 self.cancelDescriptor(entry);
             }
         }
-        const uses_local = self.config.scheduler_variant == .work_stealing or
-            self.config.scheduler_variant == .lane_extension;
+        const uses_local = usesLocalQueues(self);
         if (uses_local) {
             // Drain LIFO slots too.
             for (self.workers) |*w| {

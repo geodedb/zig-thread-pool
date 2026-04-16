@@ -7,6 +7,12 @@
 
 const std = @import("std");
 
+/// Re-export the `build_options` module so downstream test harnesses can
+/// inspect compile-time-pinned flags (`-Dtimestamp-mode`,
+/// `-Dscheduler-variant`, `-Dsingle-pool`) and adapt their configs
+/// accordingly.  See `tests/common.zig::default_timestamp_mode`.
+pub const build_options = @import("build_options");
+
 pub const sync = @import("sync.zig");
 pub const clock = @import("clock.zig");
 pub const types = @import("types.zig");

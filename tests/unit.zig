@@ -474,6 +474,10 @@ test "Stats.steals/parks aggregate per-worker under work-stealing" {
 }
 
 test "timestamp_mode disabled zeroes histograms" {
+    // COMPTIME-ELISION: when the library is compiled with
+    // -Dtimestamp-mode=full the runtime config is rejected by design.
+    // Skip the disabled-mode behavioral check in that build.
+    if (thread_pool.build_options.timestamp_mode == .full) return error.SkipZigTest;
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 2,
         .queue_capacity = 64,
@@ -495,6 +499,9 @@ test "timestamp_mode disabled zeroes histograms" {
 }
 
 test "timestamp_mode disabled still purges scratch on idle" {
+    // COMPTIME-ELISION: skip under -Dtimestamp-mode=full (same reasoning
+    // as the histogram-zeroing test above).
+    if (thread_pool.build_options.timestamp_mode == .full) return error.SkipZigTest;
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 2,
         .queue_capacity = 64,

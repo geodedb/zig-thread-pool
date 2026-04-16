@@ -1,24 +1,35 @@
 # Performance Gap Analysis
 
-Last updated: 2026-04-11
+Last updated: 2026-04-16
 
 ## Summary
 
-| PerfSeverity | Open | Resolved | Closed | Won't Do | Total |
-|---|---|---|---|---|---|
-| P0 (SLO breach / outage risk) | 0 | 3 | 2 | 0 | 5 |
-| P1 (Material user-facing impact) | 0 | 3 | 7 | 2 | 12 |
-| P2 (Moderate impact / cost) | 6 | 0 | 4 | 1 | 11 |
-| P3 (Minor optimization) | 3 | 0 | 0 | 0 | 3 |
-| **Total** | **9** | **6** | **13** | **3** | **31** |
+Two tracks:
 
-### Top 5 Risks by Expected Impact
+- **Historical PERF-### cohort** (2026-04-11 baseline): micro-opt and false-sharing work, mostly closed. Preserved verbatim below for audit continuity.
+- **2026-04-16 adversarial perf review cohort** (`P-##`, `R-##`): pivot-axis findings (tail latency / lanes / memory / observability / methodology) filed against the declared throughput plateau. Raw input: `.cache/audit/perf-reviewed.json`.
 
-1. ~~**PERF-022** (P1, PerfScore 80)~~ Closed -- cache-line padding added; commit ca1b0a4.
-2. ~~**PERF-002** (P0, PerfScore 100)~~ Closed -- cancelDescriptor guarded with waitable check; commit 3299728.
-3. ~~**PERF-023** (P1, PerfScore 60)~~ Closed -- cache-line padding added to Counters struct; commit 37fbd6a.
-4. **PERF-027** (P2, PerfScore 40) Hot-path atomic overhead -- ~10 atomic operations per task. Global counters (steals, steal_failures, parks) duplicate per-worker counters; could derive from per-worker at snapshot time.
-5. **PERF-024** (P2, PerfScore 36) submitBatch per-task signaling -- N individual park_mutex lock/signal/unlock calls per batch of N tasks.
+Plateau verdict (per `project_throughput_plateau_pivot.md`): throughput plateau on `flood_1m_batched` is architectural — 5 consecutive iter failures on the notifySubmits/state-load plane (iter7 bitmap, iter8 single-probe, iter9 isolation, iter10 shouldExit, iter11 active_tasks shard). **Throughput micro-opts against the plateau are filtered/demoted.** Pivot axes: tail latency, lanes, memory, API, observability, methodology.
+
+### Cohort counts (2026-04-16 adversarial review)
+
+| PerfSeverity | Count | Filed | Tracked in cluster | Filtered / Demoted |
+|---|---|---|---|---|
+| P0 | 1 | 1 (doc-only P-05) | -- | 0 |
+| P1 | 9 | 5 individual + 2 trackers | -- | 0 |
+| P2 | 10 | 4 individual | 3 in trackers | 3 (P-06 ARM-defer, P-10, P-12) |
+| P3 | 3 | 0 | -- | 3 (P-07/P-08 confirm-only, P-14 dup of PERF-028) |
+| **Total** | **23** | **12 issues created** | **5 sub-tasks clustered** | **6 filtered** |
+
+Filtered per plateau-pivot rule: **P-04** (scanAndWake TLS hint, speculative throughput), **P-06** (ARM-only defer), **P-10** (watchdog scan cost, borderline), **P-12** (releaseSubmitter spin, submitter-churn only), **P-07/P-08** (confirm-only), **P-14** (duplicate of existing PERF-028). Six total.
+
+### Top 5 Risks (2026-04-16 cohort, by PerfScore + pivot-axis relevance)
+
+1. **PERF-METHODOLOGY** (P1, PerfScore 100) -- Benchmark methodology hardening tracker. `.full` timestamp_mode + `queue_capacity=4096` + `backpressure=.block` in `flood_1m` means the published runtime-compare table may not be apples-to-apples vs Tokio/Go. Issue #36.
+2. **PERF-OBSERVABILITY** (P1, PerfScore 80) -- Observability pivot tracker: p999/p9999, per-lane histograms, wake-latency histogram, memory budget API, layout doc. Blocks confidence in every future lane/tail-latency/memory win. Issue #46.
+3. **PERF-P-09** (P1, PerfScore 64) -- Comptime elision of `timestamp_mode`, `scheduler_variant`, `queue_kind`, `lane_extension`. Projected 3-10% on `flood_1m` with `-Dtimestamp-mode=disabled`; compounds with existing `-Dsingle-pool`. Issue #73.
+4. **PERF-P-11** (P1, PerfScore 48) -- Pool-wide `completion_mutex` + broadcast on waitable tasks. Dormant today but a production-user foot-gun; pairs with R-09 scoped-wait API. Issue #79.
+5. **PERF-P-01** (P1, PerfScore 48) -- `RingQueue` head/tail share a cacheline. Default `queue_kind`, so every `LocalQueue` pays unpaid cross-core coherence on every owner push + stealer CAS. Issue #55.
 
 ### Baselines (measured 2026-04-11)
 
@@ -40,6 +51,100 @@ At 64 workers with trivial tasks, throughput will likely plateau due to:
 - Single-item steal: O(N) steal scans return only 1 task, starving workers at scale
 
 ---
+
+## 2026-04-16 Adversarial Perf Review Cohort
+
+Input: `.cache/audit/perf-reviewed.json` (23 findings; P0=1, P1=9, P2=10, P3=3). All issues on GitLab `devnw/zig/thread-pool`.
+
+### Stack-ranked (pivot-axis findings)
+
+| Rank | Sev | PerfScore | ID | Finding | Component | Evidence | Measurement | Issue | Fix Summary | Owner | SLA | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | P1 | 100 | P-15/R-05/R-08/R-12/R-14 | Benchmark methodology hardening (tracker) | bench, scripts, docs | `runtime_compare_zig.zig:306-313,428-434`; `types.zig:187` | Re-run parity preset; stddev; new scenarios | [#36](https://gitlab.com/devnw/zig/thread-pool/-/work_items/36) | Parity preset; env gating; n=15 warmup=3; new scenarios | @benjiv | Within sprint | Open |
+| 2 | P1 | 80 | R-01/R-02/R-03/R-06/R-10 | Observability pivot (tracker) | stats, pool, docs | `stats/latency.zig:66-78`; `pool.zig:204-255` | per-lane p99, wake-latency p99, mem budget, offset dump | [#46](https://gitlab.com/devnw/zig/thread-pool/-/work_items/46) | p999/p9999; per-lane hist; wake-latency hist; memory budget; layout doc | @benjiv | Within sprint / Next quarter | Open |
+| 3 | P1 | 64 | P-09 | Comptime elision flags | build, types, pool | `types.zig:82,115-116,187`; `pool.zig:995,1589,1606,1640` | Build-matrix A/B | [#73](https://gitlab.com/devnw/zig/thread-pool/-/work_items/73) | `-Dtimestamp-mode` + `-Dscheduler-variant` landed; `-Dqueue-kind` + `-Dlane-extension` deferred | @benjiv | Within sprint | **Partially Closed 2026-04-16** |
+| 4 | P1 | 48 | P-01 | RingQueue head/tail false sharing (default queue_kind) | queue | `ring_queue.zig:30-31` | n=20 paired on `nested_fanout_4x`, `contended_cpu_10us` | [#55](https://gitlab.com/devnw/zig/thread-pool/-/work_items/55) | Mirror `BoundedRing` `_pad_head` layout | @benjiv | Within sprint | Open |
+| 5 | P1 | 48 | P-03 | Worker struct layout audit | pool | `pool.zig:204-255` | Comptime offset dump + paired A/B | [#64](https://gitlab.com/devnw/zig/thread-pool/-/work_items/64) | Full `@offsetOf` pass before any layout shift | @benjiv | Within sprint | Open |
+| 6 | P1 | 48 | P-11 | Waitable completion pool-wide mutex + broadcast | pool | `pool.zig:1653-1670` | 100K waitable bench; waiter-count 4 | [#79](https://gitlab.com/devnw/zig/thread-pool/-/work_items/79) | Per-descriptor condvar lazy-alloc | @benjiv | Within sprint | Open |
+| 7 | P1 | 48 | R-13 | Validate `watchdog_interval_ns` extremes | types, pool | `pool.zig:1176-1202` | Unit tests + oscillation bench | [#84](https://gitlab.com/devnw/zig/thread-pool/-/work_items/84) | Reject sub-100us interval; warn >1s | @benjiv | Within sprint | Open |
+| 8 | P2 | 36 | R-09 | `waitForCompletion(handle, timeout)` API | pool, types | `pool.zig:1653-1670` | 1M single-task-wait microbench | [#90](https://gitlab.com/devnw/zig/thread-pool/-/work_items/90) | Scoped-wait API; deprecate `options.waitable` | @benjiv | Next quarter | Open |
+| 9 | P2 | 32 | R-11 | Counters comptime offset asserts | pool | `pool.zig` Counters | Compile-only | [#91](https://gitlab.com/devnw/zig/thread-pool/-/work_items/91) | Lock in hot/cold cacheline invariants | @benjiv | Next quarter | Open |
+| 10 | P2 | 24 | P-02 | BoundedRing trailing tail pad | queue | `bounded_ring.zig:19-21`; `pool.zig:365,371` | Dual-lane submit p99 | [#88](https://gitlab.com/devnw/zig/thread-pool/-/work_items/88) | Trailing `_pad_tail` + Core asserts | @benjiv | Next quarter | Open |
+| 11 | P2 | 24 | R-04 | Watchdog overflow hysteresis / proportional control | pool | `pool.zig:1199-1201` | Oscillating-stall scenario | [#89](https://gitlab.com/devnw/zig/thread-pool/-/work_items/89) | Proportional spawn + 2-tick hysteresis | @benjiv | Next quarter | Open |
+| 12 | Info | -- | P-05 | Document seq_cst `queued_tasks` IRIW invariant | docs, pool | `pool.zig:985,1137,1711-1721` | N/A (doc-only) | [#26](https://gitlab.com/devnw/zig/thread-pool/-/work_items/26) | Prose in DESIGN.md + Litmus note | @benjiv | As capacity | Open |
+
+### Filtered / demoted (plateau-pivot rule or dup)
+
+| ID | Sev | Reason |
+|---|---|---|
+| P-04 | P1→P3 | scanAndWake TLS hint — speculative throughput, orthogonal to 5-iter failure plane; do not invest further |
+| P-06 | P2 | ARM-only; bench host is x86; defer until ARM port |
+| P-07 | P3 | `acquireDescriptor` branch — confirm-only, likely LLVM-folded |
+| P-08 | P3 | `claim_sentinel_enabled` — confirm-only, comptime-false in ReleaseFast |
+| P-10 | P2 | Watchdog scan cost — throughput-plateau-adjacent, R-13 + R-04 cover the real risks |
+| P-12 | P2 | `releaseSubmitter` spin — submitter-churn only, not steady-state; defer |
+| P-13 | P2 | `submitter_nonempty` doc — inline docstring note sufficient, no issue needed |
+| P-14 | P3 | `bucketIndex` `@clz` — duplicate of historical PERF-028 |
+| R-07 | P2 | Adaptive `scan_len` — plateau wake ceiling (iter 8 closed similar angle); do not re-attack |
+
+### Findings by area (2026-04-16 cohort)
+
+**area::methodology**: PERF-METHODOLOGY (#36).
+**area::observability**: PERF-OBSERVABILITY (#46), PERF-R-11 (#91).
+**area::concurrency**: PERF-P-05 (#26), PERF-P-09 (#73), PERF-P-11 (#79), PERF-R-13 (#84), PERF-P-01 (#55), PERF-P-03 (#64), PERF-P-02 (#88), PERF-R-04 (#89), PERF-R-09 (#90).
+**area::latency**: PERF-P-11 (#79), PERF-R-09 (#90).
+
+### Roadmap (2026-04-16 cohort)
+
+**Quick wins (< 1 day each)**
+
+- PERF-P-01 #55 — RingQueue `_pad_head` (mirror BoundedRing).
+- PERF-R-11 #91 — Counters comptime offset asserts.
+- PERF-R-13 #84 — `Config.validate` watchdog bounds.
+- PERF-P-05 #26 — IRIW invariant doc.
+
+**Medium (1-5 days each)**
+
+- PERF-P-03 #64 — Worker layout audit + conditional re-pack.
+- PERF-P-11 #79 — Per-descriptor condvar for waitable.
+- PERF-P-02 #88 — BoundedRing trailing pad.
+- PERF-R-04 #89 — Watchdog hysteresis + proportional control.
+- PERF-METHODOLOGY #36 — Parity preset + env gating + re-run.
+
+**Strategic (> 5 days)**
+
+- PERF-OBSERVABILITY #46 — p999/p9999 + per-lane histograms + wake-latency hist + memory budget API + layout doc.
+- PERF-P-09 #73 — Comptime elision build matrix.
+- PERF-R-09 #90 — Scoped `waitForCompletion` API + deprecation path.
+
+### Scoring (2026-04-16 cohort)
+
+| ID | Impact | Likelihood | PerfScore | Confidence |
+|---|---|---|---|---|
+| P-15 (in #36) | 5 | 5 | 100 | confirmed |
+| R-08 (in #36) | 4 | 5 | 80 | confirmed |
+| R-02 (in #46) | 4 | 5 | 80 | confirmed |
+| R-01 (in #46) | 4 | 5 | 80 | confirmed |
+| R-05 (in #36) | 4 | 4 | 64 | confirmed |
+| P-09 #73 | 4 | 4 | 64 | suspected |
+| R-10 (in #46) | 3 | 5 | 60 | confirmed |
+| R-06 (in #46) | 3 | 5 | 60 | confirmed |
+| P-01 #55 | 3 | 4 | 48 | suspected |
+| P-03 #64 | 3 | 4 | 48 | suspected |
+| P-11 #79 | 4 | 3 | 48 | suspected |
+| R-13 #84 | 3 | 4 | 48 | confirmed |
+| R-03 (in #46) | 3 | 4 | 48 | confirmed |
+| R-09 #90 | 3 | 3 | 36 | suspected |
+| R-11 #91 | 2 | 4 | 32 | confirmed |
+| P-02 #88 | 2 | 3 | 24 | suspected |
+| R-04 #89 | 2 | 3 | 24 | suspected |
+| P-05 #26 | 0 | 0 | info | confirmed |
+
+---
+
+## Historical Cohort (2026-04-11 baseline)
+
+PERF-### numbering. Preserved for audit continuity. Most items closed / resolved via prior sprints. See "Stack-Ranked Findings" below.
 
 ## Stack-Ranked Findings
 
@@ -294,3 +399,6 @@ Likelihood:
 - Functional gap analysis: `docs/GAP_ANALYSIS.md`
 - Performance targets: `docs/PERFORMANCE_TARGETS.md`
 - Scheduler decision: `docs/SCHEDULER_DECISION.md`
+- Latest runtime-compare snapshot: `docs/performance/appsec-fixes-2026-04-15/FINAL-runtime-comparison.json`
+- 2026-04-16 adversarial review input: `.cache/audit/perf-reviewed.json`
+- Plateau-verdict memory: `project_throughput_plateau_pivot.md` (architectural flood_1m_batched plateau)

@@ -5,6 +5,37 @@ pub const Counter = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
+/// COMPTIME-ELISION: returns the build-pinned timestamp mode, or `.full`
+/// (the ambient default) when the build is unpinned.  Tests that exercise
+/// `.disabled`-specific behavior must check this and skip when it returns
+/// `.full`; tests that call this function pick up the pinned value so
+/// `Core.init` does not reject the runtime config.
+pub const default_timestamp_mode: thread_pool.types.TimestampMode = blk: {
+    const build_options = @import("thread_pool").build_options;
+    break :blk switch (build_options.timestamp_mode) {
+        .any => .full,
+        .full => .full,
+        .disabled => .disabled,
+    };
+};
+
+/// COMPTIME-ELISION: returns `true` iff the current build pinned the
+/// scheduler variant to something other than `variant`.  Tests that
+/// explicitly exercise one variant via `defaultConfig(variant)` should
+/// call `try skipIfSchedulerVariantIncompatible(variant)` at the top so
+/// pinned-variant builds cleanly skip incompatible scenarios rather than
+/// fail with `error.BuildOptionMismatch`.
+pub fn skipIfSchedulerVariantIncompatible(variant: thread_pool.SchedulerVariant) !void {
+    const build_options = @import("thread_pool").build_options;
+    const incompatible = switch (build_options.scheduler_variant) {
+        .any => false,
+        .global_queue => variant != .global_queue,
+        .work_stealing => variant != .work_stealing,
+        .lane_extension => variant != .lane_extension,
+    };
+    if (incompatible) return error.SkipZigTest;
+}
+
 pub fn defaultConfig(variant: thread_pool.SchedulerVariant) thread_pool.Config {
     return .{
         .min_threads = 2,
@@ -16,6 +47,7 @@ pub fn defaultConfig(variant: thread_pool.SchedulerVariant) thread_pool.Config {
         .idle_park_after_ns = 100_000,
         .idle_purge_after_ns = 500_000,
         .scheduler_variant = variant,
+        .timestamp_mode = default_timestamp_mode,
     };
 }
 

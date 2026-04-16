@@ -1,5 +1,28 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const sync = @import("sync.zig");
+
+/// COMPTIME-ELISION / P-09: build-time-pinned defaults.  When the library
+/// is compiled with `-Dtimestamp-mode=<mode>` the corresponding `Config`
+/// field defaults to that mode so callers that rely on the defaults do
+/// not trip `error.BuildOptionMismatch` at `Core.init`.  `any` preserves
+/// the historical `.full` default.
+const default_timestamp_mode: TimestampMode = switch (build_options.timestamp_mode) {
+    .any => .full,
+    .full => .full,
+    .disabled => .disabled,
+};
+
+/// COMPTIME-ELISION / P-09: build-time-pinned scheduler default.  When
+/// `-Dscheduler-variant=<variant>` is passed, callers that rely on the
+/// default get the pinned variant; `any` preserves the historical
+/// `.global_queue` default.
+const default_scheduler_variant: SchedulerVariant = switch (build_options.scheduler_variant) {
+    .any => .global_queue,
+    .global_queue => .global_queue,
+    .work_stealing => .work_stealing,
+    .lane_extension => .lane_extension,
+};
 
 /// Scheduler topology selector.  Picked at `ThreadPool.init` and never
 /// changed afterwards.  All three variants share the public submit/wait
@@ -223,7 +246,7 @@ pub const Config = struct {
     /// short enough to catch a hung task in CI.
     deinit_timeout_ns: u64 = 30_000_000_000,
     /// Scheduler topology.  See `SchedulerVariant` for the trade-offs.
-    scheduler_variant: SchedulerVariant = .global_queue,
+    scheduler_variant: SchedulerVariant = default_scheduler_variant,
     /// Local-queue implementation.  Only meaningful for `work_stealing`
     /// and `lane_extension`.  See `QueueKind`.
     queue_kind: QueueKind = .ring,
@@ -302,7 +325,7 @@ pub const Config = struct {
     /// output); `.disabled` elides those clock reads for a 40–80ns
     /// per-task saving on Linux.  See `TimestampMode` for why the
     /// complete-time read is always kept.
-    timestamp_mode: TimestampMode = .full,
+    timestamp_mode: TimestampMode = default_timestamp_mode,
     /// Maximum number of tasks a stealer takes from a single victim per steal
     /// attempt. With `queue_kind = .ring`, true batch-steal via stealHalf is
     /// used and values > 1 are correct. With `queue_kind = .chase_lev`,

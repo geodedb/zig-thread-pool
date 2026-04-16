@@ -41,8 +41,37 @@ pub fn build(b: *std.Build) void {
             "pools coexist in one process (restores the pre-F-001 OOB hazard).",
     ) orelse false;
 
+    // COMPTIME-ELISION / P-09: optional pin for Config.timestamp_mode at
+    // build time. `any` (default) preserves runtime-configurable behavior;
+    // `full` pins to the observability-rich default; `disabled` pins to the
+    // low-overhead path and lets the hot path elide submit/start clock
+    // reads + histogram observes at comptime.
+    const TimestampModeFlag = enum { any, full, disabled };
+    const timestamp_mode_flag = b.option(
+        TimestampModeFlag,
+        "timestamp-mode",
+        "Pin Config.timestamp_mode at build time to elide the runtime check " ++
+            "from Core.runTask. `any` (default) is runtime-configurable; " ++
+            "`full` pins histograms on; `disabled` pins them off.",
+    ) orelse .any;
+
+    // COMPTIME-ELISION / P-09: optional pin for Config.scheduler_variant at
+    // build time. `any` (default) keeps the runtime `uses_local` switches;
+    // pinning to one variant lets `submit/enqueuePush/nextTask` elide the
+    // dead-path branches for the other two variants at comptime.
+    const SchedulerVariantFlag = enum { any, global_queue, work_stealing, lane_extension };
+    const scheduler_variant_flag = b.option(
+        SchedulerVariantFlag,
+        "scheduler-variant",
+        "Pin Config.scheduler_variant at build time. `any` (default) keeps " ++
+            "all three variants runtime-selectable; pinning elides the " ++
+            "dead-path branches for the other variants at comptime.",
+    ) orelse .any;
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "single_pool", single_pool);
+    build_options.addOption(TimestampModeFlag, "timestamp_mode", timestamp_mode_flag);
+    build_options.addOption(SchedulerVariantFlag, "scheduler_variant", scheduler_variant_flag);
 
     const module = b.addModule("thread_pool", .{
         .root_source_file = b.path("src/root.zig"),
