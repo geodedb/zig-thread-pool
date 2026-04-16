@@ -186,6 +186,18 @@ pub fn build(b: *std.Build) void {
     micro_all_step.dependOn(&run_micro_steal.step);
     micro_all_step.dependOn(&run_micro_wake.step);
 
+    const fuzz_exe = b.addExecutable(.{
+        .name = "pool-fuzz",
+        .root_module = importedModule(b, "tests/fuzz/pool_fuzz.zig", target, optimize, module),
+    });
+    if (tsan) fuzz_exe.root_module.sanitize_thread = true;
+    b.installArtifact(fuzz_exe);
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    run_fuzz.has_side_effects = true;
+    if (b.args) |args| run_fuzz.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Run the public-API fuzz harness (set FUZZ_SEED / FUZZ_ITERATIONS env vars)");
+    fuzz_step.dependOn(&run_fuzz.step);
+
     const tools_step = b.step("tools", "Build benchmark tooling");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);
