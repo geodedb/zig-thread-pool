@@ -520,6 +520,85 @@ test "latency summary exposes p999 and p9999 tail fields" {
     try std.testing.expect(stats.task_exec_ns.p9999_ns > 0);
 }
 
+test "per-lane histograms populated when allow_blocking_lane=true" {
+    // OBSERVABILITY-PIVOT / R-02: with the blocking lane enabled, the
+    // snapshot carries separate default/blocking wait+exec summaries in
+    // addition to the pool-wide `task_{wait,exec}_ns`. We exercise both
+    // lanes and assert that both per-lane histograms receive samples.
+    if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
+    try common.skipIfSchedulerVariantIncompatible(.lane_extension);
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 1024,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .lane_extension,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .blocking_queue_capacity = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    // 64 default-lane tasks and 16 blocking-lane tasks; both lanes must
+    // end up with a nonzero histogram count, and the pool-wide summary
+    // count must equal their sum.
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    for (0..16) |_| {
+        _ = try pool.submit(
+            common.counterTask,
+            @ptrCast(&counter),
+            .{ .wait_group = &wg, .lane = .blocking },
+        );
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 80), counter.value.load(.acquire));
+    try std.testing.expect(stats.default_wait_ns.count > 0);
+    try std.testing.expect(stats.default_exec_ns.count > 0);
+    try std.testing.expect(stats.blocking_wait_ns.count > 0);
+    try std.testing.expect(stats.blocking_exec_ns.count > 0);
+    // Pool-wide count is the sum of lane counts.
+    try std.testing.expectEqual(
+        stats.task_wait_ns.count,
+        stats.default_wait_ns.count + stats.blocking_wait_ns.count,
+    );
+    try std.testing.expectEqual(
+        stats.task_exec_ns.count,
+        stats.default_exec_ns.count + stats.blocking_exec_ns.count,
+    );
+    try std.testing.expectEqual(@as(u64, 80), stats.task_wait_ns.count);
+}
+
+test "per-lane histograms zero when allow_blocking_lane=false" {
+    // OBSERVABILITY-PIVOT / R-02: single-lane configs must leave the
+    // per-lane fields at the zero `LatencySummary` so operators can
+    // distinguish "blocking lane disabled" from "blocking lane saw zero
+    // tasks". The pool-wide `task_{wait,exec}_ns` still carries the
+    // overall data.
+    if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, common.defaultConfig(.global_queue));
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+    for (0..128) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+    wg.wait();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expect(stats.task_wait_ns.count > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.default_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 0), stats.default_exec_ns.count);
+    try std.testing.expectEqual(@as(u64, 0), stats.blocking_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 0), stats.blocking_exec_ns.count);
+}
+
 test "timestamp_mode disabled zeroes histograms" {
     // COMPTIME-ELISION: when the library is compiled with
     // -Dtimestamp-mode=full the runtime config is rejected by design.

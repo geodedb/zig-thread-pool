@@ -760,6 +760,26 @@ pub const Stats = struct {
     /// Execution latency summary (time between start and complete).
     /// Populated when `Config.timestamp_mode == .full`.
     task_exec_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-02: per-lane queue-wait latency for the
+    /// default lane. Populated only when `Config.allow_blocking_lane ==
+    /// true`; otherwise it is the zero-value `LatencySummary` (count=0)
+    /// and operators should read `task_wait_ns` as the pool-wide summary.
+    /// The split is computed at snapshot time from per-worker histograms
+    /// keyed by `Worker.serves_lane`, so the observe hot path stays a
+    /// single `LatencyHistogram.observe` call.
+    default_wait_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-02: per-lane execution latency for the
+    /// default lane. Same activation rule as `default_wait_ns`.
+    default_exec_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-02: per-lane queue-wait latency for the
+    /// blocking lane. Populated only when `Config.allow_blocking_lane ==
+    /// true`. Lets operators see whether blocking-lane tasks are
+    /// starving (high p99/p999) without the signal being diluted by
+    /// default-lane traffic.
+    blocking_wait_ns: LatencySummary = .{},
+    /// OBSERVABILITY-PIVOT / R-02: per-lane execution latency for the
+    /// blocking lane. Same activation rule as `blocking_wait_ns`.
+    blocking_exec_ns: LatencySummary = .{},
     /// OS-level memory snapshot.  See `ProcessMemoryStats`.
     memory: ProcessMemoryStats = .{},
     /// Per-worker statistics, indexed by worker_index.  Slice points

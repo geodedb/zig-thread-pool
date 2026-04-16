@@ -1073,9 +1073,30 @@ const Core = struct {
 
         var merged_wait = LatencyHistogram{};
         var merged_exec = LatencyHistogram{};
+        // OBSERVABILITY-PIVOT / R-02: per-lane merged histograms populated
+        // only when the blocking lane is enabled. Hot-path observe remains
+        // a single per-worker `LatencyHistogram.observe` call; the split is
+        // purely a snapshot-time aggregation keyed on `Worker.serves_lane`.
+        var merged_default_wait = LatencyHistogram{};
+        var merged_default_exec = LatencyHistogram{};
+        var merged_blocking_wait = LatencyHistogram{};
+        var merged_blocking_exec = LatencyHistogram{};
+        const per_lane_active = self.config.allow_blocking_lane;
         for (self.workers) |*worker| {
             merged_wait.merge(&worker.wait_histogram);
             merged_exec.merge(&worker.exec_histogram);
+            if (per_lane_active) {
+                switch (worker.serves_lane) {
+                    .default => {
+                        merged_default_wait.merge(&worker.wait_histogram);
+                        merged_default_exec.merge(&worker.exec_histogram);
+                    },
+                    .blocking => {
+                        merged_blocking_wait.merge(&worker.wait_histogram);
+                        merged_blocking_exec.merge(&worker.exec_histogram);
+                    },
+                }
+            }
         }
 
         // REV-001 — compute best-effort counter-skew flag.  A panicked
@@ -1121,6 +1142,10 @@ const Core = struct {
             .accounting_skew_detected = skew,
             .task_wait_ns = merged_wait.summary(),
             .task_exec_ns = merged_exec.summary(),
+            .default_wait_ns = if (per_lane_active) merged_default_wait.summary() else .{},
+            .default_exec_ns = if (per_lane_active) merged_default_exec.summary() else .{},
+            .blocking_wait_ns = if (per_lane_active) merged_blocking_wait.summary() else .{},
+            .blocking_exec_ns = if (per_lane_active) merged_blocking_exec.summary() else .{},
             .memory = memory,
             .worker_stats = self.worker_stats_buffer,
         };
