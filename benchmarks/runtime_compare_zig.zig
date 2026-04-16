@@ -431,6 +431,8 @@ fn runCpuWorkScenario(worker_count: usize, task_count: usize, work_ns: u64, subm
         .queue_capacity = 4096,
         .local_queue_capacity = 256,
         .scheduler_variant = .work_stealing,
+        .max_submitter_queues = @intCast(@max(submitters, 1)),
+        .submitter_queue_capacity = 4096,
     });
     defer pool.deinit();
 
@@ -480,6 +482,9 @@ fn runCpuWorkScenario(worker_count: usize, task_count: usize, work_ns: u64, subm
             };
             threads[s] = try std.Thread.spawn(.{}, struct {
                 fn run(c: *CpuSubmitterCtx) void {
+                    const slot = c.p.registerSubmitter() catch
+                        @panic("registerSubmitter failed during contended_cpu benchmark");
+                    defer c.p.releaseSubmitter(slot);
                     for (c.tasks, 0..) |*t, j| {
                         c.sub_at[j] = nowNs();
                         _ = c.p.submit(realisticTask, @ptrCast(t), .{
