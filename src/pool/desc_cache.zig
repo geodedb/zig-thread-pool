@@ -9,10 +9,10 @@ const std = @import("std");
 /// touches `DescCache` at a time. If this ever changes, every op needs
 /// to become atomic and you should reach for a proper SPSC ring instead.
 pub const DescCache = struct {
-    pub const capacity: usize = 32;
+    pub const capacity: u32 = 32;
 
     indices: [capacity]u32 = undefined,
-    head: usize = 0,
+    head: u32 = 0,
 
     pub fn init() DescCache {
         return .{};
@@ -35,10 +35,15 @@ pub const DescCache = struct {
         return true;
     }
 
+    /// Drains the entire cache into `out`, most-recently-pushed first (LIFO).
+    /// Panics if `out.len < len()`. Resets the cache to empty.
     pub fn drainAll(self: *DescCache, out: []u32) usize {
         const n = self.head;
-        std.debug.assert(out.len >= n);
-        var i: usize = 0;
+        if (out.len < n) std.debug.panic(
+            "drainAll: output buffer too small (need {d}, got {d})",
+            .{ n, out.len },
+        );
+        var i: u32 = 0;
         while (i < n) : (i += 1) out[i] = self.indices[n - 1 - i];
         self.head = 0;
         return n;
