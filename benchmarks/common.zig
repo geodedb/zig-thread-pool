@@ -409,13 +409,23 @@ fn nestedTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = runtime;
     const ctx: *BenchTaskCtx = @ptrCast(@alignCast(raw_ctx));
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
-    for (0..ctx.nested_children) |_| {
-        _ = ctx.pool.?.submit(benchTask, @ptrCast(ctx), .{
-            .wait_group = ctx.wait_group.?,
-            .backpressure = .block,
-            .timeout_ns = 5 * std.time.ns_per_s,
-        }) catch return;
+
+    // submitBatch coalesces the per-task seq-cst queued_tasks fetchAdd
+    // and notifySubmits into one of each per batch. Buffer is [32]
+    // because ScenarioSpec.nested_children is scenario-configurable
+    // and 32 is comfortable headroom for all existing specs
+    // (bench_realistic uses 4). If a future scenario exceeds 32, the
+    // debug assert will fire in test builds.
+    var batch: [32]thread_pool.BatchTask = undefined;
+    std.debug.assert(ctx.nested_children <= batch.len);
+    for (0..ctx.nested_children) |i| {
+        batch[i] = .{ .task_fn = benchTask, .ctx = @ptrCast(ctx) };
     }
+    _ = ctx.pool.?.submitBatch(batch[0..ctx.nested_children], .{
+        .wait_group = ctx.wait_group.?,
+        .backpressure = .block,
+        .timeout_ns = 5 * std.time.ns_per_s,
+    }) catch return;
     ctx.completed_at_ns.* = nowNs();
 }
 
