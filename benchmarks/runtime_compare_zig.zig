@@ -403,13 +403,19 @@ fn nestedParentTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void
     _ = runtime;
     const ctx: *NestedParentCtx = @ptrCast(@alignCast(raw_ctx));
     ctx.completed_at_ns.* = nowNs();
-    for (ctx.child_ctxs, ctx.child_submitted_at) |*child, *sub| {
-        sub.* = nowNs();
-        _ = ctx.pool.submit(realisticTask, @ptrCast(child), .{
-            .wait_group = ctx.wg,
-            .backpressure = .block,
-        }) catch return;
+
+    var batch: [16]thread_pool.BatchTask = undefined;
+    const n = ctx.child_ctxs.len;
+    std.debug.assert(n <= batch.len);
+    const now = nowNs();
+    for (ctx.child_ctxs, ctx.child_submitted_at, 0..) |*child, *sub, i| {
+        sub.* = now;
+        batch[i] = .{ .task_fn = realisticTask, .ctx = @ptrCast(child) };
     }
+    _ = ctx.pool.submitBatch(batch[0..n], .{
+        .wait_group = ctx.wg,
+        .backpressure = .block,
+    }) catch return;
 }
 
 fn runCpuWork10usSample(worker_count: usize) !SampleResult {
