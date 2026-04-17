@@ -341,17 +341,6 @@ const Worker = struct {
     is_overflow: bool = false,
     overflow_retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Go-gap contended Slice 2-W: per-worker DescCache.
-    ///
-    /// Appended AT THE END of `Worker` to preserve existing field offsets
-    /// — the iter-11 `active_tasks` shard regressed flood_1m_batched
-    /// -4.26% and contended_spawn_8x_batched -9.72% purely because
-    /// inserting a field mid-struct shifted other field offsets and
-    /// disrupted cache-line layout. Task 3.2 wires this cache into the
-    /// worker-side descriptor acquire path; Task 3.3 drains it back to
-    /// the freelist on pool deinit.
-    desc_cache: DescCache = .{},
-
     comptime {
         // OBSERVABILITY-PIVOT / R-06: `Worker` is a plain `struct`, so Zig
         // may reorder its fields. We therefore lock size-bounded
@@ -363,17 +352,24 @@ const Worker = struct {
         //      state word size, so no cross-worker tear on mutex ops.
         //      Zig 0.16.0 `std.Thread.Mutex` is futex-based (u32 state),
         //      so `@alignOf == 4`; stronger alignment is not needed.
-        //   b. Total `@sizeOf(Worker)` is bounded. The constant is a
-        //      ceiling: a future refactor that blows it past the bound
-        //      must explicitly update the invariant after documenting
-        //      why the growth is acceptable.
+        //   b. Total `@sizeOf(Worker)` is bounded. Round 3 extracted
+        //      the 136-byte per-worker `DescCache` back out of `Worker`
+        //      into `Core.worker_desc_caches`, returning `Worker` close
+        //      to its pre-Phase-3 size. Observed size under Zig 0.16.0
+        //      / x86_64 at round-3 HEAD: 1920 bytes (8 B larger than
+        //      the pre-Phase-3 1912 due to field padding under the
+        //      current Zig field-ordering heuristic — still well below
+        //      any cacheline-splitting threshold and identical in
+        //      observable behaviour). A tight equality check catches
+        //      silent regrowth; the 4096-byte ceiling remains as a
+        //      second line of defence. A future refactor that blows
+        //      past either bound must explicitly update the invariant
+        //      after documenting why the growth is acceptable (see the
+        //      round 1 Phase 3 ledger for the cost of the previous
+        //      +136 B).
         std.debug.assert(@alignOf(sync.Mutex) >= @alignOf(u32));
-        // Observed size on Zig 0.16.0 / x86_64: 2048 bytes (was 1912
-        // pre-`desc_cache`; Go-gap contended Slice 2-W appended 136
-        // bytes at the end of the struct). Ceiling at 4096 (two pages)
-        // so accidental cacheline-splitting field additions trip at
-        // compile time.
         std.debug.assert(@sizeOf(Worker) <= 4096);
+        std.debug.assert(@sizeOf(Worker) == 1920);
     }
 };
 
@@ -516,6 +512,18 @@ const Core = struct {
     /// Allocated when `max_submitter_queues > 0`; zero-length otherwise.
     /// See Task 2.4 for call-site wiring.
     desc_caches: []DescCache = &.{},
+    /// Round 3: per-worker DescCache moved out of `Worker` into this
+    /// parallel slice indexed by worker_index. Mirrors the submitter
+    /// layout (`desc_caches`) so both sides use the same allocation and
+    /// routing pattern. Keeps `Worker` at the pre-Phase-3 size of 1912 B
+    /// — the 136-byte in-struct field regressed contended_spawn_8x
+    /// -10.10% and contended_cpu_10us -5.28% vs the Phase-2 checkpoint
+    /// of round 1, which this refactor exists to reclaim. Length equals
+    /// the total worker slot count (`max_threads + max_overflow_workers`)
+    /// and is independent of the submitter-queue count — every worker
+    /// has a cache, regardless of whether `registerSubmitter` is ever
+    /// called.
+    worker_desc_caches: []DescCache = &.{},
     /// Slice L4 — optional watchdog thread. Spawned when
     /// `config.watchdog_interval_ns > 0`. Walks default-lane workers every
     /// interval looking for stalled tasks (task duration exceeds
@@ -711,6 +719,17 @@ const Core = struct {
     /// scratch field that would crash on `purge()`.
     fn initWorkers(self: *Core, allocator: std.mem.Allocator, normalized: types.Config) !void {
         const total_worker_slots = normalized.max_threads + normalized.max_overflow_workers;
+
+        // Allocate per-worker DescCache slice up front. Parallel to
+        // `workers` / `local_queues` — indexed by worker_index. Done
+        // before the worker init loops so a partial failure below
+        // still leaves a fully zero-init cache slice that
+        // `drainWorkerDescCaches` can safely iterate under
+        // `deinitOwned`'s cleanup path. Covered by the outer
+        // `errdefer self.deinitOwned()` registered in `Core.init`.
+        self.worker_desc_caches = try allocator.alloc(DescCache, total_worker_slots);
+        for (self.worker_desc_caches) |*c| c.* = .{};
+        self.recordOwnedAlloc(self.worker_desc_caches.len * @sizeOf(DescCache));
 
         for (self.workers[0..normalized.max_threads], self.local_queues[0..normalized.max_threads], 0..) |*worker, *lq, idx| {
             // Initialize worker first (no allocation, cannot fail) so that
@@ -1334,14 +1353,14 @@ const Core = struct {
             const uses_local = usesLocalQueues(self);
             if (uses_local) {
                 if (self.tlsWorkerIndexFor()) |wi| {
-                    const w = &self.workers[wi];
-                    if (w.desc_cache.tryPop()) |cached| break :idx cached;
+                    const cache = &self.worker_desc_caches[wi];
+                    if (cache.tryPop()) |cached| break :idx cached;
                     var batch: [DescCache.capacity]u32 = undefined;
                     const taken = self.acquireDescriptorBatch(&batch);
                     if (taken == 0) return error.TaskPoolExhausted;
                     var i: usize = 1;
                     while (i < taken) : (i += 1) {
-                        _ = w.desc_cache.push(batch[i]);
+                        _ = cache.push(batch[i]);
                     }
                     break :idx batch[0];
                 }
@@ -2464,9 +2483,9 @@ const Core = struct {
     /// acquireDescriptorBatch but never consumed by a task; releasing them
     /// here restores the counter to zero for any post-run leak assertions.
     fn drainWorkerDescCaches(self: *Core) void {
-        for (self.workers[0..self.init_worker_count]) |*worker| {
+        for (self.worker_desc_caches[0..self.init_worker_count]) |*cache| {
             var buf: [DescCache.capacity]u32 = undefined;
-            const n = worker.desc_cache.drainAll(&buf);
+            const n = cache.drainAll(&buf);
             var i: usize = 0;
             while (i < n) : (i += 1) self.releaseDescriptor(buf[i]);
         }
@@ -2498,6 +2517,14 @@ const Core = struct {
         if (self.desc_caches.len > 0) {
             self.recordOwnedFree(self.desc_caches.len * @sizeOf(DescCache));
             self.allocator.free(self.desc_caches);
+        }
+        if (self.worker_desc_caches.len > 0) {
+            // `drainWorkerDescCaches` at the top of `deinitOwned` already
+            // returned every cached index to the global freelist; at this
+            // point the slice contents are irrelevant and we just reclaim
+            // the backing allocation.
+            self.recordOwnedFree(self.worker_desc_caches.len * @sizeOf(DescCache));
+            self.allocator.free(self.worker_desc_caches);
         }
         self.inject_queue.deinit();
         if (self.blocking_inject) |*bi| {
