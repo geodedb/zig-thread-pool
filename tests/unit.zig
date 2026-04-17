@@ -1511,3 +1511,37 @@ test "acquireDescriptorBatch returns distinct indices in one CAS" {
 
     for (out[0..n]) |idx| pool.releaseDescriptorForTesting(idx);
 }
+
+test "registered submitter handles N > DescCache.capacity submits correctly" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 128,
+    });
+    defer pool.deinit();
+
+    const slot = try pool.registerSubmitter();
+    defer pool.releaseSubmitter(slot);
+
+    var done = std.atomic.Value(u64).init(0);
+    const noop = struct {
+        fn run(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const d: *std.atomic.Value(u64) = @ptrCast(@alignCast(raw));
+            _ = d.fetchAdd(1, .monotonic);
+        }
+    }.run;
+
+    var wg = pool.waitGroup();
+    const N: usize = thread_pool.DescCache.capacity * 3 + 5;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        _ = try pool.submit(noop, @ptrCast(&done), .{ .wait_group = &wg, .backpressure = .block });
+    }
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, N), done.load(.acquire));
+}

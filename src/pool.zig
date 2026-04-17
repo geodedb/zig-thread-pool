@@ -1303,7 +1303,21 @@ const Core = struct {
             return error.BlockingLaneDisabled;
         }
 
-        const descriptor_index = self.acquireDescriptor() orelse return error.TaskPoolExhausted;
+        const descriptor_index = idx: {
+            if (self.tlsSubmitterIndexFor()) |si| {
+                const cache = &self.desc_caches[si];
+                if (cache.tryPop()) |cached| break :idx cached;
+                var batch: [DescCache.capacity]u32 = undefined;
+                const taken = self.acquireDescriptorBatch(&batch);
+                if (taken == 0) return error.TaskPoolExhausted;
+                var i: usize = 1;
+                while (i < taken) : (i += 1) {
+                    _ = cache.push(batch[i]);
+                }
+                break :idx batch[0];
+            }
+            break :idx self.acquireDescriptor() orelse return error.TaskPoolExhausted;
+        };
         errdefer self.releaseDescriptor(descriptor_index);
 
         if (options.wait_group) |wait_group| {
