@@ -205,6 +205,44 @@ test "recursive submission through local queues does not deadlock" {
     try std.testing.expectEqual(@as(u64, 9), counter.value.load(.acquire));
 }
 
+test "submitBatch from worker context drains via local queue" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    const CTX = struct {
+        pool: *thread_pool.ThreadPool,
+        wg: *thread_pool.WaitGroup,
+        done: *std.atomic.Value(u64),
+
+        fn parent(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var tasks: [4]thread_pool.BatchTask = undefined;
+            for (&tasks) |*t| {
+                t.* = .{ .task_fn = child, .ctx = @ptrCast(self) };
+            }
+            _ = self.pool.submitBatch(&tasks, .{ .wait_group = self.wg, .backpressure = .block }) catch return;
+        }
+        fn child(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var done = std.atomic.Value(u64).init(0);
+    var wg = pool.waitGroup();
+    var ctx = CTX{ .pool = &pool, .wg = &wg, .done = &done };
+    _ = try pool.submit(CTX.parent, @ptrCast(&ctx), .{ .wait_group = &wg, .backpressure = .block });
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 4), done.load(.monotonic));
+}
+
 test "pre-cancelled token prevents task body execution" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 1,
