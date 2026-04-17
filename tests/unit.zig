@@ -1589,3 +1589,17 @@ test "releaseSubmitter drains desc_cache back to global freelist" {
     const stats_after = pool.statsSnapshot();
     try std.testing.expectEqual(live_before, stats_after.task_desc_live);
 }
+
+test "Worker struct is within the 4096-byte ceiling post-desc_cache" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 4,
+        .max_threads = 4,
+        .queue_capacity = 64,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    try pool.assertWorkerSizeBoundedForTesting(4096);
+}

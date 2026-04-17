@@ -341,6 +341,17 @@ const Worker = struct {
     is_overflow: bool = false,
     overflow_retired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Go-gap contended Slice 2-W: per-worker DescCache.
+    ///
+    /// Appended AT THE END of `Worker` to preserve existing field offsets
+    /// — the iter-11 `active_tasks` shard regressed flood_1m_batched
+    /// -4.26% and contended_spawn_8x_batched -9.72% purely because
+    /// inserting a field mid-struct shifted other field offsets and
+    /// disrupted cache-line layout. Task 3.2 wires this cache into the
+    /// worker-side descriptor acquire path; Task 3.3 drains it back to
+    /// the freelist on pool deinit.
+    desc_cache: DescCache = .{},
+
     comptime {
         // OBSERVABILITY-PIVOT / R-06: `Worker` is a plain `struct`, so Zig
         // may reorder its fields. We therefore lock size-bounded
@@ -357,9 +368,11 @@ const Worker = struct {
         //      must explicitly update the invariant after documenting
         //      why the growth is acceptable.
         std.debug.assert(@alignOf(sync.Mutex) >= @alignOf(u32));
-        // Observed size on Zig 0.16.0 / x86_64: 1912 bytes. Ceiling at
-        // 4096 (two pages) so accidental cacheline-splitting field
-        // additions trip at compile time.
+        // Observed size on Zig 0.16.0 / x86_64: 2048 bytes (was 1912
+        // pre-`desc_cache`; Go-gap contended Slice 2-W appended 136
+        // bytes at the end of the struct). Ceiling at 4096 (two pages)
+        // so accidental cacheline-splitting field additions trip at
+        // compile time.
         std.debug.assert(@sizeOf(Worker) <= 4096);
     }
 };
@@ -2624,6 +2637,16 @@ pub const ThreadPool = struct {
     /// Test-only accessor. Not part of the public contract.
     pub fn releaseDescriptorForTesting(self: *ThreadPool, idx: u32) void {
         self.core.releaseDescriptor(idx);
+    }
+
+    /// Test-only accessor. Asserts `@sizeOf(Worker)` does not exceed
+    /// `ceiling`. Used by unit tests to catch accidental cacheline-
+    /// splitting field additions (iter-11 layout discipline). Returns
+    /// `error.WorkerSizeExceedsCeiling` on breach so the failure shows
+    /// up in the test output instead of tripping the comptime assert.
+    /// Not part of the public contract.
+    pub fn assertWorkerSizeBoundedForTesting(_: *ThreadPool, comptime ceiling: usize) !void {
+        if (@sizeOf(Worker) > ceiling) return error.WorkerSizeExceedsCeiling;
     }
 };
 
