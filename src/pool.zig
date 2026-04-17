@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const BoundedRing = @import("queue/bounded_ring.zig").BoundedRing;
 const WorkDeque = @import("queue/work_deque.zig").WorkDeque;
 const RingQueue = @import("queue/ring_queue.zig").RingQueue;
+const DescCache = @import("pool/desc_cache.zig").DescCache;
 const WorkerScratch = @import("memory/scratch.zig").WorkerScratch;
 const Accounting = @import("memory/scratch.zig").Accounting;
 const LatencyHistogram = @import("stats/latency.zig").LatencyHistogram;
@@ -497,6 +498,11 @@ const Core = struct {
     submitter_queues: []LocalQueue = &.{},
     submitter_nonempty: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
     submitter_free_mask: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Per-submitter SPSC caches of reserved descriptor indices. Parallel
+    /// to `submitter_queues` — slot `i` belongs to submitter slot `i`.
+    /// Allocated when `max_submitter_queues > 0`; zero-length otherwise.
+    /// See Task 2.4 for call-site wiring.
+    desc_caches: []DescCache = &.{},
     /// Slice L4 — optional watchdog thread. Spawned when
     /// `config.watchdog_interval_ns > 0`. Walks default-lane workers every
     /// interval looking for stalled tasks (task duration exceeds
@@ -731,6 +737,10 @@ const Core = struct {
             }
             self.submitter_free_mask = std.atomic.Value(u64).init((@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1);
             self.recordOwnedAlloc(self.submitter_queues.len * @sizeOf(LocalQueue));
+
+            self.desc_caches = try allocator.alloc(DescCache, normalized.max_submitter_queues);
+            for (self.desc_caches) |*c| c.* = .{};
+            self.recordOwnedAlloc(self.desc_caches.len * @sizeOf(DescCache));
         }
     }
 
@@ -2412,6 +2422,10 @@ const Core = struct {
             }
             self.recordOwnedFree(self.submitter_queues.len * @sizeOf(LocalQueue));
             self.allocator.free(self.submitter_queues);
+        }
+        if (self.desc_caches.len > 0) {
+            self.recordOwnedFree(self.desc_caches.len * @sizeOf(DescCache));
+            self.allocator.free(self.desc_caches);
         }
         self.inject_queue.deinit();
         if (self.blocking_inject) |*bi| {
