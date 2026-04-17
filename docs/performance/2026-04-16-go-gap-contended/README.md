@@ -35,7 +35,39 @@ Load average 1.08 (1m) on a 56-core host = ~2% utilization. The two Claude proce
 ## Phase status
 
 - [x] Phase 0 — Baseline
-- [ ] Phase 1 — `submitBatch` harness adoption
+- [x] Phase 1 — `submitBatch` harness adoption (partial: Task 1.2 landed, Task 1.3 reverted)
 - [ ] Phase 2 — Per-submitter descriptor cache
 - [ ] Phase 3 — Per-worker descriptor cache
 - [ ] Phase 4 — Final snapshot + docs
+
+## Phase 1 A/B summary
+
+| Task | Harness | Scenario | Δ% | Gate | Status |
+|------|---------|----------|---:|:----:|:------:|
+| 1.2  | runtime-compare | nested_fanout_4x | **+44.8%** | ≥8% | PASS — landed at f727966+dc25011 |
+| 1.3  | bench-realistic | nested_fanout_4x | +3.22% | ≥5% | FAIL — reverted at 0554a84 |
+
+Detail artifacts:
+- [`phase1-task1.2-result.md`](phase1-task1.2-result.md)
+- [`phase1-task1.3-result.md`](phase1-task1.3-result.md)
+
+Phase 1 is recorded as partial: the runtime_compare harness now exercises
+`submitBatch` on `nested_fanout_4x` (benchmark fairness correction with a
+large measured gain), while `bench-realistic` continues with per-task
+`submit` — the paired A/B did not produce a clean enough signal at n=10
+to justify landing on the noisier latency-focused harness. The pool
+`submitBatch` API itself is unchanged; Phase 1 touched only harnesses.
+
+The 44.8% gain on runtime-compare reflects the coalesced seq-cst
+`queued_tasks.fetchAdd` and `notifySubmits` per batch of 4 children — one
+fetchAdd instead of four, one notify instead of four — which is exactly
+the behaviour the API already documents.
+
+## Phase 0 baseline (ops/sec; 10 samples, 2 warmup discarded)
+
+| Scenario | Zig | Tokio | Go | Zig vs Go |
+|---|---:|---:|---:|:-:|
+| `contended_spawn_8x` | 955,725 | 613,797 | 3,240,636 | 3.39x behind |
+| `contended_cpu_10us` | 1,064,456 | 675,562 | 2,587,678 | 2.43x behind |
+| `nested_fanout_4x`   | 597,869  | 267,213 | 3,979,197 | 6.66x behind |
+| `mixed_fast_slow`    | 225,795  | 218,316 | 245,545   | 1.09x behind |
