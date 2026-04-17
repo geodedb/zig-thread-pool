@@ -185,3 +185,4 @@ zig build bench-realistic -Doptimize=ReleaseFast
 - [2026-04-15 Runtime Comparison Archive](performance/2026-04-15-runtime-comparison/README.md)
 - [2026-04-16 Go-gap contended (DescCache landing)](performance/2026-04-16-go-gap-contended/FINAL.md)
 - [2026-04-17 Go-gap round 2 (FAILED)](performance/2026-04-17-go-gap-round2/FINAL.md)
+- [2026-04-17 Go-gap round 3 (FAILED)](performance/2026-04-17-go-gap-round3/FINAL.md)

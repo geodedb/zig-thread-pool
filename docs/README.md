@@ -56,6 +56,9 @@ and performance history.
 
 Chronological (most recent first):
 
+- [2026-04-17 Go-gap round 3 (FAILED)](performance/2026-04-17-go-gap-round3/FINAL.md) —
+  externalised per-worker DescCache reverted; indirection cost dominated
+  Worker-size savings on all 3 primary targets. **Closed plane.**
 - [2026-04-17 Go-gap round 2 (FAILED)](performance/2026-04-17-go-gap-round2/FINAL.md) —
   lifo-rotate + batched submitBatch both reverted; **closed-plane
   reference** for future rounds.
