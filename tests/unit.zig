@@ -1807,3 +1807,95 @@ test "WorkDeque.tryPushBottomN stealTop observes the batched publish" {
     try std.testing.expectEqual(@as(?u32, 50), q.stealTop());
     try std.testing.expectEqual(@as(?u32, null), q.stealTop());
 }
+
+test "RingQueue.tryPushN batches N entries in one release" {
+    const RingQueue = @import("thread_pool").RingQueue;
+    var q = try RingQueue(u32).init(std.testing.allocator, 64);
+    defer q.deinit();
+
+    const batch = [_]u32{ 10, 20, 30, 40, 50 };
+    const n = q.tryPushN(&batch);
+    try std.testing.expectEqual(@as(usize, 5), n);
+
+    // RingQueue.pop is owner-side LIFO from tail (see src/queue/ring_queue.zig:79).
+    // After batched push of 10..50, pop returns 50, 40, 30, 20, 10.
+    try std.testing.expectEqual(@as(?u32, 50), q.pop());
+    try std.testing.expectEqual(@as(?u32, 40), q.pop());
+    try std.testing.expectEqual(@as(?u32, 30), q.pop());
+    try std.testing.expectEqual(@as(?u32, 20), q.pop());
+    try std.testing.expectEqual(@as(?u32, 10), q.pop());
+    try std.testing.expectEqual(@as(?u32, null), q.pop());
+}
+
+test "RingQueue.tryPushN partial when near-full" {
+    const RingQueue = @import("thread_pool").RingQueue;
+    var q = try RingQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    try std.testing.expect(q.tryPush(1));
+    try std.testing.expect(q.tryPush(2));
+    // Capacity = 4, already 2 in. Batch of 5 should push 2 and return 2.
+    const batch = [_]u32{ 10, 20, 30, 40, 50 };
+    const n = q.tryPushN(&batch);
+    try std.testing.expectEqual(@as(usize, 2), n);
+}
+
+test "RingQueue.tryPushN empty slice is a no-op" {
+    const RingQueue = @import("thread_pool").RingQueue;
+    var q = try RingQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    const n = q.tryPushN(&[_]u32{});
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(@as(?u32, null), q.pop());
+}
+
+test "RingQueue.tryPushN exact-fit publishes all entries" {
+    const RingQueue = @import("thread_pool").RingQueue;
+    var q = try RingQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    const batch = [_]u32{ 7, 8, 9, 10 };
+    const n = q.tryPushN(&batch);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    // A follow-up push must fail (exact-fit leaves no free slots).
+    try std.testing.expect(!q.tryPush(11));
+    // LIFO pop order confirms the ring-index boundary is sound.
+    try std.testing.expectEqual(@as(?u32, 10), q.pop());
+    try std.testing.expectEqual(@as(?u32, 9), q.pop());
+    try std.testing.expectEqual(@as(?u32, 8), q.pop());
+    try std.testing.expectEqual(@as(?u32, 7), q.pop());
+    try std.testing.expectEqual(@as(?u32, null), q.pop());
+}
+
+test "RingQueue.tryPushN crosses the ring-mask wraparound" {
+    const RingQueue = @import("thread_pool").RingQueue;
+    // Capacity 4: advance head/tail far enough that the batched push
+    // straddles the power-of-two mask boundary. Pre-fill and drain a
+    // handful so tail indexes past `buffer.len` when the batch lands.
+    var q = try RingQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    var pre: u32 = 0;
+    while (pre < 3) : (pre += 1) try std.testing.expect(q.tryPush(pre));
+    // Drain all three via stealHalf so head advances to 3 and tail = 3,
+    // with the next push landing at physical slot `3 & mask`, and a batch
+    // of 4 must wrap. stealHalf returns ceil(n/2) per call, so two calls
+    // drain all three (2 then 1).
+    var out: [4]u32 = undefined;
+    const s0 = q.stealHalf(out[0..]);
+    try std.testing.expectEqual(@as(usize, 2), s0);
+    const s1 = q.stealHalf(out[0..]);
+    try std.testing.expectEqual(@as(usize, 1), s1);
+    try std.testing.expectEqual(@as(usize, 0), q.len());
+
+    const batch = [_]u32{ 100, 200, 300, 400 };
+    const n = q.tryPushN(&batch);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    // Draining confirms each slot is readable across the wrap.
+    try std.testing.expectEqual(@as(?u32, 400), q.pop());
+    try std.testing.expectEqual(@as(?u32, 300), q.pop());
+    try std.testing.expectEqual(@as(?u32, 200), q.pop());
+    try std.testing.expectEqual(@as(?u32, 100), q.pop());
+    try std.testing.expectEqual(@as(?u32, null), q.pop());
+}

@@ -76,6 +76,28 @@ pub fn RingQueue(comptime T: type) type {
             return true;
         }
 
+        /// Owner-only. Push up to `values.len` items to the tail. Returns the
+        /// number actually pushed. One `.release` store of `tail` publishes
+        /// all `n` slot writes. Same correctness sketch as `tryPush` scaled:
+        /// slot stores use `.unordered`, the final `tail` store is `.release`
+        /// so stealers that later acquire `tail` observe every slot write.
+        pub fn tryPushN(self: *Self, values: []const T) usize {
+            if (values.len == 0) return 0;
+            const t = self.tail.load(.monotonic);
+            const h = self.head.load(.acquire);
+            const cap: u32 = @intCast(self.buffer.len);
+            const used = t -% h;
+            if (used >= cap) return 0;
+            const free: u32 = cap - used;
+            const n: u32 = @min(free, @as(u32, @intCast(values.len)));
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                self.buffer[(t +% i) & self.mask].store(values[i], .unordered);
+            }
+            self.tail.store(t +% n, .release);
+            return @intCast(n);
+        }
+
         /// Owner-only. Pop from the tail (LIFO). Returns null if empty.
         pub fn pop(self: *Self) ?T {
             const t = self.tail.load(.monotonic);
