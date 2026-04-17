@@ -1454,3 +1454,35 @@ test "clock.sleep sleeps at least the requested duration" {
     // Allow 0.5ms slop for scheduler jitter.
     try std.testing.expect(elapsed >= @as(i96, @intCast(want_ns - 500_000)));
 }
+
+test "DescCache stores and returns indices LIFO" {
+    var cache = thread_pool.DescCache.init();
+    try std.testing.expectEqual(@as(usize, 0), cache.len());
+    try std.testing.expect(cache.tryPop() == null);
+
+    _ = cache.push(7);
+    _ = cache.push(9);
+    try std.testing.expectEqual(@as(?u32, 9), cache.tryPop());
+    try std.testing.expectEqual(@as(?u32, 7), cache.tryPop());
+    try std.testing.expect(cache.tryPop() == null);
+}
+
+test "DescCache full push returns false" {
+    var cache = thread_pool.DescCache.init();
+    var i: u32 = 0;
+    while (i < thread_pool.DescCache.capacity) : (i += 1) try std.testing.expect(cache.push(i));
+    try std.testing.expect(!cache.push(9999));
+}
+
+test "DescCache drainAll yields all held indices" {
+    var cache = thread_pool.DescCache.init();
+    _ = cache.push(1);
+    _ = cache.push(2);
+    _ = cache.push(3);
+
+    var drained: [4]u32 = undefined;
+    const n = cache.drainAll(&drained);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 3, 2, 1 }, drained[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), cache.len());
+}
