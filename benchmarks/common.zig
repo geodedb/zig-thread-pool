@@ -417,7 +417,12 @@ fn nestedTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     // (bench_realistic uses 4). If a future scenario exceeds 32, the
     // debug assert will fire in test builds.
     var batch: [32]thread_pool.BatchTask = undefined;
-    std.debug.assert(ctx.nested_children <= batch.len);
+    if (ctx.nested_children > batch.len) {
+        std.debug.panic(
+            "nestedTask: nested_children={d} exceeds batch buffer size {d}",
+            .{ ctx.nested_children, batch.len },
+        );
+    }
     for (0..ctx.nested_children) |i| {
         batch[i] = .{ .task_fn = benchTask, .ctx = @ptrCast(ctx) };
     }
