@@ -1410,53 +1410,16 @@ const Core = struct {
                 if (self.tlsWorkerIndexFor()) |wi| {
                     const w = &self.workers[wi];
                     if (w.serves_lane == .default) {
-                        // LIFO-rotate (Go `runqput` / Tokio `LifoSlot` next-g
-                        // semantics): always swap the freshest entry into
-                        // lifo_slot; the displaced entry (if any) goes to the
-                        // bottom of local_queue. `nextTask` pops lifo_slot
-                        // first, so the just-spawned task is always the next
-                        // to run when this worker idles — matching Go's
-                        // next-g slot. Under the prior "only when empty"
-                        // variant, only the first worker-context submit after
-                        // a drain got the hot single-atomic-store path; every
-                        // subsequent spawn fell through to the deque.
-                        //
-                        // Safety of the restore branch: only this worker's
-                        // own thread reaches this code path (enqueuePush is
-                        // invoked from the worker's own stack inside a
-                        // running task). Stealers never touch lifo_slot;
-                        // nextTask's swap also runs on this worker's thread
-                        // and is not in flight while enqueuePush is. So a
-                        // plain store back to prev is race-free.
-                        //
-                        // Teardown ordering: `submitInternal` rejects new
-                        // work with `error.ShutdownInProgress` once
-                        // `state != .running` (see ~line 1276), and
-                        // `shutdown` swaps `state` before calling
-                        // `cancelQueuedTasks`. So any worker-context submit
-                        // that reaches this branch happens-before the
-                        // shutdown state transition; `cancelQueuedTasks`'
-                        // `lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire)` at
-                        // teardown observes either prev (drained and
-                        // cancelled) or LIFO_SLOT_EMPTY — no leak window.
-                        const prev = w.lifo_slot.swap(entry, .acq_rel);
-                        if (prev == LIFO_SLOT_EMPTY) {
+                        if (w.lifo_slot.load(.monotonic) == LIFO_SLOT_EMPTY) {
+                            w.lifo_slot.store(entry, .release);
                             queued = true;
                         } else {
                             const was_empty = w.owned_queue_len == 0;
-                            if (self.local_queues[wi].tryPushBottom(prev)) {
+                            queued = self.local_queues[wi].tryPushBottom(entry);
+                            if (queued) {
                                 w.owned_queue_len += 1;
                                 if (was_empty) self.markWorkerNonEmpty(wi);
                                 updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
-                                queued = true;
-                            } else {
-                                // Local deque full — restore prev to lifo_slot
-                                // and fall through to submitter/inject paths
-                                // with `entry`. This preserves FIFO order
-                                // between prev (older) and entry (newer) once
-                                // entry lands in the slower submitter/inject
-                                // queue.
-                                w.lifo_slot.store(prev, .release);
                             }
                         }
                     }
@@ -2509,24 +2472,6 @@ const Core = struct {
         }
     }
 
-    /// Test-only: inject the calling thread as worker `worker_index` for this
-    /// pool in TLS. After this call, `enqueuePush` takes the worker-context
-    /// fast path (lifo_slot / local_queue) on submits issued from this
-    /// thread. Paired with `clearTestTlsWorkerSlot` to restore the non-
-    /// worker default. Only safe when the real worker with that index is
-    /// known not to be racing against the injected thread (e.g. gated on a
-    /// blocking task so its `nextTask` loop is suspended).
-    fn installTestTlsWorkerSlot(self: *Core, worker_index: usize) void {
-        tls_worker_slot = .{ .pool = @as(*anyopaque, @ptrCast(self)), .index = worker_index };
-    }
-
-    /// Test-only: undo `installTestTlsWorkerSlot`. Must be called from the
-    /// same thread that invoked `installTestTlsWorkerSlot`.
-    fn clearTestTlsWorkerSlot(self: *Core) void {
-        _ = self;
-        tls_worker_slot = .{};
-    }
-
     fn deinitOwned(self: *Core) void {
         // Use init_worker_count / init_queue_count / init_submitter_count to
         // bound the cleanup loops: if Core.init fails partway through the
@@ -2732,45 +2677,6 @@ pub const ThreadPool = struct {
     /// of the public contract.
     pub fn drainWorkerDescCachesForTesting(self: *ThreadPool) void {
         self.core.drainWorkerDescCaches();
-    }
-
-    /// Test-only accessor. Injects the calling thread as `worker_index` for
-    /// this pool in TLS so that subsequent `submit` calls on this thread
-    /// take the worker-context fast path in `enqueuePush`. Use with care:
-    /// real worker `worker_index` must be gated (e.g. blocked on a
-    /// semaphore) so its `nextTask` loop is not concurrently racing the
-    /// injected thread on `lifo_slot[worker_index]` / `local_queue[worker_index]`.
-    /// Paired with `clearTestTlsWorkerSlot`. Not part of the public contract.
-    pub fn installTestTlsWorkerSlot(self: *ThreadPool, worker_index: usize) void {
-        self.core.installTestTlsWorkerSlot(worker_index);
-    }
-
-    /// Test-only accessor. Undoes a previous `installTestTlsWorkerSlot`.
-    /// Must be called from the same thread. Not part of the public contract.
-    pub fn clearTestTlsWorkerSlot(self: *ThreadPool) void {
-        self.core.clearTestTlsWorkerSlot();
-    }
-
-    /// Test-only accessor. Reads the LIFO slot for `worker_index` with
-    /// acquire ordering, returning the raw `QueueEntry`. Compare against
-    /// `lifoSlotEmptySentinelForTesting()` to detect the empty state. Not
-    /// part of the public contract.
-    pub fn peekLifoSlotForTesting(self: *ThreadPool, worker_index: usize) QueueEntry {
-        return self.core.workers[worker_index].lifo_slot.load(.acquire);
-    }
-
-    /// Test-only accessor. Returns the sentinel value used for "empty"
-    /// in `lifo_slot`. Not part of the public contract.
-    pub fn lifoSlotEmptySentinelForTesting(_: *ThreadPool) QueueEntry {
-        return LIFO_SLOT_EMPTY;
-    }
-
-    /// Test-only accessor. Returns the approximate count of entries in the
-    /// worker's local deque. Safe to call while the owner is not pushing
-    /// or popping; for a live worker the value may momentarily lag. Not
-    /// part of the public contract.
-    pub fn localQueueLenForTesting(self: *ThreadPool, worker_index: usize) usize {
-        return self.core.local_queues[worker_index].len();
     }
 
     /// Test-only accessor. Asserts `@sizeOf(Worker)` does not exceed
