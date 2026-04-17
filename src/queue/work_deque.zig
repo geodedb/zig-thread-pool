@@ -44,6 +44,36 @@ pub fn WorkDeque(comptime T: type) type {
             return true;
         }
 
+        /// Owner-only. Push up to `values.len` items to the bottom of the deque.
+        /// Returns the number actually pushed (0..values.len). Writes all slot
+        /// payloads at `.unordered` and publishes the new bottom with a single
+        /// `.release` store — one global visibility event regardless of batch
+        /// size, vs N release-stores for N single `tryPushBottom` calls.
+        ///
+        /// Correctness: same as `tryPushBottom` scaled. Stealers only read slots
+        /// at indices `[top, bottom)`, and `bottom` is advanced last under
+        /// `.release`, so until the final store no stealer can observe any of
+        /// the new slot writes. A stealer that sees the bumped bottom sees all
+        /// `n` writes (causal with release).
+        pub fn tryPushBottomN(self: *Self, values: []const T) usize {
+            if (values.len == 0) return 0;
+            const b = self.bottom.load(.monotonic);
+            const t = self.top.load(.acquire);
+            const cap: isize = @intCast(self.buffer.len);
+            const used = b -% t;
+            if (used >= cap) return 0;
+            const free: usize = @intCast(cap -% used);
+            const n = @min(free, values.len);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                self.buffer[@as(usize, @intCast(b +% @as(isize, @intCast(i)))) & self.mask]
+                    .store(values[i], .unordered);
+            }
+            // Release store ensures the buffer writes are visible before bottom advances.
+            self.bottom.store(b +% @as(isize, @intCast(n)), .release);
+            return n;
+        }
+
         /// Owner-only. Pop an item from the bottom of the deque (LIFO).
         /// Returns null if empty.
         pub fn popBottom(self: *Self) ?T {

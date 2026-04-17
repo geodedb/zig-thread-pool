@@ -1702,3 +1702,34 @@ test "pool.deinit drains per-worker desc_caches" {
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
 }
+
+test "WorkDeque.tryPushBottomN batches N entries in one release" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    var q = try WorkDeque(u32).init(std.testing.allocator, 64);
+    defer q.deinit();
+
+    const batch = [_]u32{ 10, 20, 30, 40, 50 };
+    const n = q.tryPushBottomN(&batch);
+    try std.testing.expectEqual(@as(usize, 5), n);
+
+    // popBottom returns LIFO: 50, 40, 30, 20, 10.
+    try std.testing.expectEqual(@as(?u32, 50), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 40), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 30), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 20), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 10), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, null), q.popBottom());
+}
+
+test "WorkDeque.tryPushBottomN partial when near-full" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    var q = try WorkDeque(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    try std.testing.expect(q.tryPushBottom(1));
+    try std.testing.expect(q.tryPushBottom(2));
+    // Capacity = 4, already 2 in. Batch of 5 should push 2 and return 2.
+    const batch = [_]u32{ 10, 20, 30, 40, 50 };
+    const n = q.tryPushBottomN(&batch);
+    try std.testing.expectEqual(@as(usize, 2), n);
+}
