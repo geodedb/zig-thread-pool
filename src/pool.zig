@@ -1331,6 +1331,21 @@ const Core = struct {
         }
 
         const descriptor_index = idx: {
+            const uses_local = usesLocalQueues(self);
+            if (uses_local) {
+                if (self.tlsWorkerIndexFor()) |wi| {
+                    const w = &self.workers[wi];
+                    if (w.desc_cache.tryPop()) |cached| break :idx cached;
+                    var batch: [DescCache.capacity]u32 = undefined;
+                    const taken = self.acquireDescriptorBatch(&batch);
+                    if (taken == 0) return error.TaskPoolExhausted;
+                    var i: usize = 1;
+                    while (i < taken) : (i += 1) {
+                        _ = w.desc_cache.push(batch[i]);
+                    }
+                    break :idx batch[0];
+                }
+            }
             if (self.tlsSubmitterIndexFor()) |si| {
                 const cache = &self.desc_caches[si];
                 if (cache.tryPop()) |cached| break :idx cached;

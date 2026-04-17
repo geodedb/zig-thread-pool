@@ -1603,3 +1603,45 @@ test "Worker struct is within the 4096-byte ceiling post-desc_cache" {
 
     try pool.assertWorkerSizeBoundedForTesting(4096);
 }
+
+test "worker-spawned task consumes from per-worker DescCache" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var done = std.atomic.Value(u64).init(0);
+    const Ctx = struct {
+        pool: *thread_pool.ThreadPool,
+        wg: *thread_pool.WaitGroup,
+        done: *std.atomic.Value(u64),
+        fn parent(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                _ = self.pool.submit(child, @ptrCast(self), .{
+                    .wait_group = self.wg,
+                    .backpressure = .block,
+                }) catch return;
+            }
+        }
+        fn child(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wg = pool.waitGroup();
+    var ctx = Ctx{ .pool = &pool, .wg = &wg, .done = &done };
+    _ = try pool.submit(Ctx.parent, @ptrCast(&ctx), .{
+        .wait_group = &wg,
+        .backpressure = .block,
+    });
+    wg.wait();
+    try std.testing.expectEqual(@as(u64, 64), done.load(.monotonic));
+}
