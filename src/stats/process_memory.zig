@@ -97,15 +97,8 @@ fn sampleMacos() !types.ProcessMemoryStats {
 }
 
 fn sampleWindows() !types.ProcessMemoryStats {
-    const windows = std.os.windows;
-    const counters = windows.GetProcessMemoryInfo(windows.GetCurrentProcess()) catch {
-        return error.ProcessMemoryUnavailable;
-    };
-
-    return .{
-        .rss_current_bytes = @as(u64, @intCast(counters.WorkingSetSize)),
-        .rss_peak_bytes = @as(u64, @intCast(counters.PeakWorkingSetSize)),
-        .private_current_bytes = @as(u64, @intCast(counters.PagefileUsage)),
-        .private_peak_bytes = @as(u64, @intCast(counters.PeakPagefileUsage)),
-    };
+    // Zig 0.16 removed the GetProcessMemoryInfo wrapper from std.os.windows.
+    // Keep Windows memory sampling unavailable until a psapi.dll extern is
+    // added; callers already handle ProcessMemoryUnavailable gracefully.
+    return error.ProcessMemoryUnavailable;
 }
