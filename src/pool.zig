@@ -2250,6 +2250,52 @@ const Core = struct {
         }
     }
 
+    /// Batched take from the top of the freelist. Returns the number of
+    /// descriptors actually taken (0..out.len). One CAS regardless of
+    /// batch size, vs N CASes for N single acquires. Caller must arrange
+    /// to `releaseDescriptor` each returned index exactly once.
+    ///
+    /// Traverses up to `out.len` freelist links to find the new head, then
+    /// CAS-publishes the skip. On CAS failure, retries from the current
+    /// head (standard lock-free retry loop).
+    fn acquireDescriptorBatch(self: *Core, out: []u32) usize {
+        if (out.len == 0) return 0;
+        retry: while (true) {
+            const tagged = self.free_top_tagged.load(.acquire);
+            const head = @as(u32, @truncate(tagged));
+            if (head == free_sentinel) return 0;
+            const aba = @as(u32, @truncate(tagged >> 32));
+
+            var taken: usize = 1;
+            var cur: u32 = head;
+            out[0] = head;
+            while (taken < out.len) {
+                const next = self.free_indices[cur].load(.monotonic);
+                if (next == free_sentinel) break;
+                out[taken] = next;
+                taken += 1;
+                cur = next;
+            }
+            const new_head_u32 = self.free_indices[cur].load(.monotonic);
+            const new_tagged = (@as(u64, aba +% 1) << 32) | @as(u64, new_head_u32);
+            if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                continue :retry;
+            }
+            for (out[0..taken]) |idx| {
+                const descriptor = &self.descriptors[idx];
+                const prev_generation = descriptor.generation;
+                descriptor.* = .{};
+                descriptor.generation = prev_generation +% 1;
+                if (descriptor.generation == 0) descriptor.generation = 1;
+                if (claim_sentinel_enabled) descriptor.claimed_by.store(-1, .release);
+                descriptor.state.store(.reserved, .release);
+            }
+            const live = self.counters.task_desc_live.fetchAdd(taken, .monotonic) + taken;
+            updatePeak(&self.counters.task_desc_peak, live);
+            return taken;
+        }
+    }
+
     /// Release a completed or cancelled descriptor back to the freelist.
     ///
     /// SEC-018: uses a CAS on `descriptor.state` to guarantee exactly-once
@@ -2525,6 +2571,17 @@ pub const ThreadPool = struct {
     /// allocator ownership.
     pub fn purgeWorkerCaches(self: *ThreadPool) !void {
         return self.core.purgeWorkerCaches();
+    }
+
+    // Test-only accessors
+    /// Test-only accessor. Not part of the public contract.
+    pub fn acquireDescriptorBatchForTesting(self: *ThreadPool, out: []u32) usize {
+        return self.core.acquireDescriptorBatch(out);
+    }
+
+    /// Test-only accessor. Not part of the public contract.
+    pub fn releaseDescriptorForTesting(self: *ThreadPool, idx: u32) void {
+        self.core.releaseDescriptor(idx);
     }
 };
 

@@ -1486,3 +1486,28 @@ test "DescCache drainAll yields all held indices" {
     try std.testing.expectEqualSlices(u32, &[_]u32{ 3, 2, 1 }, drained[0..n]);
     try std.testing.expectEqual(@as(usize, 0), cache.len());
 }
+
+test "acquireDescriptorBatch returns distinct indices in one CAS" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 64,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var out: [16]u32 = undefined;
+    const n = pool.acquireDescriptorBatchForTesting(&out);
+    try std.testing.expect(n > 0 and n <= out.len);
+
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+    for (out[0..n]) |idx| {
+        const gop = try seen.getOrPut(idx);
+        try std.testing.expect(!gop.found_existing);
+    }
+
+    for (out[0..n]) |idx| pool.releaseDescriptorForTesting(idx);
+}
