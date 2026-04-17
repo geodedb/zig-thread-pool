@@ -1899,3 +1899,37 @@ test "RingQueue.tryPushN crosses the ring-mask wraparound" {
     try std.testing.expectEqual(@as(?u32, 100), q.pop());
     try std.testing.expectEqual(@as(?u32, null), q.pop());
 }
+
+test "submitBatch of 8 from worker context routes through tryPushBottomN" {
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 256,
+    });
+    defer pool.deinit();
+
+    pool.installTestTlsWorkerSlot(0);
+    defer pool.clearTestTlsWorkerSlot();
+
+    const T = struct {
+        var count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        fn bump(_: *anyopaque, _: *thread_pool.TaskContext) void {
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+    T.count.store(0, .monotonic);
+
+    var ctx: u8 = 0;
+    var tasks: [8]thread_pool.BatchTask = undefined;
+    for (&tasks) |*t| t.* = .{ .task_fn = T.bump, .ctx = &ctx };
+
+    const res = try pool.submitBatch(&tasks, .{});
+    try std.testing.expectEqual(@as(usize, 8), res.submitted);
+
+    pool.clearTestTlsWorkerSlot();
+
+    const deadline = thread_pool.clock.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (T.count.load(.monotonic) < 8) {
+        if (thread_pool.clock.nanoTimestamp() > deadline) return error.Timeout;
+        std.Thread.yield() catch {};
+    }
+}

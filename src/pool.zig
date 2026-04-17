@@ -829,12 +829,30 @@ const Core = struct {
     /// of tasks actually queued.
     pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !SubmitBatchResult {
         if (tasks.len == 0) return .{ .submitted = 0 };
-
         const effective = self.effectiveBackpressure(options);
         const deadline = if (effective == .block_with_timeout and options.timeout_ns != null)
             nowNs() + options.timeout_ns.?
         else
             0;
+
+        if (options.lane == .default and tasks.len > 1) {
+            const uses_local = usesLocalQueues(self);
+            if (uses_local) {
+                if (self.tlsWorkerIndexFor()) |wi| {
+                    const w = &self.workers[wi];
+                    if (w.serves_lane == .default) {
+                        if (self.submitBatchWorkerFast(tasks, options, wi, w)) |res| {
+                            return res;
+                        }
+                    }
+                }
+                if (self.tlsSubmitterIndexFor()) |si| {
+                    if (self.submitBatchSubmitterFast(tasks, options, si)) |res| {
+                        return res;
+                    }
+                }
+            }
+        }
 
         var submitted: usize = 0;
         var pending_notify: u64 = 0;
@@ -868,9 +886,6 @@ const Core = struct {
                     self.waitForCapacity(deadline, options.lane);
                 },
                 error.BlockingLaneDisabled => {
-                    // Config rejects this lane. Flush pending then propagate
-                    // the error regardless of backpressure — no amount of
-                    // waiting will unblock a disabled lane.
                     if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
                     if (submitted == 0) return err;
                     return .{ .submitted = submitted };
@@ -879,6 +894,155 @@ const Core = struct {
         }
         if (pending_notify > 0) self.notifySubmits(pending_notify, options.lane);
         return .{ .submitted = submitted };
+    }
+
+    fn submitBatchWorkerFast(
+        self: *Core,
+        tasks: []const BatchTask,
+        options: types.SubmitOptions,
+        wi: usize,
+        w: *Worker,
+    ) ?SubmitBatchResult {
+        const n = tasks.len;
+        var desc_buf: [128]u32 = undefined;
+        if (n > desc_buf.len) return null;
+        var acquired: usize = 0;
+        while (acquired < n) {
+            if (w.desc_cache.tryPop()) |idx| {
+                desc_buf[acquired] = idx;
+                acquired += 1;
+                continue;
+            }
+            var refill: [DescCache.capacity]u32 = undefined;
+            const taken = self.acquireDescriptorBatch(&refill);
+            if (taken == 0) break;
+            var ri: usize = 0;
+            while (ri < taken and acquired < n) : (ri += 1) {
+                desc_buf[acquired] = refill[ri];
+                acquired += 1;
+            }
+            while (ri < taken) : (ri += 1) {
+                _ = w.desc_cache.push(refill[ri]);
+            }
+        }
+        if (acquired == 0) return null;
+
+        var entries: [128]QueueEntry = undefined;
+        var j: usize = 0;
+        const with_ts = timestampsEnabled(self);
+        while (j < acquired) : (j += 1) {
+            const di = desc_buf[j];
+            const d = &self.descriptors[di];
+            d.task_fn = tasks[j].task_fn;
+            d.ctx = tasks[j].ctx;
+            d.options = options;
+            d.submit_ns = if (with_ts) nowNs() else 0;
+            d.start_ns = 0;
+            d.complete_ns = 0;
+            d.state.store(.queued, .release);
+            if (options.wait_group) |wg| wg.add(1);
+            entries[j] = packEntry(di, d.generation);
+        }
+
+        const newest = entries[acquired - 1];
+        const prev_slot = w.lifo_slot.swap(newest, .acq_rel);
+        const had_prev = prev_slot != LIFO_SLOT_EMPTY;
+
+        var push_buf: [129]QueueEntry = undefined;
+        var push_n: usize = 0;
+        if (had_prev) {
+            push_buf[0] = prev_slot;
+            push_n = 1;
+        }
+        for (entries[0 .. acquired - 1]) |e| {
+            push_buf[push_n] = e;
+            push_n += 1;
+        }
+
+        const was_empty = w.owned_queue_len == 0;
+        const pushed = self.local_queues[wi].tryPushBottomN(push_buf[0..push_n]);
+        if (pushed < push_n) {
+            w.lifo_slot.store(prev_slot, .release);
+            for (desc_buf[0..acquired]) |di| {
+                const d = &self.descriptors[di];
+                if (options.wait_group) |wg| wg.done();
+                _ = d.state.cmpxchgStrong(.queued, .free, .acq_rel, .acquire);
+                self.releaseDescriptor(di);
+            }
+            return null;
+        }
+
+        if (pushed > 0) {
+            w.owned_queue_len += pushed;
+            if (was_empty) self.markWorkerNonEmpty(wi);
+            updatePeakU32(&w.local_queue_peak, @intCast(w.owned_queue_len));
+        }
+
+        self.notifySubmits(@intCast(acquired), options.lane);
+        return .{ .submitted = acquired };
+    }
+
+    fn submitBatchSubmitterFast(
+        self: *Core,
+        tasks: []const BatchTask,
+        options: types.SubmitOptions,
+        si: usize,
+    ) ?SubmitBatchResult {
+        const n = tasks.len;
+        var desc_buf: [128]u32 = undefined;
+        if (n > desc_buf.len) return null;
+        const cache = &self.desc_caches[si];
+        var acquired: usize = 0;
+        while (acquired < n) {
+            if (cache.tryPop()) |idx| {
+                desc_buf[acquired] = idx;
+                acquired += 1;
+                continue;
+            }
+            var refill: [DescCache.capacity]u32 = undefined;
+            const taken = self.acquireDescriptorBatch(&refill);
+            if (taken == 0) break;
+            var ri: usize = 0;
+            while (ri < taken and acquired < n) : (ri += 1) {
+                desc_buf[acquired] = refill[ri];
+                acquired += 1;
+            }
+            while (ri < taken) : (ri += 1) {
+                _ = cache.push(refill[ri]);
+            }
+        }
+        if (acquired == 0) return null;
+
+        var entries: [128]QueueEntry = undefined;
+        var j: usize = 0;
+        const with_ts = timestampsEnabled(self);
+        while (j < acquired) : (j += 1) {
+            const di = desc_buf[j];
+            const d = &self.descriptors[di];
+            d.task_fn = tasks[j].task_fn;
+            d.ctx = tasks[j].ctx;
+            d.options = options;
+            d.submit_ns = if (with_ts) nowNs() else 0;
+            d.start_ns = 0;
+            d.complete_ns = 0;
+            d.state.store(.queued, .release);
+            if (options.wait_group) |wg| wg.add(1);
+            entries[j] = packEntry(di, d.generation);
+        }
+
+        const pushed = self.submitter_queues[si].tryPushBottomN(entries[0..acquired]);
+        if (pushed < acquired) {
+            for (desc_buf[pushed..acquired]) |di| {
+                const d = &self.descriptors[di];
+                if (options.wait_group) |wg| wg.done();
+                _ = d.state.cmpxchgStrong(.queued, .free, .acq_rel, .acquire);
+                self.releaseDescriptor(di);
+            }
+            if (pushed == 0) return null;
+        }
+
+        self.notifySubmits(@intCast(pushed), options.lane);
+        return .{ .submitted = pushed };
     }
 
     pub fn registerSubmitter(self: *Core) !usize {
@@ -2479,6 +2643,19 @@ const Core = struct {
         }
     }
 
+    /// Test-only: Inject the calling thread as `worker_index` for this pool
+    /// in TLS. Paired with `clearTestTlsWorkerSlot`.
+    fn installTestTlsWorkerSlot(self: *Core, worker_index: usize) void {
+        tls_worker_slot = .{ .pool = @as(*anyopaque, @ptrCast(self)), .index = worker_index };
+    }
+
+    /// Test-only: undo `installTestTlsWorkerSlot`. Must be called from the
+    /// same thread that invoked `installTestTlsWorkerSlot`.
+    fn clearTestTlsWorkerSlot(self: *Core) void {
+        _ = self;
+        tls_worker_slot = .{};
+    }
+
     fn deinitOwned(self: *Core) void {
         // Use init_worker_count / init_queue_count / init_submitter_count to
         // bound the cleanup loops: if Core.init fails partway through the
@@ -2694,6 +2871,16 @@ pub const ThreadPool = struct {
     /// Not part of the public contract.
     pub fn assertWorkerSizeBoundedForTesting(_: *ThreadPool, comptime ceiling: usize) !void {
         if (@sizeOf(Worker) > ceiling) return error.WorkerSizeExceedsCeiling;
+    }
+
+    /// Test-only accessor. Not part of the public contract.
+    pub fn installTestTlsWorkerSlot(self: *ThreadPool, worker_index: usize) void {
+        self.core.installTestTlsWorkerSlot(worker_index);
+    }
+
+    /// Test-only accessor. Not part of the public contract.
+    pub fn clearTestTlsWorkerSlot(self: *ThreadPool) void {
+        self.core.clearTestTlsWorkerSlot();
     }
 };
 
