@@ -1900,10 +1900,71 @@ test "RingQueue.tryPushN crosses the ring-mask wraparound" {
     try std.testing.expectEqual(@as(?u32, null), q.pop());
 }
 
+test "submitBatch fast-path rollback does not leak descriptors" {
+    // Regression guard for C-1: the rollback loops in submitBatchWorkerFast
+    // previously did an external cmpxchgStrong(.queued, .free) before calling
+    // releaseDescriptor, causing releaseDescriptor to early-return on .free
+    // and skip task_desc_live.fetchSub + freelist push — descriptors leaked.
+    //
+    // With local_queue_capacity = 2 and 8 tasks, push_n = 7 entries exceed
+    // the queue capacity so pushed < push_n triggers the rollback path.
+    // The fast path returns null and the slow path re-submits; but any
+    // descriptors touched by the rollback must not be stranded outside the
+    // freelist.  After all tasks complete + drainWorkerDescCachesForTesting,
+    // task_desc_live must be 0.  If C-1 is re-introduced, the desc count
+    // will be non-zero and the final assertion fails.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 2,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    pool.installTestTlsWorkerSlot(0);
+    defer pool.clearTestTlsWorkerSlot();
+
+    var wg = pool.waitGroup();
+    const T = struct {
+        var count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        fn bump(_: *anyopaque, _: *thread_pool.TaskContext) void {
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+    T.count.store(0, .monotonic);
+    var ctx: u8 = 0;
+    var tasks: [8]thread_pool.BatchTask = undefined;
+    for (&tasks) |*t| t.* = .{ .task_fn = T.bump, .ctx = &ctx };
+
+    // Submit with a WaitGroup so we can block until all accepted tasks drain.
+    // The fast-path rollback fires (local queue too small), then the slow
+    // path re-submits. Either way, all accepted tasks must complete.
+    const res = try pool.submitBatch(&tasks, .{ .wait_group = &wg });
+
+    pool.clearTestTlsWorkerSlot();
+
+    // Wait for all submitted tasks to complete.
+    wg.wait();
+    try std.testing.expectEqual(res.submitted, T.count.load(.monotonic));
+
+    // Drain per-worker DescCaches (mirrors deinitOwned's drain) so that
+    // descriptors held in worker caches are returned to the freelist and
+    // task_desc_live is correctly zeroed before we read it.
+    pool.drainWorkerDescCachesForTesting();
+
+    // task_desc_live must be 0: every descriptor acquired during the
+    // rollback path must have been returned to the freelist.  A non-zero
+    // value means the C-1 external-CAS bug caused releaseDescriptor to
+    // skip task_desc_live.fetchSub, leaving leaked descriptor counts.
+    const snap = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.task_desc_live);
+}
+
 test "submitBatch of 8 from worker context routes through tryPushBottomN" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .max_threads = 2,
         .queue_capacity = 256,
+        .scheduler_variant = .work_stealing,
     });
     defer pool.deinit();
 

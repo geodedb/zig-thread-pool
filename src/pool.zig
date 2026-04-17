@@ -964,9 +964,7 @@ const Core = struct {
         if (pushed < push_n) {
             w.lifo_slot.store(prev_slot, .release);
             for (desc_buf[0..acquired]) |di| {
-                const d = &self.descriptors[di];
                 if (options.wait_group) |wg| wg.done();
-                _ = d.state.cmpxchgStrong(.queued, .free, .acq_rel, .acquire);
                 self.releaseDescriptor(di);
             }
             return null;
@@ -1033,9 +1031,7 @@ const Core = struct {
         const pushed = self.submitter_queues[si].tryPushBottomN(entries[0..acquired]);
         if (pushed < acquired) {
             for (desc_buf[pushed..acquired]) |di| {
-                const d = &self.descriptors[di];
                 if (options.wait_group) |wg| wg.done();
-                _ = d.state.cmpxchgStrong(.queued, .free, .acq_rel, .acquire);
                 self.releaseDescriptor(di);
             }
             if (pushed == 0) return null;
