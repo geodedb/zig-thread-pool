@@ -2457,6 +2457,21 @@ const Core = struct {
         self.accounting.recordFree(bytes);
     }
 
+    /// Drain per-worker DescCaches back to the global freelist. Called from
+    /// deinitOwned (after workers are joined) and exposed via the testing
+    /// hook so tests can assert task_desc_live == 0 before pool.deinit().
+    /// Each index held in a worker cache was counted into task_desc_live by
+    /// acquireDescriptorBatch but never consumed by a task; releasing them
+    /// here restores the counter to zero for any post-run leak assertions.
+    fn drainWorkerDescCaches(self: *Core) void {
+        for (self.workers[0..self.init_worker_count]) |*worker| {
+            var buf: [DescCache.capacity]u32 = undefined;
+            const n = worker.desc_cache.drainAll(&buf);
+            var i: usize = 0;
+            while (i < n) : (i += 1) self.releaseDescriptor(buf[i]);
+        }
+    }
+
     fn deinitOwned(self: *Core) void {
         // Use init_worker_count / init_queue_count / init_submitter_count to
         // bound the cleanup loops: if Core.init fails partway through the
@@ -2465,6 +2480,7 @@ const Core = struct {
         // counts would invoke purge() / deinit() on garbage pointers → crash.
         // After a successful init these counts equal the slice lengths, so the
         // hot (non-error) path is unchanged.
+        self.drainWorkerDescCaches();
         for (self.workers[0..self.init_worker_count]) |*worker| {
             worker.scratch.purge();
         }
@@ -2652,6 +2668,15 @@ pub const ThreadPool = struct {
     /// Test-only accessor. Not part of the public contract.
     pub fn releaseDescriptorForTesting(self: *ThreadPool, idx: u32) void {
         self.core.releaseDescriptor(idx);
+    }
+
+    /// Test-only accessor. Drains all per-worker DescCaches back to the
+    /// global freelist, mirroring the drain that deinitOwned performs. Use
+    /// in tests to assert task_desc_live == 0 before pool.deinit() while
+    /// the pool is still live and statsSnapshot() can be called. Not part
+    /// of the public contract.
+    pub fn drainWorkerDescCachesForTesting(self: *ThreadPool) void {
+        self.core.drainWorkerDescCaches();
     }
 
     /// Test-only accessor. Asserts `@sizeOf(Worker)` does not exceed

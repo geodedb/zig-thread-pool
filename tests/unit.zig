@@ -1645,3 +1645,60 @@ test "worker-spawned task consumes from per-worker DescCache" {
     wg.wait();
     try std.testing.expectEqual(@as(u64, 64), done.load(.monotonic));
 }
+
+test "pool.deinit drains per-worker desc_caches" {
+    // Verifies that descriptor indices cached in Worker.desc_cache are
+    // returned to the global freelist at pool teardown, so task_desc_live
+    // reaches zero.  The explicit drainWorkerDescCachesForTesting hook
+    // mirrors the drain that deinitOwned runs, letting us assert the
+    // invariant while the pool is still live (statsSnapshot requires a
+    // live pool).  Without the drain, workers hold ~32 cached-but-unused
+    // indices each and task_desc_live remains > 0 after wg.wait().
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    var done = std.atomic.Value(u64).init(0);
+    const Ctx = struct {
+        pool: *thread_pool.ThreadPool,
+        wg: *thread_pool.WaitGroup,
+        done: *std.atomic.Value(u64),
+        fn parent(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var i: usize = 0;
+            // 96 children across 2 workers ensures both caches refill at
+            // least once, leaving cached-but-unused indices when tasks end.
+            while (i < 96) : (i += 1) {
+                _ = self.pool.submit(child, @ptrCast(self), .{
+                    .wait_group = self.wg,
+                    .backpressure = .block,
+                }) catch return;
+            }
+        }
+        fn child(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wg = pool.waitGroup();
+    var ctx = Ctx{ .pool = &pool, .wg = &wg, .done = &done };
+    _ = try pool.submit(Ctx.parent, @ptrCast(&ctx), .{
+        .wait_group = &wg,
+        .backpressure = .block,
+    });
+    wg.wait();
+
+    // Drain worker caches before asserting; this exercises the same code
+    // path that deinitOwned calls internally at shutdown.
+    pool.drainWorkerDescCachesForTesting();
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
+}
