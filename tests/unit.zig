@@ -1545,3 +1545,47 @@ test "registered submitter handles N > DescCache.capacity submits correctly" {
     wg.wait();
     try std.testing.expectEqual(@as(u64, N), done.load(.acquire));
 }
+
+test "releaseSubmitter drains desc_cache back to global freelist" {
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 32,
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    const stats_before = pool.statsSnapshot();
+    const live_before = stats_before.task_desc_live;
+
+    const slot = try pool.registerSubmitter();
+
+    var done = std.atomic.Value(u64).init(0);
+    const noop = struct {
+        fn run(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const d: *std.atomic.Value(u64) = @ptrCast(@alignCast(raw));
+            _ = d.fetchAdd(1, .monotonic);
+        }
+    }.run;
+
+    var wg = pool.waitGroup();
+    // 16 submits will refill the cache (take 32 from freelist on first miss,
+    // consume 1, cache 31 — then 15 more tryPop hits). After wg.wait() returns,
+    // 16 descriptors are queued but the other 16 cached indices are still live.
+    for (0..16) |_| {
+        _ = try pool.submit(noop, @ptrCast(&done), .{ .wait_group = &wg, .backpressure = .block });
+    }
+    wg.wait();
+
+    // Release the submitter — must return the remaining ~16 cached
+    // descriptors to the global freelist, restoring task_desc_live to
+    // the pre-registration value.
+    pool.releaseSubmitter(slot);
+
+    const stats_after = pool.statsSnapshot();
+    try std.testing.expectEqual(live_before, stats_after.task_desc_live);
+}

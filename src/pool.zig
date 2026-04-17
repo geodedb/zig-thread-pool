@@ -914,6 +914,21 @@ const Core = struct {
             tls_submitter_slot = .{};
         }
 
+        // Drain desc_cache back to the global freelist. Must happen AFTER the
+        // free_mask CAS above (we own this slot) and BEFORE next registerSubmitter
+        // can observe a stale cache. Cached descriptors are in `.reserved` state
+        // (set by acquireDescriptorBatch at refill time) and releaseDescriptor
+        // accepts .reserved in its terminal-state CAS loop.
+        {
+            const cache = &self.desc_caches[idx];
+            var buf: [DescCache.capacity]u32 = undefined;
+            const n = cache.drainAll(&buf);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                self.releaseDescriptor(buf[i]);
+            }
+        }
+
         // Drain: bounded spin-retry on inject_queue.tryPush so no task is
         // silently dropped in the common case. The outer loop terminates
         // because the submitter queue is bounded; the inner spin is bounded
