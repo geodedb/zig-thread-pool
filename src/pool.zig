@@ -174,6 +174,13 @@ const LocalQueue = union(enum) {
         };
     }
 
+    fn tryPushBottomN(self: *LocalQueue, values: []const QueueEntry) usize {
+        return switch (self.*) {
+            .chase_lev => |*q| q.tryPushBottomN(values),
+            .ring => |*q| q.tryPushN(values),
+        };
+    }
+
     fn popBottom(self: *LocalQueue) ?QueueEntry {
         return switch (self.*) {
             .chase_lev => |*q| q.popBottom(),
