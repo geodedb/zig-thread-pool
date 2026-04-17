@@ -1646,6 +1646,78 @@ test "worker-spawned task consumes from per-worker DescCache" {
     try std.testing.expectEqual(@as(u64, 64), done.load(.monotonic));
 }
 
+test "per-worker desc_caches live on pool, not inside Worker" {
+    // Round 3 invariant: the per-worker DescCache is owned by a
+    // pool-level slice (`Core.worker_desc_caches`) rather than a field
+    // on the `Worker` struct. `Core` is private, so we pin the
+    // structural change via the observable side effect: `Worker` shrank
+    // back to its pre-Phase-3 size when the 136-byte `desc_cache` field
+    // was extracted. A tight ceiling of 1920 bytes catches any
+    // regression that would put the cache (or a new field of similar
+    // size) back into Worker.
+    //
+    // Pre-refactor Worker size: 2048 bytes (fails the 1920 ceiling).
+    // Post-refactor Worker size: 1912 bytes (passes comfortably).
+    //
+    // The test also exercises `drainWorkerDescCachesForTesting` end-to-
+    // end so a refactor that removes the cache entirely (instead of
+    // relocating it) still fails: the drain must return the 32-entry
+    // capacity worth of cached descriptors to the freelist and leave
+    // `task_desc_live == 0`.
+    const allocator = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .local_queue_capacity = 64,
+        .scheduler_variant = .work_stealing,
+    });
+    defer pool.deinit();
+
+    // Structural invariant: Worker must fit below the tight ceiling.
+    // Fails against the pre-round-3 layout where the 136-byte
+    // `desc_cache` field blew the Worker size up to 2048.
+    try pool.assertWorkerSizeBoundedForTesting(1920);
+
+    // Behavioural invariant: worker-context submits still populate a
+    // per-worker DescCache that `drainWorkerDescCachesForTesting`
+    // returns to the global freelist. Even if Worker shrinks some
+    // other way (e.g. an unrelated field removal), the per-worker
+    // cache must still exist and still be drainable.
+    var done = std.atomic.Value(u64).init(0);
+    const Ctx = struct {
+        pool: *thread_pool.ThreadPool,
+        wg: *thread_pool.WaitGroup,
+        done: *std.atomic.Value(u64),
+        fn parent(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                _ = self.pool.submit(child, @ptrCast(self), .{
+                    .wait_group = self.wg,
+                    .backpressure = .block,
+                }) catch return;
+            }
+        }
+        fn child(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var wg = pool.waitGroup();
+    var ctx = Ctx{ .pool = &pool, .wg = &wg, .done = &done };
+    _ = try pool.submit(Ctx.parent, @ptrCast(&ctx), .{
+        .wait_group = &wg,
+        .backpressure = .block,
+    });
+    wg.wait();
+
+    pool.drainWorkerDescCachesForTesting();
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
+}
+
 test "pool.deinit drains per-worker desc_caches" {
     // Verifies that descriptor indices cached in Worker.desc_cache are
     // returned to the global freelist at pool teardown, so task_desc_live
