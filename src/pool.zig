@@ -1428,6 +1428,17 @@ const Core = struct {
                         // nextTask's swap also runs on this worker's thread
                         // and is not in flight while enqueuePush is. So a
                         // plain store back to prev is race-free.
+                        //
+                        // Teardown ordering: `submitInternal` rejects new
+                        // work with `error.ShutdownInProgress` once
+                        // `state != .running` (see ~line 1276), and
+                        // `shutdown` swaps `state` before calling
+                        // `cancelQueuedTasks`. So any worker-context submit
+                        // that reaches this branch happens-before the
+                        // shutdown state transition; `cancelQueuedTasks`'
+                        // `lifo_slot.swap(LIFO_SLOT_EMPTY, .acquire)` at
+                        // teardown observes either prev (drained and
+                        // cancelled) or LIFO_SLOT_EMPTY — no leak window.
                         const prev = w.lifo_slot.swap(entry, .acq_rel);
                         if (prev == LIFO_SLOT_EMPTY) {
                             queued = true;
