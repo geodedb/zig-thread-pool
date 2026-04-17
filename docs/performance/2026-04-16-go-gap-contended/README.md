@@ -36,7 +36,7 @@ Load average 1.08 (1m) on a 56-core host = ~2% utilization. The two Claude proce
 
 - [x] Phase 0 — Baseline
 - [x] Phase 1 — `submitBatch` harness adoption (partial: Task 1.2 landed, Task 1.3 reverted)
-- [ ] Phase 2 — Per-submitter descriptor cache
+- [x] Phase 2 — Per-submitter descriptor cache (kill gate PASS — see [`runs/phase2-ab.md`](runs/phase2-ab.md))
 - [ ] Phase 3 — Per-worker descriptor cache
 - [ ] Phase 4 — Final snapshot + docs
 
@@ -48,6 +48,7 @@ Load average 1.08 (1m) on a 56-core host = ~2% utilization. The two Claude proce
 | 1.3  | bench-realistic | nested_fanout_4x | +3.22% | ≥5% | FAIL — reverted at 0554a84 |
 
 Detail artifacts:
+
 - [`phase1-task1.2-result.md`](phase1-task1.2-result.md)
 - [`phase1-task1.3-result.md`](phase1-task1.3-result.md)
 
