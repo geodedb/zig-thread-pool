@@ -1733,3 +1733,77 @@ test "WorkDeque.tryPushBottomN partial when near-full" {
     const n = q.tryPushBottomN(&batch);
     try std.testing.expectEqual(@as(usize, 2), n);
 }
+
+test "WorkDeque.tryPushBottomN empty slice is a no-op" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    var q = try WorkDeque(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    const n = q.tryPushBottomN(&[_]u32{});
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(@as(?u32, null), q.popBottom());
+}
+
+test "WorkDeque.tryPushBottomN exact-fit publishes all entries" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    var q = try WorkDeque(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    const batch = [_]u32{ 7, 8, 9, 10 };
+    const n = q.tryPushBottomN(&batch);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    // A follow-up push must fail (exact-fit leaves no free slots).
+    try std.testing.expect(!q.tryPushBottom(11));
+    // LIFO popBottom order confirms the ring-index boundary is sound.
+    try std.testing.expectEqual(@as(?u32, 10), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 9), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 8), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 7), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, null), q.popBottom());
+}
+
+test "WorkDeque.tryPushBottomN crosses the ring-mask wraparound" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    // Capacity 4: advance head/tail far enough that the batched push
+    // straddles the power-of-two mask boundary. Pre-fill and drain a
+    // handful so bottom indexes past `buffer.len` when the batch lands.
+    var q = try WorkDeque(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    var pre: u32 = 0;
+    while (pre < 3) : (pre += 1) try std.testing.expect(q.tryPushBottom(pre));
+    // Drain all three so bottom = 3 and top = 3, with the next push
+    // landing at physical slot `3 & mask`, and a batch of 4 must wrap.
+    try std.testing.expectEqual(@as(?u32, 0), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 1), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 2), q.stealTop());
+
+    const batch = [_]u32{ 100, 200, 300, 400 };
+    const n = q.tryPushBottomN(&batch);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    // Draining confirms each slot is readable across the wrap.
+    try std.testing.expectEqual(@as(?u32, 400), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 300), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 200), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, 100), q.popBottom());
+    try std.testing.expectEqual(@as(?u32, null), q.popBottom());
+}
+
+test "WorkDeque.tryPushBottomN stealTop observes the batched publish" {
+    const WorkDeque = @import("thread_pool").WorkDeque;
+    var q = try WorkDeque(u32).init(std.testing.allocator, 64);
+    defer q.deinit();
+
+    const batch = [_]u32{ 10, 20, 30, 40, 50 };
+    const n = q.tryPushBottomN(&batch);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    // stealTop is FIFO from the top of the deque, mirroring the existing
+    // tryPushBottom + stealTop contract. After one .release publish,
+    // all 5 entries are visible in insertion order.
+    try std.testing.expectEqual(@as(?u32, 10), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 20), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 30), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 40), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, 50), q.stealTop());
+    try std.testing.expectEqual(@as(?u32, null), q.stealTop());
+}
