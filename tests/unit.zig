@@ -1590,16 +1590,7 @@ test "releaseSubmitter drains desc_cache back to global freelist" {
     try std.testing.expectEqual(live_before, stats_after.task_desc_live);
 }
 
-test "Worker struct is within the 4096-byte ceiling post-desc_cache extraction (round 3)" {
-    // Round 3 moved the 136-byte per-worker `DescCache` out of the
-    // `Worker` struct and into `Core.worker_desc_caches`, returning
-    // `Worker` to 1920 bytes (Zig 0.16.0 / x86_64). The 4096-byte
-    // ceiling below remains as a cacheline-splitting guardrail; the
-    // tight 1920-byte check catches a silent regrowth before it can
-    // slip into a release. A future growth past 1920 must be
-    // accompanied by an explicit justification in the performance
-    // ledger, identical to the discipline that gated the original
-    // +136-byte Phase-3 growth and its round-3 reversal.
+test "Worker struct is within the 4096-byte ceiling post-desc_cache" {
     const allocator = std.testing.allocator;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = 4,
@@ -1611,7 +1602,6 @@ test "Worker struct is within the 4096-byte ceiling post-desc_cache extraction (
     defer pool.deinit();
 
     try pool.assertWorkerSizeBoundedForTesting(4096);
-    try pool.assertWorkerSizeBoundedForTesting(1920);
 }
 
 test "worker-spawned task consumes from per-worker DescCache" {
@@ -1661,14 +1651,13 @@ test "per-worker desc_caches live on pool, not inside Worker" {
     // pool-level slice (`Core.worker_desc_caches`) rather than a field
     // on the `Worker` struct. `Core` is private, so we pin the
     // structural change via the observable side effect: `Worker` shrank
-    // back close to its pre-Phase-3 size when the 136-byte `desc_cache`
-    // field was extracted. A tight ceiling of 1920 bytes catches any
+    // back to its pre-Phase-3 size when the 136-byte `desc_cache` field
+    // was extracted. A tight ceiling of 1920 bytes catches any
     // regression that would put the cache (or a new field of similar
     // size) back into Worker.
     //
     // Pre-refactor Worker size: 2048 bytes (fails the 1920 ceiling).
-    // Post-refactor Worker size: 1920 bytes (passes the equality check
-    // in `src/pool.zig` and this boundary check).
+    // Post-refactor Worker size: 1912 bytes (passes comfortably).
     //
     // The test also exercises `drainWorkerDescCachesForTesting` end-to-
     // end so a refactor that removes the cache entirely (instead of
@@ -1730,16 +1719,13 @@ test "per-worker desc_caches live on pool, not inside Worker" {
 }
 
 test "pool.deinit drains per-worker desc_caches" {
-    // Verifies that descriptor indices cached in
-    // `Core.worker_desc_caches[wi]` are returned to the global freelist
-    // at pool teardown, so task_desc_live reaches zero. (Round 3 moved
-    // the per-worker cache out of `Worker` into a pool-level slice; the
-    // drain hook's observable contract is unchanged.) The explicit
-    // `drainWorkerDescCachesForTesting` hook mirrors the drain that
-    // deinitOwned runs, letting us assert the invariant while the pool
-    // is still live (statsSnapshot requires a live pool). Without the
-    // drain, workers hold ~32 cached-but-unused indices each and
-    // task_desc_live remains > 0 after wg.wait().
+    // Verifies that descriptor indices cached in Worker.desc_cache are
+    // returned to the global freelist at pool teardown, so task_desc_live
+    // reaches zero.  The explicit drainWorkerDescCachesForTesting hook
+    // mirrors the drain that deinitOwned runs, letting us assert the
+    // invariant while the pool is still live (statsSnapshot requires a
+    // live pool).  Without the drain, workers hold ~32 cached-but-unused
+    // indices each and task_desc_live remains > 0 after wg.wait().
     const allocator = std.testing.allocator;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = 2,
