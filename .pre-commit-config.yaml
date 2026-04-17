@@ -94,8 +94,15 @@ repos:
     pass_filenames: false
     verbose: true
 
+  - id: check-mermaid
+    name: mermaid render (check)
+    description: Validate fenced ```mermaid blocks in docs/ via mermaid-cli.
+    entry: python3 scripts/check-mermaid.py
+    language: system
+    files: ^docs/.*\.md$
+
 ci:
   autofix_prs: true
   autofix_commit_msg: '[pre-commit.ci] auto fixes'
   autoupdate_schedule: weekly
-  skip: [zig-fmt, zig-build, zig-test]
+  skip: [zig-fmt, zig-build, zig-test, check-mermaid]

@@ -175,13 +175,13 @@ sequenceDiagram
     participant Owner as Owner worker
     participant Deque
     participant Stealer as Any other worker
-    Note over Owner,Stealer: Invariants: bottom monotonically up by owner; top up by CAS winners
+    Note over Owner,Stealer: Invariants — bottom monotonically up by owner, top up by CAS winners
     Owner->>Deque: tryPushBottom value
-    Note right of Deque: buffer idx bottom mask := value (unordered)<br/>bottom.store(+1, .release)
+    Note right of Deque: buffer idx (bottom mask) := value (unordered), then bottom.store(+1, .release)
     Owner->>Deque: popBottom (LIFO)
-    Note right of Deque: b-- (seq_cst), load top (seq_cst)<br/>if t == b: CAS top to t+1, race with stealers
+    Note right of Deque: b-- (seq_cst), load top (seq_cst). If t == b, CAS top to t+1 — race with stealers
     Stealer->>Deque: stealTop (FIFO)
-    Note right of Deque: load top (seq_cst), bottom (acquire)<br/>CAS top to t+1, one winner
+    Note right of Deque: load top (seq_cst), bottom (acquire). CAS top to t+1 — one winner
 ```
 
 Properties:
@@ -515,8 +515,8 @@ and its associated coherence cost disappears.
 flowchart LR
     subgraph Flags
         F1[-Dsingle-pool bool - skip per-pool TLS identity check]
-        F2[-Dtimestamp-mode {disabled, completion_only, full}]
-        F3[-Dscheduler-variant {global_queue, work_stealing, lane_extension}]
+        F2["-Dtimestamp-mode {disabled, completion_only, full}"]
+        F3["-Dscheduler-variant {global_queue, work_stealing, lane_extension}"]
     end
     subgraph Branches[Hot-path branches elided]
         B1[tlsWorkerIndexFor - pool identity check]

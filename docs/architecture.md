@@ -106,7 +106,7 @@ sequenceDiagram
     else no TLS context
         TP->>TP: single acquireDescriptor (global freelist)
     end
-    TP->>TP: descriptor.state := queued; pack entry
+    TP->>TP: descriptor.state := queued, pack entry
     alt worker-TLS path
         TP->>LF: lifo_slot.store if empty
         opt lifo full

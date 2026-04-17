@@ -39,20 +39,20 @@ established by the project measurement rules:
 ```mermaid
 sequenceDiagram
     participant Host as Host state log
-    participant Loop as ab-loop.sh
+    participant Driver as ab-loop.sh
     participant A as Baseline binary
     participant B as Candidate binary
     Host->>Host: uptime start, record 1/5/15m load
     loop 10 rounds (balanced A, B, A, B, ...)
-        Loop->>A: run-runtime-comparison.sh samples 3 warmup-discard 1
-        A-->>Loop: A-<i>.json, median of 2 retained samples
-        Loop->>B: run-runtime-comparison.sh samples 3 warmup-discard 1
-        B-->>Loop: B-<i>.json, median of 2 retained samples
+        Driver->>A: run-runtime-comparison.sh samples 3 warmup-discard 1
+        A-->>Driver: A-[i].json, median of 2 retained samples
+        Driver->>B: run-runtime-comparison.sh samples 3 warmup-discard 1
+        B-->>Driver: B-[i].json, median of 2 retained samples
     end
     Host->>Host: uptime end, record 1/5/15m load
-    Loop->>Loop: aggregate.py: median-of-10 per leg (5th+6th/2)
-    Loop->>Loop: Compute delta% per scenario, weighted avg across targets
-    Loop->>Loop: Kill gate: targets +5% AND no non-target < -3%
+    Driver->>Driver: aggregate.py — median-of-10 per leg (5th+6th/2)
+    Driver->>Driver: Compute delta% per scenario, weighted avg across targets
+    Driver->>Driver: Kill gate — targets +5% AND no non-target < -3%
 ```
 
 Parameters:

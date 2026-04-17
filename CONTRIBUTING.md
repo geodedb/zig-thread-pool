@@ -13,6 +13,26 @@ make pre-commit-install
 make dev
 ```
 
+### Editing documentation with mermaid diagrams
+
+The `check-mermaid` pre-commit hook validates every ```` ```mermaid ```` block
+in `docs/*.md` with [`mermaid-cli`](https://github.com/mermaid-js/mermaid-cli).
+Install it once (any of the below):
+
+```bash
+# globally on PATH
+npm install -g @mermaid-js/mermaid-cli
+
+# or in the repo (preferred for isolation)
+npm install --no-save @mermaid-js/mermaid-cli
+
+# or point at a prebuilt binary
+export MERMAID_CLI=/path/to/mmdc
+```
+
+`mmdc` uses Puppeteer and downloads Chromium on first install (~170 MB).
+Subsequent runs are cached. The hook only fires on changes under `docs/`.
+
 ## Reporting Bugs
 
 Before submitting a bug report:
