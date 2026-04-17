@@ -6,6 +6,7 @@ const clock = thread_pool.clock;
 const flood_task_count: usize = 1_000_000;
 const contended_task_count: usize = 100_000;
 const contended_submitters: usize = 8;
+const children_per_parent: usize = 4;
 
 const SampleResult = struct {
     elapsed_ns: u64,
@@ -404,15 +405,18 @@ fn nestedParentTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void
     const ctx: *NestedParentCtx = @ptrCast(@alignCast(raw_ctx));
     ctx.completed_at_ns.* = nowNs();
 
-    var batch: [16]thread_pool.BatchTask = undefined;
-    const n = ctx.child_ctxs.len;
-    std.debug.assert(n <= batch.len);
+    // One timestamp for the whole batch: submitBatch enqueues all children
+    // together, so per-child submit-time spread is < 1 µs. Accepting the
+    // minor latency inflation avoids N extra nowNs() calls that would
+    // partially negate the batching gain in the tight harness loop.
+    var batch: [children_per_parent]thread_pool.BatchTask = undefined;
+    std.debug.assert(ctx.child_ctxs.len == batch.len);
     const now = nowNs();
     for (ctx.child_ctxs, ctx.child_submitted_at, 0..) |*child, *sub, i| {
         sub.* = now;
         batch[i] = .{ .task_fn = realisticTask, .ctx = @ptrCast(child) };
     }
-    _ = ctx.pool.submitBatch(batch[0..n], .{
+    _ = ctx.pool.submitBatch(&batch, .{
         .wait_group = ctx.wg,
         .backpressure = .block,
     }) catch return;
@@ -518,7 +522,6 @@ fn runCpuWorkScenario(worker_count: usize, task_count: usize, work_ns: u64, subm
 
 fn runNestedFanout4xSample(worker_count: usize) !SampleResult {
     const parent_count: usize = 2_000;
-    const children_per_parent: usize = 4;
     const total_tasks: usize = parent_count + parent_count * children_per_parent;
 
     var pool = try thread_pool.ThreadPool.init(std.heap.smp_allocator, .{
