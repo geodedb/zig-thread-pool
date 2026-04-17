@@ -40,9 +40,20 @@ A stddev: 14,041   B stddev: 15,069
 - The direction is consistently positive for B (B floor 162.5K vs A floor 161.7K;
   B ceiling 209.2K vs A ceiling 205.8K), but the +3.22% median gain is below gate.
 
-## Decision
+## Decision — REVERTED at 0554a84
 
-Gate FAIL. Per protocol, controller decides on revert. The code change is directionally
-correct but the effect size on bench-realistic nested_fanout_4x is below the 5% threshold
-at n=10. The runtime_compare harness (Task 1.2) showed a larger effect; the bench-realistic
-scenario may be too noisy or the effect is genuinely smaller there.
+Gate FAIL → controller applied the plan's strict kill criterion and reverted
+d85b250 + 650167e in a single revert commit `0554a84`. Rationale:
+
+- The plan's Task 1.3 Step 4 says "Commit if gains hold"; gains did not hold.
+- Directionally positive (+3.22%) is insufficient when the measurement protocol
+  gives a ≥5% gate. n=10 stddev ~14K means the +3.22% median is within one σ of
+  A's median — we cannot distinguish signal from noise at this sample size.
+- Task 1.2 (runtime_compare) passed +44.8% on the same mechanism and is the
+  primary Phase-1 deliverable. Reverting Task 1.3 does not invalidate Task 1.2;
+  the two harnesses test the same pool code via different drivers.
+- The `submitBatch` API remains available; users driving nested fan-out in
+  production can adopt it directly.
+
+The result doc stays as a permanent record of what was measured and why the
+change did not land.
