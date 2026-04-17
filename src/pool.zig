@@ -897,28 +897,18 @@ const Core = struct {
         // requires per-slot generation tags on the free_mask itself, which
         // is an API-breaking change out of scope for F-005. Callers MUST
         // ensure a given idx is released at most once per registration.
-        while (true) {
-            const current = self.submitter_free_mask.load(.acquire);
-            if ((current & bit) != 0) return; // already free — idempotent bail
-            if (self.submitter_free_mask.cmpxchgWeak(current, current | bit, .acq_rel, .acquire) == null) {
-                break; // we won the release
-            }
-        }
 
-        // F-005: thread-owner check — only clear TLS if this thread actually
-        // owns the slot on this pool. A stray releaseSubmitter call from a
-        // helper thread must not wipe an unrelated thread's submitter cache.
+        // Drain desc_cache BEFORE the free_mask CAS publishes the slot as free.
+        // DescCache is SPSC — if we drained after the CAS, a concurrent
+        // registerSubmitter could claim this slot and start using desc_caches[idx]
+        // before our drain completes, racing on `head`. TLS guard ensures only the
+        // legitimate owner (the thread that registered) performs the drain; a stray
+        // helper thread with no TLS binding must not corrupt the real owner's cache.
+        // Cached descriptors are in `.reserved` state (set by acquireDescriptorBatch
+        // at refill time) and releaseDescriptor accepts .reserved in its terminal-
+        // state CAS loop.
         if (tls_submitter_slot.pool == @as(*anyopaque, @ptrCast(self)) and
             tls_submitter_slot.index == idx)
-        {
-            tls_submitter_slot = .{};
-        }
-
-        // Drain desc_cache back to the global freelist. Must happen AFTER the
-        // free_mask CAS above (we own this slot) and BEFORE next registerSubmitter
-        // can observe a stale cache. Cached descriptors are in `.reserved` state
-        // (set by acquireDescriptorBatch at refill time) and releaseDescriptor
-        // accepts .reserved in its terminal-state CAS loop.
         {
             const cache = &self.desc_caches[idx];
             var buf: [DescCache.capacity]u32 = undefined;
@@ -926,6 +916,15 @@ const Core = struct {
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 self.releaseDescriptor(buf[i]);
+            }
+            tls_submitter_slot = .{};
+        }
+
+        while (true) {
+            const current = self.submitter_free_mask.load(.acquire);
+            if ((current & bit) != 0) return; // already free — idempotent bail
+            if (self.submitter_free_mask.cmpxchgWeak(current, current | bit, .acq_rel, .acquire) == null) {
+                break; // we won the release
             }
         }
 
