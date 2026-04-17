@@ -205,7 +205,7 @@ test "recursive submission through local queues does not deadlock" {
     try std.testing.expectEqual(@as(u64, 9), counter.value.load(.acquire));
 }
 
-test "submitBatch from worker context drains via local queue" {
+test "submitBatch from worker context completes all child tasks" {
     const allocator = std.testing.allocator;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = 4,
@@ -240,7 +240,7 @@ test "submitBatch from worker context drains via local queue" {
     var ctx = CTX{ .pool = &pool, .wg = &wg, .done = &done };
     _ = try pool.submit(CTX.parent, @ptrCast(&ctx), .{ .wait_group = &wg, .backpressure = .block });
     wg.wait();
-    try std.testing.expectEqual(@as(u64, 4), done.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 4), done.load(.acquire));
 }
 
 test "pre-cancelled token prevents task body execution" {
