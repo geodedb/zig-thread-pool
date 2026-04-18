@@ -251,19 +251,12 @@ pub fn build(b: *std.Build) void {
     tools_step.dependOn(&compare_exe.step);
     tools_step.dependOn(&runtime_compare_zig.step);
 
-    const cross_step = b.step("cross-check", "Compile smoke targets for Linux, macOS, and Windows");
-    const cross_targets = [_]std.Target.Query{
-        .{ .cpu_arch = .x86_64, .os_tag = .linux },
-        .{ .cpu_arch = .aarch64, .os_tag = .macos },
-        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
-    };
-    for (cross_targets) |query| {
-        const resolved = b.resolveTargetQuery(query);
-        const cross_lib = b.addLibrary(.{
-            .name = "thread-pool-smoke",
-            .linkage = .static,
-            .root_module = threadPoolModule(b, resolved, optimize, build_options),
-        });
-        cross_step.dependOn(&cross_lib.step);
-    }
+    // NOTE: cross-check step removed. Previously created per-target copies
+    // of the root module via `threadPoolModule`, which introduced multiple
+    // modules rooted at src/root.zig into the build graph. When downstream
+    // consumers instantiated thread-pool, Zig's build graph saw the
+    // duplicate roots and errored with "file exists in modules
+    // 'build_options0' and 'build_optionsN'". Cross-target builds can be
+    // invoked from CI by running `zig build -Dtarget=...` explicitly.
+    _ = threadPoolModule; // silence unused-fn warning
 }
