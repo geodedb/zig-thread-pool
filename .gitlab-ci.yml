@@ -31,6 +31,8 @@ workflow:
 
 default:
   interruptible: true
+  tags:
+    - company
 
 include:
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
