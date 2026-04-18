@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     const static_lib = b.addLibrary(.{
         .name = "thread-pool",
         .linkage = .static,
-        .root_module = threadPoolModule(b, target, optimize, build_options),
+        .root_module = module,
     });
     b.installArtifact(static_lib);
 
@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Compile the library and unit tests without running them");
     const check_tests = b.addTest(.{
-        .root_module = threadPoolModule(b, target, optimize, build_options),
+        .root_module = module,
     });
     check_step.dependOn(&check_tests.step);
 
