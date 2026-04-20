@@ -7,9 +7,10 @@
 # + bounded zig-fuzz). Security/SBOM components stay on their existing
 # pins since those APIs haven't changed.
 #
-# Linux jobs run on shared runners. macOS and Windows jobs require
-# GitLab SaaS runners (`saas-macos-medium-m1`, `saas-windows-medium-amd64`);
-# they are gated behind rules + allow_failure so pipelines without those
+# Linux jobs run on shared runners. macOS jobs still use GitLab SaaS
+# (`saas-macos-medium-m1`); Windows jobs now use the self-hosted company
+# runner group (`company` + `windows` tags) instead of GitLab SaaS. They
+# are gated behind rules + allow_failure so pipelines without those
 # runners still pass. Trigger cross-OS runs by setting RUN_CROSS_OS=true
 # or by scheduling / merging to the default branch.
 
@@ -125,27 +126,33 @@ include:
       job_suffix: "-stress"
       test_step: "test-stress"
 
-  # Zig build + tests on Windows (gated).
+  # Zig build + tests on Windows (gated). tags override routes these to
+  # the self-hosted company Windows runner group; remove the override
+  # once ci-catalog >v1.22.0 lands and bakes the new default in.
   - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.22.0
     inputs:
       zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
+      tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
+      tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
+      tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
+      tags: ["company", "windows"]
 
 variables:
   ZIG_VERSION: "0.16.0"
