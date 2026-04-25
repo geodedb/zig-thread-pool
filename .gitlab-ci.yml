@@ -247,8 +247,14 @@ zig-test-windows-stress-0.16.0:
 cross-check:
   extends: .zig-host-base
   stage: test
+  # The dedicated `cross-check` build step was removed in commit ee8440f
+  # (it created duplicate root modules in downstream consumers). Cross-
+  # target smoke coverage now happens here via explicit per-target
+  # invocations, matching the convention recommended in build.zig.
   script:
-    - zig build cross-check
+    - zig build -Dtarget=x86_64-linux
+    - zig build -Dtarget=aarch64-macos
+    - zig build -Dtarget=x86_64-windows-gnu
   needs: ["zig-build-0.16.0"]
 
 benchmark-regression:
