@@ -427,6 +427,8 @@ pub const Config = struct {
             return error.WatchdogWithoutOverflowCap;
         if (@as(u64, self.max_threads) + @as(u64, self.max_overflow_workers) > 64)
             return error.OverflowCapExceedsBitmap;
+        if (self.max_submitter_queues > 64)
+            return error.SubmitterCapExceedsBitmap;
     }
 };
 

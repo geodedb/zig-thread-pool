@@ -21,7 +21,7 @@ pub const TaskContext = @import("pool.zig").TaskContext;
 pub const TaskFn = @import("pool.zig").TaskFn;
 pub const BatchTask = @import("pool.zig").BatchTask;
 
-pub const version = "0.2.0";
+pub const version = "0.2.1";
 
 pub const Config = types.Config;
 pub const SchedulerVariant = types.SchedulerVariant;

@@ -748,7 +748,14 @@ const Core = struct {
                 sq.* = try LocalQueue.init(allocator, normalized.submitter_queue_capacity, normalized.queue_kind);
                 self.init_submitter_count += 1;
             }
-            self.submitter_free_mask = std.atomic.Value(u64).init((@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1);
+            // BUG_2026-04-25: `(1 << n) - 1` is UB on `u64` when `n == 64`
+            // (the documented maximum the clamp produces). Special-case the
+            // full-bitmap value; for n < 64 the shift is well-defined.
+            const initial_free_mask: u64 = if (normalized.max_submitter_queues == 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(normalized.max_submitter_queues)) - 1;
+            self.submitter_free_mask = std.atomic.Value(u64).init(initial_free_mask);
             self.recordOwnedAlloc(self.submitter_queues.len * @sizeOf(LocalQueue));
 
             self.desc_caches = try allocator.alloc(DescCache, normalized.max_submitter_queues);
