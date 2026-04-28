@@ -3,7 +3,18 @@
     .version = "0.2.1",
     .fingerprint = 0x2b20b508067550d7,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // Lazy otel dependency. Only fetched when `-Dwith_otel=true` is
+        // passed to `zig build`. The `lazy = true` entry lets Zig skip
+        // the fetch entirely under the default disabled build, which
+        // keeps the dependency graph cycle-free (otel itself depends on
+        // thread-pool transitively under `-Dotel_use_devnw_pool=true`).
+        .otel = .{
+            .url = "git+https://gitlab.com/devnw/zig/otel#20078af231c069d88eaeb79dcf950b94366be624",
+            .hash = "otel-0.1.0-B0v3lsl9MwCHrG8GDrxdFebugqjybfr4KAiplOJKCRG7",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

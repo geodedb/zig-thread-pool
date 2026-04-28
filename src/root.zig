@@ -9,9 +9,24 @@ const std = @import("std");
 
 /// Re-export the `build_options` module so downstream test harnesses can
 /// inspect compile-time-pinned flags (`-Dtimestamp-mode`,
-/// `-Dscheduler-variant`, `-Dsingle-pool`) and adapt their configs
-/// accordingly.  See `tests/common.zig::default_timestamp_mode`.
+/// `-Dscheduler-variant`, `-Dsingle-pool`, `-Dwith_otel`) and adapt
+/// their configs accordingly.  See `tests/common.zig::default_timestamp_mode`.
 pub const build_options = @import("build_options");
+
+/// otel observability seam. Surfaces `startSubmitSpan` / `endSubmitSpan`
+/// plus the `enabled` flag. When `-Dwith_otel=false` (the default), every
+/// helper collapses to a comptime no-op and the otel dependency is never
+/// resolved. The public API is reachable as `thread_pool.observability`.
+pub const observability = @import("observability");
+
+/// Bootstrap helper for the enabled build. Only registered as a build
+/// import when `-Dwith_otel=true`; under the disabled build the
+/// reference resolves to a placeholder empty struct so the public root
+/// stays uniform.
+pub const observability_init = if (observability.enabled)
+    @import("observability_init")
+else
+    struct {};
 
 pub const sync = @import("sync.zig");
 pub const clock = @import("clock.zig");
