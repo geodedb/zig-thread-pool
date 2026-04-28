@@ -73,3 +73,6 @@ benchmarks/results/.tmp/
 src/topology.zig
 
 .claude/scheduled_tasks.lock
+
+# Local git worktrees (per-feature isolated checkouts)
+.worktrees/
