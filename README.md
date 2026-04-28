@@ -239,6 +239,7 @@ Build-time comptime flags:
 | `-Dtimestamp-mode=<m>` | runtime | Pin `Config.timestamp_mode` at build time. Always safe. |
 | `-Dscheduler-variant=<v>` | runtime | Pin `Config.scheduler_variant` at build time. Always safe. |
 | `-Dtsan` | `false` | Enable ThreadSanitizer; auto-downgrades stress suite to Debug. |
+| `-Dwith_otel=true` | `false` | Compile in OpenTelemetry instrumentation. Off by default; the otel dependency is `lazy = true` and only fetched when this flag is on. Verified zero-overhead when off (no `otel` / `observability` symbols leak into the disabled build). See [Observability](#observability) below. |
 
 ## Public API
 
@@ -262,6 +263,87 @@ Exported queue primitives for low-level experimentation:
 - `thread_pool.RingQueue(T)` — SPMC
 - `thread_pool.WorkDeque(T)` — Chase-Lev
 - `thread_pool.DescCache` — SPSC LIFO 32
+
+## Observability
+
+`thread-pool` exposes an opt-in OpenTelemetry seam via the
+`thread_pool.observability` namespace. The seam is **off by default**;
+turn it on with `-Dwith_otel=true`.
+
+When disabled (the default), every helper collapses to a comptime-known
+no-op, the otel dependency is never resolved, and
+`otel/scripts/verify-consumer-noop.sh` confirms zero `otel` /
+`observability` symbols leak into the produced artifacts.
+
+### What gets instrumented
+
+The seam wires one **producer**-kind span per public-API submit at
+`ThreadPool.submit`, `ThreadPool.trySubmit`, and `ThreadPool.submitBatch`
+(one span covers the whole batch — per-task spans would explode volume
+under flood workloads).
+
+| Span field | Value |
+|---|---|
+| `name` | `thread_pool.submit` |
+| `kind` | `producer` |
+| `messaging.system` | `thread_pool` |
+| `messaging.operation` | `publish` |
+
+Worker-side task pickup is intentionally **not** instrumented — that
+path runs at very high frequency and per-pop spans would distort the
+latency budgets the scheduler is tuned against.
+
+### Caller bootstrap (when `-Dwith_otel=true`)
+
+```zig
+const std = @import("std");
+const thread_pool = @import("thread_pool");
+
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Build providers from OTEL_* env vars (defaults: OTLP/HTTP to
+    // http://localhost:4318, parentbased_traceidratio @ 0.05).
+    var otel_state = try thread_pool.observability_init.Otel.init(
+        allocator,
+        "my-service",
+    );
+    defer otel_state.deinit();
+    // installGlobals must run against the value at its STABLE address
+    // (not a moved-from copy) so the published Tracer/Meter pointers
+    // outlive every span site.
+    otel_state.installGlobals();
+
+    // ... use thread_pool as usual ...
+}
+```
+
+`OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`, `OTEL_EXPORTER_OTLP_*`, and
+the rest of the OTEL spec env vars work as documented in the
+OpenTelemetry environment variable reference.
+
+### Dependency cycle handling
+
+`otel` itself depends on `thread-pool` transitively under
+`-Dotel_use_devnw_pool=true`, so a naive eager dependency would form a
+build-graph cycle. The cycle is broken at compile time by:
+
+1. `lazy = true` on the `.otel` entry in `build.zig.zon` — Zig only
+   fetches when `b.lazyDependency("otel", ...)` is reached.
+2. `b.lazyDependency` is gated behind `if (with_otel)` in `build.zig`,
+   so the disabled build never enters the otel-resolving branch.
+3. otel's default build does NOT set `-Dotel_use_devnw_pool=true`, so
+   even when otel is built it does not force-fetch thread-pool.
+4. Comptime guards in `src/observability.zig`
+   (`const otel = if (enabled) @import("otel") else struct {};`) keep
+   the otel namespace out of the disabled-mode AST entirely.
+
+### See also
+
+- Integration recipe (canonical): `otel/docs/integration/RECIPE.md`
+- Verifier: `otel/scripts/verify-consumer-noop.sh thread-pool`
 
 ## Documentation Map
 
