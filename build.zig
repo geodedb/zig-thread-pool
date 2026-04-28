@@ -238,6 +238,25 @@ pub fn build(b: *std.Build) void {
     });
     unit_step.dependOn(&b.addRunArtifact(disabled_seam_tests).step);
 
+    // Enabled-mode smoke test. Skips internally when `-Dwith_otel=false`
+    // (the inner `if (!thread_pool.observability.enabled) return
+    // error.SkipZigTest;` short-circuits before touching `otel`).
+    // Compiles cleanly under both flag values because the test file
+    // gates its `otel` namespace identifiers behind
+    // `if (build_options.with_otel) @import("otel") else struct{}`.
+    const enabled_seam_module = b.createModule(.{
+        .root_source_file = b.path("tests/observability_enabled_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = allocImports(b, &.{
+            .{ .name = "thread_pool", .module = module },
+            .{ .name = "build_options", .module = build_options_mod },
+        }),
+    });
+    if (otel_mod) |m| enabled_seam_module.addImport("otel", m);
+    const enabled_seam_tests = b.addTest(.{ .root_module = enabled_seam_module });
+    unit_step.dependOn(&b.addRunArtifact(enabled_seam_tests).step);
+
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/integration.zig", target, optimize, module, deps),
