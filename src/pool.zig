@@ -1,5 +1,11 @@
 const std = @import("std");
 const build_options = @import("build_options");
+/// otel observability seam. Comptime-no-op when -Dwith_otel=false; the
+/// optimizer drops every `startSubmitSpan` / `endSubmitSpan` call site.
+/// When enabled, emits one `thread_pool.submit` producer span per
+/// public-API submit. Wired below at ThreadPool.submit / trySubmit /
+/// submitBatch.
+const observability = @import("observability");
 const sync = @import("sync.zig");
 const clock = @import("clock.zig");
 const types = @import("types.zig");
@@ -2601,21 +2607,46 @@ pub const ThreadPool = struct {
     /// `error.TaskPoolExhausted` immediately if capacity is exhausted,
     /// regardless of the backpressure policy in `options`.
     pub fn trySubmit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
-        return self.core.trySubmit(task_fn, ctx, options);
+        // otel seam: comptime-no-op when -Dwith_otel=false. When
+        // enabled, emits one `thread_pool.submit` producer span per
+        // public-API submit. The defer-end + errdefer-fail + final
+        // ok-end pattern guarantees the span is always closed; otel's
+        // first-status-write-wins semantics make the deferred
+        // `__obs_span.end(null)` a redundant no-op when this helper
+        // already closed the span via `endSubmitSpan`.
+        var __obs_span = observability.startSubmitSpan();
+        defer __obs_span.end(null);
+        errdefer observability.endSubmitSpan(__obs_span, false);
+        const handle = try self.core.trySubmit(task_fn, ctx, options);
+        observability.endSubmitSpan(__obs_span, true);
+        return handle;
     }
 
     /// Submit a task, optionally blocking per `options.backpressure`.
     /// Returns a `TaskHandle` that can be passed to `wait()` if
     /// `options.waitable` is true; otherwise returns an invalid handle.
     pub fn submit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
-        return self.core.submit(task_fn, ctx, options);
+        var __obs_span = observability.startSubmitSpan();
+        defer __obs_span.end(null);
+        errdefer observability.endSubmitSpan(__obs_span, false);
+        const handle = try self.core.submit(task_fn, ctx, options);
+        observability.endSubmitSpan(__obs_span, true);
+        return handle;
     }
 
     /// Submit multiple tasks atomically. Returns the count of tasks
     /// successfully enqueued. If the first task fails, the error propagates;
     /// subsequent failures return a partial `SubmitBatchResult`.
     pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
-        return self.core.submitBatch(tasks, options);
+        // One span per submitBatch call (covers the whole batch as a
+        // single producer-side enqueue). Per-task spans would explode
+        // span volume on flood workloads.
+        var __obs_span = observability.startSubmitSpan();
+        defer __obs_span.end(null);
+        errdefer observability.endSubmitSpan(__obs_span, false);
+        const result = try self.core.submitBatch(tasks, options);
+        observability.endSubmitSpan(__obs_span, true);
+        return result;
     }
 
     pub fn registerSubmitter(self: *ThreadPool) !usize {
