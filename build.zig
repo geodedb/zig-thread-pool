@@ -145,6 +145,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "single_pool", single_pool);
     build_options.addOption(TimestampModeFlag, "timestamp_mode", timestamp_mode_flag);
     build_options.addOption(SchedulerVariantFlag, "scheduler_variant", scheduler_variant_flag);
+    build_options.addOption([]const u8, "package_name", "thread_pool");
     build_options.addOption(bool, "with_otel", with_otel);
     const build_options_mod = build_options.createModule();
 
