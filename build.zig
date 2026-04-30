@@ -19,15 +19,10 @@ const Deps = struct {
     build_options_mod: *std.Build.Module,
     /// Shared `observability` named module. Imported by the public
     /// `thread_pool` module + every test root that exercises the seam.
+    /// As of 2026-04-30 this is a permanent comptime no-op stub
+    /// (see src/observability.zig); callers that need real telemetry
+    /// wrap `ThreadPool.submit` directly at their layer.
     observability_mod: *std.Build.Module,
-    /// Optional otel module. `null` when `-Dwith_otel=false`. When
-    /// non-null, the seam imports it as `@import("otel")`.
-    otel_mod: ?*std.Build.Module,
-    /// Optional bootstrap helper module (`observability_init`). Only
-    /// non-null when `-Dwith_otel=true`. The public `thread_pool`
-    /// module imports this so caller binaries can construct the
-    /// providers via `thread_pool.observability_init.Otel.init`.
-    observability_init_mod: ?*std.Build.Module,
 };
 
 fn allocImports(b: *std.Build, imports: []const Import) []Import {
@@ -42,7 +37,7 @@ fn importedModule(
     module: *std.Build.Module,
     deps: Deps,
 ) *std.Build.Module {
-    const mod = b.createModule(.{
+    return b.createModule(.{
         .root_source_file = b.path(path),
         .target = target,
         .optimize = optimize,
@@ -52,9 +47,6 @@ fn importedModule(
             .{ .name = "build_options", .module = deps.build_options_mod },
         }),
     });
-    if (deps.observability_init_mod) |m| mod.addImport("observability_init", m);
-    if (deps.otel_mod) |m| mod.addImport("otel", m);
-    return mod;
 }
 
 pub fn build(b: *std.Build) void {
@@ -96,46 +88,25 @@ pub fn build(b: *std.Build) void {
             "dead-path branches for the other variants at comptime.",
     ) orelse .any;
 
-    // -Dwith_otel: compile in otel instrumentation. OFF by default;
-    // when off the otel dependency is never resolved and the seam
-    // collapses to a comptime-known no-op (verified by
-    // otel/scripts/verify-consumer-noop.sh). Note: thread-pool is a
-    // transitive dependency of otel itself (otel exposes
-    // `-Dotel_use_devnw_pool=true`), so the cycle is broken at compile
-    // time by `lazy = true` on the dep entry + otel's default build NOT
-    // setting `otel_use_devnw_pool`.
-    const with_otel = b.option(
-        bool,
-        "with_otel",
-        "Compile in otel instrumentation (off by default; zero overhead when off)",
-    ) orelse false;
-
-    // Forward otel build options so the upstream package is configured
-    // identically across all consumers in the build graph. Without this,
-    // each consumer's `b.lazyDependency("otel", ...)` materialises a
-    // DISTINCT otel Module instance (different `build_options` ⇒ different
-    // package keys), and zig 0.16 errors with `file exists in modules
-    // 'otel' and 'otel0'` when transitive imports overlap.
-    const otel_use_devnw_tls = b.option(
-        bool,
-        "otel_use_devnw_tls",
-        "Forward to upstream otel: HTTPS via DevNW tls",
-    ) orelse false;
-    const otel_disabled = b.option(
-        bool,
-        "otel_disabled",
-        "Forward to upstream otel: comptime-disable",
-    ) orelse false;
-    const otel_profiles = b.option(
-        bool,
-        "otel_profiles",
-        "Forward to upstream otel: experimental profiles",
-    ) orelse false;
-    const otel_use_devnw_grpc = b.option(
-        bool,
-        "otel_use_devnw_grpc",
-        "Forward to upstream otel: DevNW gRPC",
-    ) orelse false;
+    // -Dwith_otel and -Dotel_use_devnw_* options: ACCEPTED BUT IGNORED.
+    // Removed 2026-04-30 from the dep graph because thread-pool ↔ otel
+    // formed a hard cycle (otel pulls thread-pool back through
+    // `-Dotel_use_devnw_pool=true`) that the cross-repo diamond-dep
+    // detector could not converge — every commit on either side bumped
+    // the other's hash. The observability seam is now a permanent
+    // comptime no-op (`src/observability.zig`); callers that need real
+    // telemetry wrap `ThreadPool.submit` directly.
+    //
+    // We still accept the flags so existing downstream `b.dependency(
+    // "thread_pool", .{ .with_otel = true, ... })` calls don't error
+    // with "unknown option" — they just have no effect here. Downstream
+    // consumers should treat thread-pool as a pure leaf and stop
+    // forwarding otel options once they've migrated.
+    _ = b.option(bool, "with_otel", "DEPRECATED: accepted for compat, ignored. Telemetry seam is permanent no-op.") orelse false;
+    _ = b.option(bool, "otel_use_devnw_tls", "DEPRECATED: accepted for compat, ignored.") orelse false;
+    _ = b.option(bool, "otel_disabled", "DEPRECATED: accepted for compat, ignored.") orelse false;
+    _ = b.option(bool, "otel_profiles", "DEPRECATED: accepted for compat, ignored.") orelse false;
+    _ = b.option(bool, "otel_use_devnw_grpc", "DEPRECATED: accepted for compat, ignored.") orelse false;
 
     // Materialize ONE shared `build_options` MODULE. Every consumer
     // module imports the SAME module instance via `addImport` to avoid
@@ -146,70 +117,26 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(TimestampModeFlag, "timestamp_mode", timestamp_mode_flag);
     build_options.addOption(SchedulerVariantFlag, "scheduler_variant", scheduler_variant_flag);
     build_options.addOption([]const u8, "package_name", "thread_pool");
-    build_options.addOption(bool, "with_otel", with_otel);
+    // `with_otel` always false: the seam is permanently disabled.
+    build_options.addOption(bool, "with_otel", false);
     const build_options_mod = build_options.createModule();
 
-    // Observability seam (otel). Declared as a SHARED NAMED MODULE so
-    // every consumer (lib, tests, examples, benchmarks, plus the seam
-    // tests) resolves to the same source file via
-    // `@import("observability")`. Using relative
-    // `@import("observability.zig")` from each module would trip Zig's
-    // "file exists in modules X and Y" error because the file would be
-    // pulled into multiple module trees. The seam's `enabled` flag
-    // tracks `build_options.with_otel`; when off, every helper compiles
-    // to a comptime-known no-op and the otel dependency is never
-    // resolved.
+    // Observability seam. Declared as a SHARED NAMED MODULE so every
+    // consumer (lib, tests, examples, benchmarks, plus the seam tests)
+    // resolves to the same source file via `@import("observability")`.
+    // As of 2026-04-30 this is a permanent comptime no-op stub; it does
+    // NOT import otel and does NOT participate in any external dep
+    // graph. See `src/observability.zig` for the residual API
+    // (`Span`, `startSubmitSpan`, `endSubmitSpan`).
     const observability_mod = b.addModule("observability", .{
         .root_source_file = b.path("src/observability.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = allocImports(b, &.{
-            .{ .name = "build_options", .module = build_options_mod },
-        }),
     });
-
-    // Gated otel dependency. The `lazy = true` entry in build.zig.zon
-    // means Zig only fetches the package when this branch executes;
-    // with the flag off the dependency is never resolved and the
-    // produced artifacts contain zero otel symbols (verified by
-    // otel/scripts/verify-consumer-noop.sh).
-    var otel_mod: ?*std.Build.Module = null;
-    var observability_init_mod: ?*std.Build.Module = null;
-    if (with_otel) {
-        if (b.lazyDependency("otel", .{
-            .target = target,
-            .optimize = optimize,
-            .otel_use_devnw_tls = otel_use_devnw_tls,
-            .otel_disabled = otel_disabled,
-            .otel_profiles = otel_profiles,
-            .otel_use_devnw_grpc = otel_use_devnw_grpc,
-        })) |otel_dep| {
-            const m = otel_dep.module("otel");
-            otel_mod = m;
-            // The seam itself imports `otel` when enabled.
-            observability_mod.addImport("otel", m);
-
-            // Bootstrap helper. Only registered when `-Dwith_otel=true`
-            // so the disabled build never compiles otel-touching code.
-            // Gated from root.zig via
-            // `if (observability.enabled) @import("observability_init")`.
-            observability_init_mod = b.addModule("observability_init", .{
-                .root_source_file = b.path("src/observability_init.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = allocImports(b, &.{
-                    .{ .name = "otel", .module = m },
-                    .{ .name = "observability", .module = observability_mod },
-                }),
-            });
-        }
-    }
 
     const deps: Deps = .{
         .build_options_mod = build_options_mod,
         .observability_mod = observability_mod,
-        .otel_mod = otel_mod,
-        .observability_init_mod = observability_init_mod,
     };
 
     const module = b.addModule("thread_pool", .{
@@ -221,8 +148,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "observability", .module = observability_mod },
         }),
     });
-    if (observability_init_mod) |m| module.addImport("observability_init", m);
-    if (otel_mod) |m| module.addImport("otel", m);
 
     const static_lib = b.addLibrary(.{
         .name = "thread-pool",
@@ -270,24 +195,12 @@ pub fn build(b: *std.Build) void {
     });
     unit_step.dependOn(&b.addRunArtifact(disabled_seam_tests).step);
 
-    // Enabled-mode smoke test. Skips internally when `-Dwith_otel=false`
-    // (the inner `if (!thread_pool.observability.enabled) return
-    // error.SkipZigTest;` short-circuits before touching `otel`).
-    // Compiles cleanly under both flag values because the test file
-    // gates its `otel` namespace identifiers behind
-    // `if (build_options.with_otel) @import("otel") else struct{}`.
-    const enabled_seam_module = b.createModule(.{
-        .root_source_file = b.path("tests/observability_enabled_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = allocImports(b, &.{
-            .{ .name = "thread_pool", .module = module },
-            .{ .name = "build_options", .module = build_options_mod },
-        }),
-    });
-    if (otel_mod) |m| enabled_seam_module.addImport("otel", m);
-    const enabled_seam_tests = b.addTest(.{ .root_module = enabled_seam_module });
-    unit_step.dependOn(&b.addRunArtifact(enabled_seam_tests).step);
+    // Enabled-mode smoke test removed 2026-04-30 along with the otel
+    // dependency. The seam is now permanently disabled, so the test
+    // file `tests/observability_enabled_test.zig` was deleted (it
+    // imported `otel` and exercised the wired path that no longer
+    // exists). The disabled_seam_tests above remain and are sufficient
+    // to verify the comptime no-op invariants.
 
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{

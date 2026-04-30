@@ -4,16 +4,17 @@
     .fingerprint = 0x2b20b508067550d7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Lazy otel dependency. Only fetched when `-Dwith_otel=true` is
-        // passed to `zig build`. The `lazy = true` entry lets Zig skip
-        // the fetch entirely under the default disabled build, which
-        // keeps the dependency graph cycle-free (otel itself depends on
-        // thread-pool transitively under `-Dotel_use_devnw_pool=true`).
-        .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#2665f64d4fb85f8d7beb6b21f2218317ea2fc05e",
-            .hash = "otel-0.1.0-B0v3lrgNNADQwluWDPhv5kY_7L_C1vptqunNkx_Ipzy1",
-            .lazy = true,
-        },
+        // No external dependencies. Removed 2026-04-30: the otel observability
+        // seam used to lazy-pull `gitlab.com/devnw/zig/otel`, but that created
+        // a hard dependency cycle (otel itself transitively pulled thread-pool
+        // back through `-Dotel_use_devnw_pool=true`).  Even though both ends
+        // of the cycle were `lazy = true`, the cross-repo dep-graph detector
+        // (geode/scripts/detect_diamond_deps.py) couldn't converge because
+        // every commit on either side bumped the other's hash.  The seam was
+        // collapsed into a permanent comptime no-op (`observability.enabled`
+        // is now hardcoded `false`) — callers that want telemetry on
+        // submit/run can wrap `ThreadPool.submit` directly.  See
+        // `src/observability.zig` for the residual stub API.
     },
     .paths = .{
         "build.zig",

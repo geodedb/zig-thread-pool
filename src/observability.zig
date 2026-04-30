@@ -1,99 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 CodePros
 
-//! observability.zig — single-file otel seam for thread-pool.
+//! observability.zig — permanent comptime no-op observability seam for
+//! thread-pool.
 //!
-//! When `build_options.with_otel == false`, every public function in this
-//! file collapses to a comptime-known no-op so the optimizer eliminates
-//! the call site entirely. When true, calls forward to the appropriate
-//! `otel.api.trace` helper.
+//! HISTORY: this file used to forward to `otel.api.trace` when
+//! `-Dwith_otel=true` was passed to `zig build`.  As of 2026-04-30
+//! the otel dependency is removed from `build.zig.zon` because
+//! thread-pool ↔ otel formed a hard dep cycle that the cross-repo
+//! diamond-dep detector (`geode/scripts/detect_diamond_deps.py`)
+//! could not converge: every commit on either side bumped the
+//! other's hash.  Even with `lazy = true` on the thread-pool side,
+//! the manifest entry still made transitive consumers diamond.
 //!
-//! INVARIANT: every emit is `catch {}`-discarded. A failing exporter
-//! never reaches the caller — telemetry must never break a task submit.
+//! The seam is preserved as a permanent stub so callers
+//! (pool.zig::submit, etc.) keep compiling unchanged.  Every public
+//! symbol is a zero-sized struct or a `void`-returning no-op the
+//! optimizer drops at every call site.  Callers that need real
+//! telemetry should wrap `ThreadPool.submit` directly at their layer
+//! (which has access to its own otel + caller context).
 //!
-//! NOTE: deviation from the HTTP template — thread-pool submit operations
-//! do not fit the `instrumentation.http.startClientSpan` shape (HTTP
-//! method/url is meaningless for a producer-side enqueue). We expose a
-//! domain-specific `startSubmitSpan()` helper that constructs a span via
-//! `otel.api.trace.Tracer.startSpan` directly with a messaging-shaped
-//! span name (`"thread_pool.submit"`), `.producer` kind, and the
-//! `messaging.system="thread_pool"` / `messaging.operation="publish"`
-//! semantic conventions (matching otel messaging conventions for
-//! producer-side enqueue spans).
+//! INVARIANT preserved from the otel-wired version: telemetry is
+//! never on the success-or-failure path of `submit`.  In the no-op
+//! build, this is trivially true.
 
-const std = @import("std");
-const build_options = @import("build_options");
+pub const enabled: bool = false;
 
-pub const enabled: bool = build_options.with_otel;
-
-const otel = if (enabled) @import("otel") else struct {};
-
-/// Opaque handle for an in-flight submit operation. When disabled, this
-/// is a zero-sized struct the optimizer drops entirely. The no-op
-/// fallback's `end` signature MUST match `otel.api.trace.Span.end(?u64) void`
-/// so callers can write `span.end(null)` regardless of `enabled` state.
-pub const Span = if (enabled) otel.api.trace.Span else struct {
+/// Opaque handle for an in-flight submit operation.  Zero-sized; the
+/// optimizer drops it.  `end` matches the previous wired-up
+/// `otel.api.trace.Span.end(?u64) void` signature so caller code that
+/// does `span.end(null)` keeps compiling without changes.
+pub const Span = struct {
     pub fn end(self: @This(), _: ?u64) void {
         _ = self;
     }
 };
 
-/// Start a span for a thread-pool submit operation.
-///
-/// Span shape:
-///   - name: `"thread_pool.submit"`
-///   - kind: `.producer` (otel messaging conventions: producer = the
-///     side that enqueues messages onto the queue/broker; the worker
-///     thread that pops a task is the consumer).
-///   - attributes:
-///       * `messaging.system    = "thread_pool"`
-///       * `messaging.operation = "publish"`
-///
-/// Wired at the public `ThreadPool.submit` / `ThreadPool.trySubmit` /
-/// `ThreadPool.submitBatch` entry points. Worker-side task pickup is
-/// intentionally NOT instrumented — that path runs at very high
-/// frequency and a per-pop span would distort latency budgets.
+/// Start a span for a thread-pool submit operation.  No-op stub.
 pub fn startSubmitSpan() Span {
-    if (!enabled) return Span{};
-    const tracer = global.tracer orelse return Span{};
-    const span = tracer.startSpan(
-        .empty(),
-        "thread_pool.submit",
-        .{ .kind = .producer },
-    ) catch return Span{};
-    // Best-effort attribute attachment. Failures (OOM in the attribute
-    // set) cannot block the submit — telemetry is non-fatal.
-    span.setStringAttribute("messaging.system", "thread_pool") catch {};
-    span.setStringAttribute("messaging.operation", "publish") catch {};
-    return span;
+    return Span{};
 }
 
-/// Close a submit span, recording success/failure status.
-///
-/// On `ok = true` we set status `.ok`; on `ok = false` we set status
-/// `.error_` with an empty description (callers who have an error
-/// message can attach it via `span.setStatus` before calling this
-/// helper). Callers typically pair this with `defer span.end(null)` at
-/// the call site so the span is always ended regardless of which path
-/// is taken; `setStatus` + `end` are idempotent for status reporting
-/// (only the first status write wins; the deferred `end(null)` is a
-/// redundant no-op when this helper has already ended the span).
+/// Close a submit span, recording success/failure status.  No-op stub.
 pub fn endSubmitSpan(span: Span, ok: bool) void {
-    if (!enabled) return;
-    if (ok) {
-        span.setStatus(.ok, "");
-    } else {
-        // `StatusCode` uses `@"error"` (escaped keyword) for the
-        // failure variant — see otel/src/api/trace.zig:35.
-        span.setStatus(.@"error", "");
-    }
-    span.end(null);
+    _ = span;
+    _ = ok;
 }
 
-/// Set once at process start by `observability_init.Otel.installGlobals`.
-/// Only referenced when `enabled == true`; otherwise the optimizer drops
-/// the whole struct.
-pub const global = if (enabled) struct {
-    pub var tracer: ?*otel.api.trace.Tracer = null;
-    pub var meter: ?*otel.api.metrics.Meter = null;
-} else struct {};
+/// Globals struct preserved as an empty namespace so older code paths
+/// that referenced `observability.global.tracer` (now unreachable
+/// because `enabled = false`) still type-check at the access site.
+pub const global = struct {};
