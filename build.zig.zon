@@ -10,8 +10,8 @@
         // keeps the dependency graph cycle-free (otel itself depends on
         // thread-pool transitively under `-Dotel_use_devnw_pool=true`).
         .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel#ee492166dfefc7914229979c933411e6da9e504e",
-            .hash = "otel-0.1.0-B0v3lr2UMwA5qFJCa20OT-1huDPLm1sTIFD22PQBADDD",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git#e7a0fca548524061bb89aa1e0956709d412438d1",
+            .hash = "otel-0.1.0-B0v3lpwNNAAeClYawUg8O3BtgOdMPhevogg0BkyAaGM2",
             .lazy = true,
         },
     },
