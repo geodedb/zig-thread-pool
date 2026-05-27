@@ -584,6 +584,13 @@ pub const WaitGroup = struct {
     /// panics before that point, the call does NOT happen.  See the
     /// struct-level doc above and `docs/security/REV-001.md`.
     pub fn done(self: *WaitGroup) void {
+        // CANARY: REQ=REQ-QUIC-HC-061; FEATURE="QUIC High-Concurrency Requests"; ASPECT=WaitGroupLifetime; STATUS=IMPL; TEST=test_quic_condition_timedwait_cadence; OWNER=transport; UPDATED=2026-05-26
+        // Hold the condition mutex before publishing pending==0. Otherwise a
+        // waiter can observe zero, return, and let a stack-owned WaitGroup go
+        // out of scope while this thread is still about to lock/broadcast.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const previous = self.pending.fetchSub(1, .acq_rel);
         if (previous == 0) {
             // F-004: restore invariant so repeated misuse can't push
@@ -597,8 +604,6 @@ pub const WaitGroup = struct {
             return;
         }
         if (previous == 1) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             self.cond.broadcast();
         }
     }
