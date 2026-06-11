@@ -67,4 +67,5 @@ test {
     // whose top-level decls appear in this module's public surface).
     _ = @import("stats/latency.zig");
     _ = @import("stats/process_memory.zig");
+    _ = @import("memory/scratch.zig");
 }
