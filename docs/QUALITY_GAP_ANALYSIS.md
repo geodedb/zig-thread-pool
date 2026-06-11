@@ -1,29 +1,61 @@
 # Quality Gap Analysis
 
-Last updated: 2026-04-16
+Last updated: 2026-06-11
 
 ## Summary
 
-- **Critical:** 0 | **High:** 3 open + 3 closed | **Medium:** 15 | **Low:** 12 | **Info:** 0
+- **Critical:** 0 | **High:** 3 open + 3 closed | **Medium:** 15 | **Low:** 12 | **Info:** 0 (2026-04-16 pass + legacy, unchanged)
+- **2026-06-11 re-review pass:** 11 new findings — **High:** 1 | **Medium:** 6 | **Low:** 4 (plus Q-NEW-01 folded into #59 and NEW-002 folded into #34); **3 legacy items closed** (Q-028, Q-029, Q-006)
 - **Total open findings (new audit):** 29 open + 3 closed on 2026-04-16 (QS-002, QS-003, QS-008)
-- **Legacy Q-xxx open items carried over:** 12 (from 2026-04-11 audit pass)
+- **Legacy Q-xxx open items carried over:** 12 (from 2026-04-11 audit pass); 3 closed 2026-06-11 (Q-028, Q-029, Q-006)
 - **Formal gates (2026-04-16):** `zig fmt` clean, `zig build check` clean, `zig build test` 47 pass / 1 skip / 0 fail; `test-all` + TSan stress all pass post-closure
 
-### Top 5 Risks (current pass, by PriorityScore)
+### Top 5 Risks (2026-06-11 re-review pass, by PriorityScore)
 
-1. **QS-001** Split 2087-line src/pool.zig monolith (PriorityScore 80)
-2. ~~**QS-003** Decompose 130-line hot-path Core.runTask~~ — **Closed 2026-04-16 (a0259e6)**
-3. ~~**QS-002** Decompose 147-line Core.init with nested errdefers~~ — **Closed 2026-04-16 (301392b)**
-4. ~~**QS-008** Document 24 undocumented public symbols in src/types.zig~~ — **Closed 2026-04-16 (429caab)**
-5. **QR-001** Add unit-level tests for lane/watchdog/overflow slices (PriorityScore 48)
+1. **Q-NEW-02** submitBatch leaks waitable descriptors → pool exhaustion (PriorityScore 60, High) — [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107)
+2. **Q-NEW-03** DESIGN.md documents phantom features (RuntimePreset/wake_strategy/idle_queue) (PriorityScore 36, Medium) — [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108)
+3. **Q-NEW-08** Watchdog non-interruptible sleep blocks shutdown up to watchdog_interval_ns (PriorityScore 36, Medium) — [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113)
+4. **QS-001** Split 2745-line src/pool.zig monolith (PriorityScore 80, High, carried) — [#14](https://gitlab.com/devnw/zig/thread-pool/-/issues/14)
+5. **Q-NEW-04..07** DESIGN.md / types.zig doc-accuracy cluster (PriorityScore 24 each, Medium) — [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109)–[#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112)
 
-### Closed This Sweep (2026-04-16)
+### Closed This Sweep (2026-06-11)
+
+| Gap-ID | Issue | Resolution evidence |
+|--------|-------|---------------------|
+| Q-028 | [#65](https://gitlab.com/devnw/zig/thread-pool/-/issues/65) | DESIGN.md no longer says "Mutex-protected"; Queue Design (DESIGN.md:86-114) accurately describes BoundedRing Vyukov per-slot sequence MPMC lock-free. **Closed.** |
+| Q-029 | [#67](https://gitlab.com/devnw/zig/thread-pool/-/issues/67) | DESIGN.md:277-279 now accurately qualified ("lock-free on the fast paths but not on the wake scan"); Chase-Lev deque documented at DESIGN.md:94-96. **Closed.** |
+| Q-006 | (doc-only, no issue) | `lane_extension` is a documented stable public API surface; no longer a gap. Confirmed resolved (per gap determination, recorded in GAP_ANALYSIS_RESOLVED.md). |
+
+### Closed Previous Sweep (2026-04-16)
 
 | Gap-ID | Commit | Issue | Evidence |
 |--------|--------|-------|----------|
 | QS-002 | `301392b` | [#15](https://gitlab.com/devnw/zig/thread-pool/-/issues/15) | `Core.init` 147 → 60 lines; F-002 errdefer chain preserved |
 | QS-003 | `a0259e6` | [#16](https://gitlab.com/devnw/zig/thread-pool/-/issues/16) | Hot-path decomposed; +16.3% conn_churn_seq / +11.7% producer_contention paired A/B |
 | QS-008 | `429caab` | [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) | 24 public symbols documented; `grep -c '^///' src/types.zig` = 159 |
+
+## Stack-Ranked Findings — 2026-06-11 Re-Review Pass
+
+All findings `confidence::confirmed` (verified against source at commit `39528a3`).
+
+| Rank | Severity | PriorityScore | Category | Finding | Component | Evidence | Issue URL | Fix Summary | Effort | Status |
+|------|----------|---------------|----------|---------|-----------|----------|-----------|-------------|--------|--------|
+| 1 | High | 60 | api-contract/reliability | Q-NEW-02 submitBatch accepts `options.waitable=true` but discards every handle → waitable descriptors never released → pool exhaustion after `queue_capacity` such tasks | src/pool.zig:836-888 (:854 discards handle); finalizeTask :2135-2141; wait() :976-999 | submitBatch passes `options` to enqueuePush, binds handle to `\|_\|`; finalizeTask only `releaseDescriptor`s non-waitable; wait() is sole waitable release path but no handle is returned | [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) | Reject waitable in submitBatch (error) or strip+document | S | Open |
+| 2 | Medium | 36 | reliability/concurrency | Q-NEW-08 Watchdog `clock.sleep(interval)` non-interruptible → shutdown/deinit blocks up to full `watchdog_interval_ns` | src/pool.zig:1543-1545; join :1057-1061 | watchdog_stop set then thread.join() while watchdog parked in sleep | [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) | stop-condvar timedWait or document worst-case delay | S-M | Open |
+| 3 | Medium | 36 | docs | Q-NEW-03 DESIGN.md describes phantom features: RuntimePreset, wake_strategy, scan_parked_workers, idle_queue — none exist in any .zig | docs/DESIGN.md:65-68,153-162 | `grep -rn` finds none in src/ | [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108) | Delete Runtime Presets section + dual-strategy framing | S | Open |
+| 4 | Medium | 24 | docs | Q-NEW-04 DESIGN.md says `steal_batch_size` default 16; actual 8 | docs/DESIGN.md:295 vs src/types.zig:349 | `steal_batch_size: usize = 8` | [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109) | Fix doc value to 8 | S | Open |
+| 5 | Medium | 24 | docs | Q-NEW-05 Docs reference nonexistent timestamp mode `completion_only`; actual enum `{full, disabled}` | docs/DESIGN.md:320 + docs/ALGORITHMS.md:518 vs src/types.zig:107-110, build.zig:69 | enum has only full/disabled; build flag {any,full,disabled} | [#110](https://gitlab.com/devnw/zig/thread-pool/-/issues/110) | Drop `completion_only` from both docs | S | Open |
+| 6 | Medium | 24 | docs | Q-NEW-06 `queue_capacity` doc claims descriptors bounded by `queue_capacity + sum(local_queue_capacity)`; actually exactly `queue_capacity` allocated | src/types.zig:178-181 vs src/pool.zig:649 | `alloc(TaskDescriptor, normalized.queue_capacity)` | [#111](https://gitlab.com/devnw/zig/thread-pool/-/issues/111) | Fix doc; links to Q-NEW-02 capacity reasoning | S | Open |
+| 7 | Medium | 24 | docs | Q-NEW-07 `idle_park_after_ns` doc inverts mechanism (says spin duration; actually parked `timedWait` timeout; spin = `spin_before_park_iters`) | src/types.zig:240-243 vs src/pool.zig:2207,2221 | used as `park_cond.timedWait(..., idle_park_after_ns)` | [#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112) | Reword doc; clarify spin knob | S | Open |
+| 8 | Low | 24 | tests/ergonomics | NEW-003 unit.zig timeout tests use 2s sleeps → ~10s suite inflation | tests/unit.zig:309-360 | two `sleep_ns = 2_000_000_000` fixtures | [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) | Shrink sleeps to ~100ms | S | Open |
+| 9 | Low | 16 | docs/observability | Q-NEW-09 parks/wakeups counters count attempts/timeouts not futex events, contradicting docs | src/types.zig:675-677 vs src/pool.zig:2179,2199,2210 | parks++ before timedWait; wakeups++ on early-return + timeout | [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) | Reword docs or move increments | S | Open |
+| 10 | Low | 16 | observability/reliability | Q-NEW-10 joinAllWorkers joins overflow threads without updating overflow_retires/overflow_active | src/pool.zig:1080-1085 vs src/types.zig:761-767 | join loop nulls thread, no counter update | [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) | Update counters on shutdown join or doc caveat | S | Open |
+| 11 | Low | 16 | maintainability | NEW-001 src/types.zig (978 lines) exceeds 800-line threshold (QS-001 scoped pool.zig only) | src/types.zig (wc -l = 978) | — | [#118](https://gitlab.com/devnw/zig/thread-pool/-/issues/118) | Split config/stats/lane submodules behind re-exports | M | Open |
+
+**Folded (no new issue):**
+
+- **Q-NEW-01** (Medium, docs) — public `ThreadPool.submitBatch` doc at src/pool.zig:2637 still says "atomically" and self-contradicts. This is the live residual of **Q-025**; tracked as a comment + remaining acceptance criterion on [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59). Core doc (:830-836) + USAGE.md already fixed.
+- **NEW-002** (Low, docs) — 7 additional files lack `//!` module headers (src/memory/scratch.zig, src/pool/desc_cache.zig, src/stats/latency.zig, src/stats/process_memory.zig, src/queue/bounded_ring.zig, src/queue/ring_queue.zig, src/queue/work_deque.zig). Folded into **QR-009** scope via comment on [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) (which already covers pool.zig + types.zig).
 
 ## Stack-Ranked Findings — 2026-04-16 Audit Pass
 
@@ -62,23 +94,52 @@ Last updated: 2026-04-16
 
 ## Legacy Q-xxx Open Items (carried from 2026-04-11 audit)
 
-These items predate the 2026-04-16 QS/QR scan and remain open pending separate resolution. Issue URLs are not yet filed for these; tracked in this document.
+These items predate the 2026-04-16 QS/QR scan and remain open pending separate resolution. As of 2026-06-11, Q-025 (#59) and Q-027 (#62) are filed as issues; the remainder are tracked in this document only.
 
 | ID | Severity | PriorityScore | Category | Finding | Component | Status |
 |------|----------|---------------|----------|---------|-----------|--------|
 | Q-023 | Medium | 40 | maintainability | deinitOwned missing recordOwnedFree for inject_queue buffer | pool.zig:678 vs :149 | Open |
 | Q-024 | Medium | 40 | api-contract | process_memory.private_peak_bytes reports current not peak on Linux | process_memory.zig:73-74 | Open |
 | Q-004 | Medium | 28 | tests | .block backpressure policy untested | tests/*.zig | Partially Fixed |
-| Q-025 | Medium | 24 | docs | submitBatch doc says "atomically" but behavior is sequential | pool.zig:745-748 | Open |
-| Q-028 | Low | 18 | docs | DESIGN.md says inject queue "Mutex-protected" but it is lock-free Vyukov | DESIGN.md:52 | Open |
-| Q-029 | Low | 18 | docs | DESIGN.md says work-stealing "is not currently lock-free" | DESIGN.md:99 | Open |
-| Q-006 | Low | 12 | api-contract | lane_extension variant still visible in public enum | types.zig:6,99 | Partially Fixed |
+| Q-025 | Medium | 24 | docs | submitBatch doc says "atomically" — residual public wrapper only (Q-NEW-01) | [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) | Open — residual at pool.zig:2637 (Core doc + USAGE.md fixed) |
 | Q-018 | Low | 12 | perf | compare.zig readDocument leak mitigated but no explicit free | compare.zig:45 | Open |
 | Q-026 | Low | 12 | readability | Core.waitGroup() ignores self parameter | pool.zig:244-247 | Open |
 | Q-030 | Low | 12 | maintainability | Code duplication: nowNs()/Counter/updatePeak | multi-file | Open |
 | Q-020 | Low | 8 | maintainability | version constant in root.zig unreferenced | root.zig:16 | Open |
 | Q-021 | Low | 8 | cleanup | CODEOWNERS contains placeholder @your-username | CODEOWNERS:3 | **Superseded by QS-HYG sub-task** |
-| Q-027 | Low | 8 | readability | Magic sentinel 0xFFFFFFFF used as raw literal | pool.zig:158 vs :613 | Open |
+| Q-027 | Low | 8 | readability | Magic sentinel 0xFFFFFFFF raw literal — residual at pool.zig:699 (free_sentinel exists :2304) | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | Open — residual at pool.zig:699 |
+
+> **Closed 2026-06-11 (removed from open list):** Q-028 ([#65](https://gitlab.com/devnw/zig/thread-pool/-/issues/65)), Q-029 ([#67](https://gitlab.com/devnw/zig/thread-pool/-/issues/67)), Q-006 (doc-only). See "Closed This Sweep (2026-06-11)" above for evidence.
+
+## Findings by Category (2026-06-11 re-review pass)
+
+### api-contract / reliability
+
+- Q-NEW-02 (High, 60) — submitBatch waitable descriptor leak → pool exhaustion (#107)
+
+### reliability / concurrency
+
+- Q-NEW-08 (Medium, 36) — watchdog non-interruptible sleep blocks shutdown (#113)
+
+### docs (accuracy)
+
+- Q-NEW-03 (Medium, 36) — DESIGN.md phantom features (#108)
+- Q-NEW-04 (Medium, 24) — steal_batch_size default 16 vs 8 (#109)
+- Q-NEW-05 (Medium, 24) — `completion_only` phantom timestamp mode (#110)
+- Q-NEW-06 (Medium, 24) — queue_capacity descriptor-bound overstated (#111)
+- Q-NEW-07 (Medium, 24) — idle_park_after_ns mechanism inverted (#112)
+- Q-NEW-09 (Low, 16) — parks/wakeups counter semantics (#114)
+- Q-NEW-01 (Medium) — submitBatch wrapper "atomically" residual (folded into #59)
+
+### observability / reliability
+
+- Q-NEW-10 (Low, 16) — overflow_retires/active not updated on shutdown join (#115)
+
+### maintainability / tests
+
+- NEW-001 (Low, 16) — types.zig 978 lines > 800 threshold (#118)
+- NEW-003 (Low, 24) — unit.zig 2s sleeps inflate suite (#120)
+- NEW-002 (Low) — 7 files missing `//!` headers (folded into #34)
 
 ## Findings by Category (2026-04-16 pass)
 
@@ -116,7 +177,41 @@ These items predate the 2026-04-16 QS/QR scan and remain open pending separate r
 
 ## Remediation Roadmap
 
-### Quick Wins (< 1 day each)
+### 2026-06-11 Re-Review Pass
+
+**Fix first (correctness/reliability):**
+
+| ID | Fix | Effort | Issue |
+|----|-----|--------|-------|
+| Q-NEW-02 | Reject (or strip+document) `waitable` in submitBatch; add exhaustion test | S | #107 |
+| Q-NEW-08 | Stop-condvar `timedWait` for watchdog, or document worst-case shutdown delay | S-M | #113 |
+
+**Quick doc wins (< 1 day; batchable into one DESIGN.md/types.zig pass):**
+
+| ID | Fix | Effort | Issue |
+|----|-----|--------|-------|
+| Q-NEW-03 | Delete Runtime Presets + dual wake-strategy framing from DESIGN.md | S | #108 |
+| Q-NEW-04 | Fix steal_batch_size default (16 → 8) | S | #109 |
+| Q-NEW-05 | Drop `completion_only` from DESIGN.md + ALGORITHMS.md | S | #110 |
+| Q-NEW-06 | Fix queue_capacity descriptor-bound doc | S | #111 |
+| Q-NEW-07 | Reword idle_park_after_ns (timedWait timeout, not spin) | S | #112 |
+| Q-NEW-01 | Rewrite submitBatch wrapper doc (drop "atomically") | S | #59 |
+| Q-NEW-09 | Reword parks/wakeups counter docs | S | #114 |
+| Q-027 | Replace raw `0xFFFFFFFF` at pool.zig:699 with `free_sentinel` | S | #62 |
+| QR-005 | Cross-reference `.block` footgun from submit/submitBatch method docs | S | #49 |
+
+**Low / structural:**
+
+| ID | Fix | Effort | Issue |
+|----|-----|--------|-------|
+| NEW-003 | Shrink unit.zig timeout sleeps 2s → ~100ms | S | #120 |
+| Q-NEW-10 | Update overflow counters on shutdown join (or doc caveat) | S | #115 |
+| NEW-002 | Add `//!` headers to 7 remaining modules | S | #34 |
+| NEW-001 | Split types.zig into config/stats/lane submodules | M | #118 |
+
+### 2026-04-16 Pass
+
+#### Quick Wins (< 1 day each)
 
 | ID | Fix | Effort | Issue |
 |----|-----|--------|-------|
@@ -128,7 +223,7 @@ These items predate the 2026-04-16 QS/QR scan and remain open pending separate r
 | QS-018 | Pre-commit size gate script | S | #73 |
 | QS-HYG | Individual sub-tasks (CODEOWNERS, SECURITY.md, stray binaries) | S each | #77 |
 
-### Medium (1-5 days)
+#### Medium (1-5 days)
 
 | ID | Fix | Effort | Issue |
 |----|-----|--------|-------|
@@ -144,7 +239,7 @@ These items predate the 2026-04-16 QS/QR scan and remain open pending separate r
 | QS-015 | ASan build option + scheduled job | S-M | #66 |
 | QS-016 | kcov pipeline | M | #69 |
 
-### Strategic (> 5 days)
+#### Strategic (> 5 days)
 
 | ID | Fix | Effort | Issue |
 |----|-----|--------|-------|

@@ -709,3 +709,45 @@ report (tests, A/B data, platform-issue audit).
   same GitLab issue with a 2026-04-16 scope-reduce comment.
 - **Not in `GAP_ANALYSIS_RESOLVED.md` top-level list** because the issue is
   not closed. Listed here as a breadcrumb only.
+
+## 2026-06-11 Gap-Sync Closures
+
+### PERF-029: Shutdown drain residual poll [RESOLVED]
+
+- **Issue:** [#51](https://gitlab.com/devnw/zig/thread-pool/-/issues/51) (closed)
+- **Category:** Performance
+- **Severity:** Low
+- **Resolution:** The shutdown drain is now condvar-driven rather than a
+  fixed-interval busy poll. The drain loop blocks on the default-lane
+  backpressure condvar (signalled by `releaseDescriptor` on every task
+  completion) and only re-checks state on a 10 ms lost-wakeup safety cap;
+  waitable-task completion broadcasts the completion condvar.
+- **Evidence:**
+  - `src/pool.zig:1033-1045` — `shutdown` drain loop breaks on
+    `queued == 0 and active == 0`, otherwise calls
+    `waitForCapacity(deadline, .default)` (condvar) instead of `Thread.sleep`;
+    comment documents the per-completion signal + 10 ms safety re-check.
+  - `src/pool.zig:980-1010` — completion `wait()` uses
+    `completion_mutex` + `completion_cond.wait`.
+  - `src/pool.zig:2137`, `src/pool.zig:2297` — `finalizeTask` broadcasts
+    `completion_cond` on every waitable completion.
+- **Resolved date:** 2026-06-11
+
+### Q-004 / GAP-0014: Backpressure `.block` policy test coverage [RESOLVED — duplicate]
+
+- **Issue:** none (Q-004 is a `QUALITY_GAP_ANALYSIS.md` tracker entry; no
+  GitLab issue was ever opened).
+- **Category:** Test
+- **Severity:** Low (Medium in the quality tracker)
+- **Resolution:** Confirmed duplicate of the already-resolved **GAP-0014**
+  (Backpressure `.block` policy test coverage, resolved 2026-04-16). A
+  dedicated unit test exists at `tests/unit.zig:980`
+  (`test "backpressure block policy returns when capacity frees"`) plus
+  further `.block` coverage across unit/integration/stress suites.
+- **Evidence:** `tests/unit.zig:980` (dedicated test) and the GAP-0014
+  evidence set (`tests/unit.zig:614,753,768,830,843,866,980`,
+  `tests/integration.zig:245`, `tests/stress.zig:541`).
+- **Note:** `QUALITY_GAP_ANALYSIS.md` is owned by the quality-tracker agent
+  and is intentionally not edited here; recorded as resolved-by-duplicate for
+  cross-reference only.
+- **Resolved date:** 2026-06-11

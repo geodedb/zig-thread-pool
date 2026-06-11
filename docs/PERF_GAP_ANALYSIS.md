@@ -1,13 +1,24 @@
 # Performance Gap Analysis
 
-Last updated: 2026-04-16
+Last updated: 2026-06-11
 
 ## Summary
 
-Two tracks:
+Three tracks:
 
 - **Historical PERF-### cohort** (2026-04-11 baseline): micro-opt and false-sharing work, mostly closed. Preserved verbatim below for audit continuity.
 - **2026-04-16 adversarial perf review cohort** (`P-##`, `R-##`): pivot-axis findings (tail latency / lanes / memory / observability / methodology) filed against the declared throughput plateau. Raw input: `.cache/audit/perf-reviewed.json`.
+- **2026-06-11 implementation-audit cohort** (`PERF-NEW-##`, `CI-NEW-##`): a fresh code-level scan at commit `39528a3` surfacing per-slot/descriptor false sharing, memory-ordering and comptime-elision dead-work findings, a submitter-drain correctness+spin concern, a CI build-reuse gap, and one enhancement (the favoured next Go-gap attack). 9 issues filed (#99, #116, #117, #119, #121, #122, #123, #124, #125), 1 folded into #36 (#PERF-NEW-05), 1 doc-note (AP-01). See section below.
+
+### 2026-06-11 cohort counts
+
+| PerfSeverity | Count | Filed | Folded | Doc-note |
+|---|---|---|---|---|
+| P2 | 7 | 7 (#99,#116,#117,#122,#123,#124,#125) | -- | -- |
+| P3 | 2 | 2 (#119,#121) | -- | -- |
+| (methodology) | 1 | -- | 1 → #36 (PERF-NEW-05) | -- |
+| (advisory) | 1 | -- | -- | 1 (AP-01) |
+| **Total** | **11** | **9 issues** | **1** | **1** |
 
 Plateau verdict (per `project_throughput_plateau_pivot.md`): throughput plateau on `flood_1m_batched` is architectural — 5 consecutive iter failures on the notifySubmits/state-load plane (iter7 bitmap, iter8 single-probe, iter9 isolation, iter10 shouldExit, iter11 active_tasks shard). **Throughput micro-opts against the plateau are filtered/demoted.** Pivot axes: tail latency, lanes, memory, API, observability, methodology.
 
@@ -142,6 +153,86 @@ Input: `.cache/audit/perf-reviewed.json` (23 findings; P0=1, P1=9, P2=10, P3=3).
 
 ---
 
+## 2026-06-11 Implementation-Audit Perf Cohort
+
+Fresh code-level scan at commit `39528a3`. Findings verified against source before filing. All issues on GitLab `devnw/zig/thread-pool`. Throughput micro-opts that target the 3 plateau-resistant contended/nested scenarios (`contended_spawn_8x`, `contended_cpu_10us`, `nested_fanout_4x`) are filed at `status::triage` for the maintainer to re-triage against the plateau-pivot rule; each carries a strict A/B-gate instruction.
+
+### Top 5 Risks (2026-06-11 cohort, by PerfScore)
+
+1. **PERF-NEW-05** (PerfScore 80, confirmed) -- harness pays 3x `nowNs()`/task, suppressing `flood_1m`/`contended_spawn_8x` throughput 30-50% vs `-Dtimestamp-mode=disabled`. **Folded into #36** (methodology tracker), not a standalone issue.
+2. **PERF-NEW-01** (PerfScore 48, suspected) -- `BoundedRing.Slot` 16B → 4 slots/cacheline MPMC false sharing on the inject/submitter rings. Default-path, always paid under contention. Est 5-15% on `contended_spawn_8x`. #116.
+3. **PERF-NEW-10** (PerfScore 48, suspected) -- `-Dworker-desc-cache` comptime opt-out (the favoured next Go-gap attack): reclaim Phase-2's ~1.33M ops/s contended ceiling for multi-submitter workloads. Enhancement. #125.
+4. **PERF-NEW-02** (PerfScore 40, confirmed) -- 8 single-writer observability counters use `.release` where `.monotonic` suffices; ~8 redundant fences/task on ARM64 (x86 ~zero). Est 2-5% CPU-bound on ARM. #99.
+5. **PERF-NEW-09** (PerfScore 40, confirmed-code/suspected-impact) -- `finalizeTask` unconditional `nowNs()`+store survives `-Dtimestamp-mode=disabled`; ~20-30ns/task dead work. #124.
+
+### Stack-ranked (2026-06-11 cohort)
+
+| Rank | Sev | PerfScore | ID | Finding | Component | Evidence | Measurement | Issue | Fix Summary | Owner | SLA | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | P1 | 80 | PERF-NEW-05 | Harness pays 3x `nowNs()`/task (methodology) | bench | `common.zig:312,331,405,419` | bench-realistic ± `-Dtimestamp-mode=disabled` | [#36](https://gitlab.com/devnw/zig/thread-pool/-/work_items/36) | Pin disabled mode for throughput; sample latency | @benjiv | Within sprint | Folded into #36 |
+| 2 | P2 | 48 | PERF-NEW-01 | BoundedRing `Slot` 16B → 4 slots/line false sharing | queue | `bounded_ring.zig:11-14` | `perf c2c` on Slot range; padded-slot A/B | [#116](https://gitlab.com/devnw/zig/thread-pool/-/work_items/116) | Pad Slot to cache line (A/B gated; +48B/slot) | @benjiv | Next quarter | Open |
+| 3 | P2 | 48 | PERF-NEW-10 | `-Dworker-desc-cache` comptime opt-out (enhancement) | concurrency | `pool.zig:1351,1357,2482` | `-Dworker-desc-cache=false` A/B on contended_* | [#125](https://gitlab.com/devnw/zig/thread-pool/-/work_items/125) | void-field comptime opt-out; default true | @benjiv | Next quarter | Open |
+| 4 | P2 | 40 | PERF-NEW-02 | Counters `.release` where `.monotonic` suffices (ARM) | stats | `pool.zig:1758,1883,2114,2179,2198,2210` | ARM64 bench + objdump stlr→str | [#99](https://gitlab.com/devnw/zig/thread-pool/-/work_items/99) | `.release` → `.monotonic` on 8 single-writer counters | @benjiv | Next quarter | Open |
+| 5 | P2 | 40 | PERF-NEW-09 | `finalizeTask` unconditional `nowNs()`+store survives elision | stats | `pool.zig:2103-2106` | disabled-mode A/B + objdump | [#124](https://gitlab.com/devnw/zig/thread-pool/-/work_items/124) | comptime-foldable guard for idle-purge timestamp | @benjiv | Next quarter | Open |
+| 6 | P2 | 36 | PERF-NEW-07 | TaskDescriptor 96B stride cross-descriptor false sharing | concurrency | `pool.zig:229-276,:649` | `perf c2c` across descriptor slab; align(cl) A/B | [#122](https://gitlab.com/devnw/zig/thread-pool/-/work_items/122) | `align(cache_line)` → 128B stride (A/B gated; +32B/desc) | @benjiv | Next quarter | Open |
+| 7 | P2 | 36 | PERF-NEW-08 | Steal victim `@ctz` convergence (wake rotates, steal doesn't) | scheduler | `pool.zig:1862-1864,1831-1834`; ref `:1515-1519` | steals/steal_failures ratio; 3-scenario A/B | [#123](https://gitlab.com/devnw/zig/thread-pool/-/work_items/123) | `rotr(mask, worker_index)` start offset (A/B gated) | @benjiv | Next quarter | Open |
+| 8 | P2 | 24 | PERF-NEW-03 | releaseSubmitter 1M-spin no backoff, then silent task drop | concurrency | `pool.zig:962-968` | stress: release vs stalled inject; spin-cycle count | [#117](https://gitlab.com/devnw/zig/thread-pool/-/work_items/117) | Bounded backoff + observable/re-push instead of drop | @benjiv | Next quarter | Open |
+| 9 | P3 | 16 | CI-NEW-01 | bench-regression + bench-micro rebuild executables independently | ci | `.gitlab-ci.yml:260-289` | perf-stage pipeline duration before/after | [#121](https://gitlab.com/devnw/zig/thread-pool/-/work_items/121) | Share `zig-out` artifact from `zig-build-0.16.0`; run prebuilt | @benjiv | Backlog | Open |
+| 10 | P3 | 12 | PERF-NEW-04 | `gitSha()` forks git subprocess per scenario (~168/run) | bench | `common.zig:262,471-488` | `strace -e execve` count rev-parse forks | [#119](https://gitlab.com/devnw/zig/thread-pool/-/work_items/119) | Hoist gitSha to main (compute once) | @benjiv | Backlog | Open |
+
+### Advisory doc-note (no separate issue)
+
+**AP-01 -- monotonic clock for timeouts/wait.** `src/clock.zig:16` uses `std.Io.Clock.Timestamp.now(io, .real)` and `src/sync.zig:51` (`Condition.timedWait`) uses `.clock = .real`. The wall clock is subject to NTP steps / settime jumps; a backward step can over-shorten or over-lengthen a `timedWait`, and a forward step can corrupt elapsed-time deltas. **Recommendation:** switch both to `.awake` (monotonic). On Linux the vDSO path for `CLOCK_MONOTONIC` is the same fast path as `CLOCK_REALTIME`, so this is **zero hot-path cost** and strictly more correct than a saturating-subtraction workaround. Low risk; covered by existing timeout/park tests. Filed as a doc-note rather than an issue per audit scope.
+
+### Findings by area (2026-06-11 cohort)
+
+- **area::queue**: PERF-NEW-01 (#116).
+- **area::stats**: PERF-NEW-02 (#99), PERF-NEW-09 (#124).
+- **area::concurrency**: PERF-NEW-03 (#117), PERF-NEW-07 (#122), PERF-NEW-10 (#125).
+- **area::scheduler**: PERF-NEW-08 (#123).
+- **area::bench**: PERF-NEW-04 (#119); PERF-NEW-05 (folded → #36).
+- **area::ci**: CI-NEW-01 (#121).
+- **advisory**: AP-01 (clock.zig:16, sync.zig:51) -- doc-note only.
+
+### Roadmap (2026-06-11 cohort)
+
+**Quick wins (< 1 day each)**
+
+- PERF-NEW-02 #99 -- `.release` → `.monotonic` on 8 counters (ARM; no x86 regression).
+- PERF-NEW-04 #119 -- hoist `gitSha()` to main.
+- AP-01 -- `.real` → `.awake` in clock.zig:16 + sync.zig:51.
+
+**Medium (1-5 days each)**
+
+- PERF-NEW-01 #116 -- padded-slot A/B on BoundedRing.
+- PERF-NEW-07 #122 -- `align(cache_line)` TaskDescriptor A/B.
+- PERF-NEW-08 #123 -- per-thief steal rotation A/B.
+- PERF-NEW-09 #124 -- comptime-foldable idle-purge timestamp.
+- PERF-NEW-03 #117 -- bounded backoff + observable drop in releaseSubmitter.
+- CI-NEW-01 #121 -- share `zig-out` artifact across perf jobs.
+- PERF-NEW-05 (#36) -- pin disabled mode for throughput scenarios.
+
+**Strategic (> 5 days)**
+
+- PERF-NEW-10 #125 -- `-Dworker-desc-cache` comptime opt-out (next Go-gap attack; dual-config CI + stress + TSan + fuzz).
+
+### Scoring (2026-06-11 cohort)
+
+| ID | Impact | Likelihood | PerfScore | Confidence |
+|---|---|---|---|---|
+| PERF-NEW-05 (in #36) | 4 | 5 | 80 | confirmed |
+| PERF-NEW-01 #116 | 3 | 4 | 48 | suspected |
+| PERF-NEW-10 #125 | 4 | 3 | 48 | suspected |
+| PERF-NEW-02 #99 | 2 | 5 | 40 | confirmed |
+| PERF-NEW-09 #124 | 2 | 5 | 40 | confirmed-code / suspected-impact |
+| PERF-NEW-07 #122 | 3 | 3 | 36 | suspected |
+| PERF-NEW-08 #123 | 3 | 3 | 36 | suspected |
+| PERF-NEW-03 #117 | 3 | 2 | 24 | confirmed |
+| CI-NEW-01 #121 | 2 | 2 | 16 | confirmed |
+| PERF-NEW-04 #119 | 1 | 3 | 12 | confirmed |
+
+---
+
 ## Historical Cohort (2026-04-11 baseline)
 
 PERF-### numbering. Preserved for audit continuity. Most items closed / resolved via prior sprints. See "Stack-Ranked Findings" below.
@@ -169,8 +260,8 @@ Sorted by PerfScore descending. PerfScore = Impact(1-5) x Likelihood(1-5) x 4.
 | 15 | P2 | 48 | PERF-017 | submitBatch is N individual submits, not true batch | `pool.zig:213-221` | Loop calls submit() individually; N lock pairs per batch | 32x lock overhead for batch=32 | N/A | @benjiv | Next quarter | Won't Do -- PERF-006 lock-free freelist makes per-task cost negligible. |
 | 16 | P2 | 40 | PERF-027 | Hot-path atomic overhead -- ~10 atomic operations per task | `pool.zig:394-401,464-472,527-531` | Global counters (steals :465, steal_failures :471, parks :557) duplicate per-worker counters (:466, :472, :558). Global wakeups counter (:316) is loaded in statsSnapshot but never incremented -- always 0. | ~10 atomics per task; 5-6 are redundant global increments | Remove global steals/steal_failures/parks/wakeups counters; derive from sum of per-worker values in statsSnapshot | @benjiv | Next quarter | Open |
 | 17 | P1 | 36 | PERF-011 | LatencyHistogram non-atomic fields read cross-thread in statsSnapshot | `stats/latency.zig:7-11; pool.zig:300-303` | sum_ns is now u64 (not u128), reducing tearing risk. But all histogram fields (counts, count, min_ns, max_ns, sum_ns) are plain u64, not atomic. statsSnapshot merges histograms cross-thread at pool.zig:300-303 without synchronization. | Data race on cross-thread histogram reads during active workloads | Use atomic fields for histogram counters, or copy histogram under per-worker lock before merge | @benjiv | Within sprint | Closed -- all histogram fields converted to std.atomic.Value with proper load/store ordering; commit de49d69. |
-| 18 | P2 | 36 | PERF-024 | submitBatch per-task signaling | `pool.zig:213-221,397-400` | submitBatch calls submit() in a loop; each submit does park_mutex.lock/signal/unlock if parked_workers > 0 | N park_mutex lock/signal/unlock for batch of N tasks | Signal once at end of batch; or add internal submitInternal variant without signal, signal after loop | @benjiv | Next quarter | Open |
-| 19 | P2 | 36 | PERF-026 | Single-item steal in work_stealing | `pool.zig:463-466; queue/work_deque.zig:63-82` | stealTop() returns exactly 1 item per successful steal. Most runtimes batch-steal half the victim's deque. | Under-utilization of steal opportunity; O(N) scan for 1 task | Implement batch steal (steal half of victim's deque) | @benjiv | Next quarter | Open |
+| 18 | P2 | 36 | PERF-024 | submitBatch per-task signaling | `pool.zig:886` | submitBatch accumulates `pending_notify` and issues a single `notifySubmits(pending_notify, lane)` after the loop | N park_mutex lock/signal collapsed to 1 per batch | Single notifySubmits at pool.zig:886 | @benjiv | Next quarter | Resolved -- submitBatch coalesces notification into one notifySubmits call at pool.zig:886 (also in GAP_ANALYSIS_RESOLVED.md). |
+| 19 | P2 | 36 | PERF-026 | Single-item steal in work_stealing | `queue/ring_queue.zig:110; queue/work_deque.zig:5-8` | Default work-stealing path (RingQueue) implements `stealHalf` (steals `(len+1)/2`); chase_lev `WorkDeque` single-steal is a documented design constraint (Chase-Lev proof does not generalize to batch-steal) | Batch-steal on default path; single-steal only on opt-in chase_lev | RingQueue.stealHalf at ring_queue.zig:110 | @benjiv | Next quarter | Resolved -- default RingQueue path batch-steals via stealHalf (ring_queue.zig:110); chase_lev single-steal documented as design constraint (work_deque.zig:5-8). Also in GAP_ANALYSIS_RESOLVED.md. |
 | 20 | P1 | 36 | PERF-014 | Benchmark uses 128 tasks -- below noise floor | `benchmarks/bench.zig:14` | task_count increased to 4096; queue_capacity raised proportionally | Runtime now ~3-6ms, well above noise floor | Task count increased | @benjiv | Within sprint | Closed -- task_count increased to 4096. |
 | 21 | P1 | 36 | PERF-015 | Benchmark single-shot measurement, no statistical repetition | `benchmarks/common.zig` | Median-of-3 runs implemented in runScenarios | Reduced noise | Added iterations with median reporting | @benjiv | Within sprint | Closed -- median-of-3 runs implemented. |
 | 22 | P2 | 32 | PERF-020 | statsSnapshot reads non-atomic Worker fields cross-thread | `pool.zig:280-293` | Converted all Worker stat fields to std.atomic.Value with proper load/store/fetchAdd ordering | N/A | Atomic fields implemented | @benjiv | Next quarter | Closed -- all Worker stat fields converted to std.atomic.Value. |
@@ -181,7 +272,7 @@ Sorted by PerfScore descending. PerfScore = Impact(1-5) x Likelihood(1-5) x 4.
 | 27 | P0 | 40 | PERF-004 | Spurious wakeups counter incremented on every submit | `pool.zig:565,571` | Counter removed from submit path. Only per-worker wakeups.fetchAdd(1) in idle() at pool.zig:565 and :571. Global counters.wakeups is loaded in statsSnapshot but never incremented. | N/A -- no wasted atomic on submit | Counter gated behind actual idle wake | @benjiv | Immediate | Resolved -- Counter removed from submit path. Only counted in idle(). |
 | 28 | P2 | 20 | PERF-018 | CI installs Zig from scratch every job (~12 jobs x 50MB) | `.gitlab-ci.yml:28-31` | install-zig.sh runs per-job; no `cache:` directive in .gitlab-ci.yml | 30-60s extra per job; ~6-12 min total pipeline waste | Add `cache:` key on ZIG_VERSION or use pre-built image | @benjiv | Next quarter | Open |
 | 29 | P3 | 20 | PERF-028 | LatencyHistogram.bucketIndex uses while loop instead of @clz intrinsic | `stats/latency.zig:47-55` | `while (value > 1)` loop iterates up to 63 times; 13 iterations for typical 10us latency. @clz is single instruction on all targets. | ~10-15 cycles per observe() vs 1 cycle with @clz | Replace with `@as(usize, @intCast(63 - @clz(value)))` or equivalent bit-scan | @benjiv | Backlog | Open |
-| 30 | P3 | 8 | PERF-029 | Shutdown drain polls with 100us sleep instead of condvar | `pool.zig:258-264` | `while (true)` loop with `Thread.sleep(100_000)` polling queued/active until zero | 100us polling latency on shutdown; wastes CPU during drain | Signal shutdown completion via condvar when last task completes | @benjiv | Backlog | Open |
+| 30 | P3 | 8 | PERF-029 | Shutdown drain polls with 100us sleep instead of condvar | `pool.zig:1020-1048` | `shutdown()` drains via the backpressure condvar `waitForCapacity` (10ms re-check cap), signaled by `releaseDescriptor` on every completion; `wait()` on `completion_cond` at `:980-1010`; broadcasts at `:2137`,`:2297` | Eventful drain; no busy-poll | Condvar-based drain | @benjiv | Backlog | Resolved (2026-06-11, closed #51) -- condvar-based drain at pool.zig:1020-1048; broadcasts :2137,:2297. Old Thread.sleep(100us) poll removed. |
 | 31 | P2 | 16 | PERF-019 | alloc_count always 0 in benchmark output | `benchmarks/common.zig` | Added total_alloc_count atomic to Accounting/Core/Stats | N/A | alloc_count wired up | @benjiv | Next quarter | Closed -- total_alloc_count wired up. |
 
 ---
@@ -210,8 +301,8 @@ Sorted by PerfScore descending. PerfScore = Impact(1-5) x Likelihood(1-5) x 4.
 | PERF-027 | 40 | Hot-path atomic overhead (redundant global counters) | Open |
 | PERF-004 | 40 | Spurious wakeups counter | Resolved |
 | PERF-011 | 36 | Non-atomic histogram fields, cross-thread reads | Closed |
-| PERF-024 | 36 | submitBatch per-task signaling | Open |
-| PERF-026 | 36 | Single-item steal in work_stealing | Open |
+| PERF-024 | 36 | submitBatch per-task signaling | Resolved |
+| PERF-026 | 36 | Single-item steal in work_stealing | Resolved |
 | PERF-020 | 32 | Non-atomic worker field reads in statsSnapshot | Closed |
 | PERF-021 | 32 | Worker struct cache layout | Closed |
 | PERF-025 | 24 | submitInternal backpressure flat 50us sleep | Open |
@@ -219,7 +310,7 @@ Sorted by PerfScore descending. PerfScore = Impact(1-5) x Likelihood(1-5) x 4.
 | PERF-028 | 20 | bucketIndex while loop instead of @clz | Open |
 | PERF-018 | 20 | Zig installed per-job without caching | Open |
 | PERF-019 | 16 | alloc_count always 0 | Closed |
-| PERF-029 | 8 | Shutdown drain polls with 100us sleep | Open |
+| PERF-029 | 8 | Shutdown drain polls with 100us sleep | Resolved |
 
 ### Area: Infra / CI
 
@@ -305,7 +396,7 @@ Likelihood:
 | PERF-002 | ~~Guard cancelDescriptor with waitable check~~ | ~~Done -- commit 3299728~~ | -- |
 | PERF-027 | Remove global counters.steals/steal_failures/parks/wakeups; sum per-worker values in statsSnapshot | ~4 fewer atomics per task | Low -- stats semantics preserved |
 | PERF-028 | Replace bucketIndex while loop with `63 - @clz(value)` | ~12 cycles saved per observe() | None -- single instruction |
-| PERF-029 | Replace shutdown drain poll with condvar signal on last task completion | Eliminate polling; instant shutdown | Low -- condvar semantics straightforward |
+| PERF-029 | ~~Replace shutdown drain poll with condvar signal on last task completion~~ | ~~Done -- condvar `waitForCapacity` drain at pool.zig:1020-1048; closed #51~~ | -- |
 | PERF-018 | Add `cache:` directive in .gitlab-ci.yml keyed on ZIG_VERSION | Save 30-60s per job | None |
 
 ### Medium Effort (1-5 days each)
@@ -315,7 +406,7 @@ Likelihood:
 | PERF-022 | ~~Add padding between BoundedRing head and tail~~ | ~~Done -- commit ca1b0a4~~ | -- |
 | PERF-023 | ~~Group hot Counters fields with cache-line padding~~ | ~~Done -- commit 37fbd6a~~ | -- |
 | PERF-030 | Add padding between WorkDeque top and bottom | Reduced false sharing under steal contention | Low -- padding only |
-| PERF-024 | Add submitBatchInternal that enqueues N tasks, signals once | N-fold reduction in park_mutex lock/unlock | Low -- additive code path |
+| PERF-024 | ~~Add submitBatchInternal that enqueues N tasks, signals once~~ | ~~Done -- single notifySubmits at pool.zig:886~~ | -- |
 | PERF-025 | Exponential backoff with jitter (50us, 100us, 200us, ... capped 1ms) | Eliminate thundering-herd retry | Low -- backpressure path only |
 | PERF-011 | ~~Convert histogram fields to std.atomic.Value~~ | ~~Done -- commit de49d69~~ | -- |
 | PERF-031 | Add bench scenario with 4-8 workers | Detect false sharing regressions in CI | None |
@@ -324,7 +415,7 @@ Likelihood:
 
 | ID | Fix | Expected Gain | Risk |
 |---|---|---|---|
-| PERF-026 | Batch-steal half of victim's deque (steal_half()) | Amortize O(N) steal scan; better load distribution | Medium -- correctness of bulk transfer |
+| PERF-026 | ~~Batch-steal half of victim's deque (steal_half())~~ | ~~Done -- RingQueue.stealHalf at ring_queue.zig:110; chase_lev single-steal documented (work_deque.zig:5-8)~~ | -- |
 
 ---
 
