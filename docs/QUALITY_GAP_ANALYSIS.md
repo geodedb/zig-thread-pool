@@ -78,7 +78,7 @@ All findings `confidence::confirmed` (verified against source at commit `39528a3
 
 **Folded (no new issue):**
 
-- **Q-NEW-01** (Medium, docs) — public `ThreadPool.submitBatch` doc at src/pool.zig:2637 still says "atomically" and self-contradicts. This is the live residual of **Q-025**; tracked as a comment + remaining acceptance criterion on [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59). Core doc (:830-836) + USAGE.md already fixed.
+- **Q-NEW-01** (Medium, docs) — **Closed 2026-06-11 (01d7f6a), #59 closed.** Public `ThreadPool.submitBatch` wrapper doc at src/pool.zig:2637 now says "NOT atomically"; the "atomically" claim has been removed. This was the live residual of **Q-025**; both the wrapper doc and the Core doc (:830-836) + USAGE.md are now consistent.
 - **NEW-002** (Low, docs) — 7 additional files lack `//!` module headers (src/memory/scratch.zig, src/pool/desc_cache.zig, src/stats/latency.zig, src/stats/process_memory.zig, src/queue/bounded_ring.zig, src/queue/ring_queue.zig, src/queue/work_deque.zig). Folded into **QR-009** scope via comment on [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) (which already covers pool.zig + types.zig).
 
 ## Stack-Ranked Findings — 2026-04-16 Audit Pass

@@ -64,8 +64,10 @@ Detailed archive: `docs/performance/2026-04-14-scratch-fastpath-idle-queue/`.
   unless the pool is quiescent: `active_tasks == 0 && queued_tasks == 0`.
 - Added `WakeStrategy` with an opt-in `idle_queue` mode that replaces the
   submit-path O(N) parked-worker scan with a bounded idle-worker ticket queue.
+  (never shipped — design exploration only; removed from DESIGN.md 2026-06-11, see Q-NEW-03 #108)
 - Added `RuntimePreset.tokio_parity`, which currently enables
   `timestamp_mode = .disabled` and `wake_strategy = .idle_queue`.
+  (never shipped — design exploration only; removed from DESIGN.md 2026-06-11, see Q-NEW-03 #108)
 
 ### Correctness outcome
 

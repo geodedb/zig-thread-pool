@@ -62,6 +62,10 @@ Go-gap round 2 plan's Phase 1 and Phase 2 both failed kill gates and were
 reverted). 7 retained samples after 1 warmup discard, 56 workers. Raw
 artifact: `benchmarks/results/runtime-comparison-latest.json`.
 
+Note (2026-06-11): this snapshot predates the 2026-06-11 audit-remediation pass
+(branch audit-2026-06-11, ~20 commits touching pool.zig/clock.zig/sync.zig/stats);
+re-run bench-runtime-compare to refresh before using these numbers for decisions.
+
 ### Throughput (ops/sec)
 
 | Scenario | Zig thread-pool | Tokio | Go | Zig vs Go |
@@ -147,6 +151,13 @@ artifact: `benchmarks/results/runtime-comparison-latest.json`.
   post-appsec `8cf119d`, both zig 0.16). **Honest remediation cost: 5–12%
   throughput regression on six of eight scenarios, accepted as the price
   of closing 1 Critical + 2 High memory-safety bugs. TSan + fuzz are clean.**
+  A 2026-06-11 appsec pass (round 1 + round 2, docs/APPSEC_REVIEW_2026-06-11_src.md
+  and_round2.md) closed AP-01..AP-06 (monotonic clock, atomic generation,
+  releaseSubmitter contract, u128 quantile, deinit drain, version derivation);
+  one accepted Info residual remains (AP2-02, cross-thread release under contract
+  violation).
+- `thread_pool.version` is now derived from `build.zig.zon` via `build_options`
+  (landed `7ab4358`, AP-06 / Q-020).
 - Single-pool workloads can opt in to `-Dsingle-pool=true` to elide the
   F-001 hot-path identity check at compile time. Reliably recovers 6–17%
   on `contended_spawn_8x`, `cpu_work_100us`, and `mixed_fast_slow`.

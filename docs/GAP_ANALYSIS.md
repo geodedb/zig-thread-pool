@@ -87,7 +87,6 @@ see the issue body for full detail.
 | Gap-ID | Title | Issue | Status | Evidence (summary) |
 | --- | --- | --- | --- | --- |
 | G-010 | Cross-platform build and test matrix (umbrella, absorbs CICD-01/02, NFR-002) | [#10](https://gitlab.com/devnw/zig/thread-pool/-/issues/10) | Partial | `.gitlab-ci.yml:105-146, 174-202` |
-| GAP-0031 | Linux private_peak_bytes reports current not peak | [#17](https://gitlab.com/devnw/zig/thread-pool/-/issues/17) | NotImplemented | `src/stats/process_memory.zig:58` |
 | SEC-007 | `scratch_init_failures` not surfaced in Stats (CWE-755) | [#19](https://gitlab.com/devnw/zig/thread-pool/-/issues/19) | NotImplemented | `src/pool.zig:1622-1624`, `src/types.zig:378` |
 | SEC-008 | CI catalog components pinned by tag not SHA (CWE-829) | [#20](https://gitlab.com/devnw/zig/thread-pool/-/issues/20) | NotImplemented | `.gitlab-ci.yml:6-13, 36-42, 45-146` |
 | SEC-011 | Descriptor fields non-atomic before queue push (CWE-362) | [#25](https://gitlab.com/devnw/zig/thread-pool/-/issues/25) | Partial | `src/pool.zig:1826-1836` |
@@ -104,7 +103,7 @@ see the issue body for full detail.
 | Gap-ID | Title | Issue | Status | Evidence (summary) |
 | --- | --- | --- | --- | --- |
 | GAP-0027 | Scratch buffer not zeroed between tasks | [#33](https://gitlab.com/devnw/zig/thread-pool/-/issues/33) | NotImplemented | `src/memory/scratch.zig:61,70` |
-| GAP-0031 | Linux `private_peak_bytes` reports current not peak (Windows RSS unimplemented) | [#17](https://gitlab.com/devnw/zig/thread-pool/-/issues/17) | Partial | `src/stats/process_memory.zig:57-58`; observed-peak tracking landed `7ab4358`; macOS/Windows contract alignment remains open |
+| GAP-0031 | Linux observed-peak landed 7ab4358; Windows RSS unimplemented (#17 re-scoped) | [#17](https://gitlab.com/devnw/zig/thread-pool/-/issues/17) | Partial | `src/stats/process_memory.zig:42,67-81`; observed-peak tracking landed `7ab4358`; Windows RSS unimplemented |
 | SEC-014 | `decrementQueued` fetchSub underflow (CWE-682) | [#27](https://gitlab.com/devnw/zig/thread-pool/-/issues/27) | Partial | `src/pool.zig:1930` |
 | SEC-016 | `purgeWorkerCaches` TOCTOU (CWE-367) | [#29](https://gitlab.com/devnw/zig/thread-pool/-/issues/29) | Partial | `src/pool.zig:950-951` |
 | SEC-018 (#30) | `queue_capacity` non-pow2 on 32-bit bypasses validation (CWE-682) | [#30](https://gitlab.com/devnw/zig/thread-pool/-/issues/30) | Partial | `src/types.zig:216` — distinct from confidential SEC-018 (#23, closed 2026-04-16) |
@@ -126,6 +125,7 @@ see the issue body for full detail.
 | --- | --- | --- | --- |
 | APPSEC-F008 | `-Dsingle-pool` comptime elision documented as unsafe with >1 pool | Accepted | `build.zig:36-43`, `src/pool.zig:17`, `CLAUDE.md` |
 | RISK-04 | Adaptive sizing | Accepted non-goal | Documented in DESIGN.md |
+| AP2-02 | Cross-thread releaseSubmitter SPSC DescCache drain races the owner under an active contract violation (descriptor double-use worst case). Accepted residual; best-effort drain + owner-thread contract documented at src/pool.zig releaseSubmitter; full fix (per-slot free-mask generation tag) is API-breaking, deferred. Evidence: docs/APPSEC_REVIEW_2026-06-11_round2.md §AP2-02. | Accepted | `src/pool.zig` releaseSubmitter; `docs/APPSEC_REVIEW_2026-06-11_round2.md §AP2-02` |
 
 ## Recently Resolved (2026-06-11 remediation pass)
 
@@ -246,4 +246,4 @@ Top open security items: SEC-008 (CI tag pinning), SEC-021 (fuzz job
 | 2026-04-15 | AppSec remediation | F-001/F-005/F-008 closed; honest 5-12% throughput cost documented |
 | 2026-04-16 | Gap sync | Canonical gap set rebuilt (75 -> 38 distinct after dedup). Closed G-001..G-006, G-008, G-009, G-012, G-013 on GitLab. Re-opened G-011. Minted GAP-9001 for LANE-L4b retroactive tracking. Created 30+ GitLab issues for open findings; tables in this file now link to them. |
 | 2026-06-11 | Gap sync | Synced AppSec review (`docs/APPSEC_REVIEW_2026-06-11_src.md`) + security-review findings at commit `39528a3`. Created GAP-0036…0042, 0045…0047, 0054…0057 (14 GitLab issues #92-#98, #100-#106). Refreshed evidence on GAP-0031 (#17), G-010 (#10), Q-027 (#62), GAP-0029 (#37), RISK-06 (#85). Closed PERF-029 (#51, condvar-based drain). Noted Q-004 resolved as dup of GAP-0014 (no issue). |
-| 2026-06-11 | Remediation pass | Closed 40+ gaps across security (GAP-0036..0042, 0045..0047, 0054..0057, SEC-002/020, GAP-0029/0030/0034), quality (Q-NEW-01..10, Q-020/025..027, QR-002..005/009, QS-009, NEW-003, GAP-0044), and performance (PERF-NEW-02..04/09) tracks. GAP-0031 reduced scope (observed-peak landed, Windows RSS remains open). RISK-06 staleness note added. 40 GitLab issues closed (#32, #37..43, #49, #56, #59, #60, #62, #92..100, #102..117, #119, #120, #124). See `docs/GAP_ANALYSIS_RESOLVED.md` § "2026-06-11 Remediation Pass". |
+| 2026-06-11 | Remediation pass | Closed 40+ gaps across security (GAP-0036..0042, 0045..0047, 0054..0057, SEC-002/020, GAP-0029/0030/0034), quality (Q-NEW-01..10, Q-020/025..027, QR-002..005/009, QS-009, NEW-003, GAP-0044), and performance (PERF-NEW-02..04/09) tracks. GAP-0031 reduced scope (observed-peak landed, Windows RSS remains open). RISK-06 staleness note added. 40 GitLab issues closed (#32, #37 #38 #39 #40 #41 #43, #49, #56, #59, #60, #62, #92..100, #102 #103 #104 #105 #106 #107 #108 #109 #110 #111 #112 #113 #114 #115 #117, #119, #120, #124). See `docs/GAP_ANALYSIS_RESOLVED.md` § "2026-06-11 Remediation Pass". |
