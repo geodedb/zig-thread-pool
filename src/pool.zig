@@ -836,6 +836,11 @@ const Core = struct {
     pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !SubmitBatchResult {
         if (tasks.len == 0) return .{ .submitted = 0 };
 
+        // Q-NEW-02 (#107): waitable handles are discarded by the batch path
+        // (no handle is returned per task), so a waitable batch would leak
+        // one descriptor per task until pool exhaustion. Reject explicitly.
+        if (options.waitable) return error.WaitableUnsupported;
+
         const effective = self.effectiveBackpressure(options);
         const deadline = if (effective == .block_with_timeout and options.timeout_ns != null)
             nowNs() + options.timeout_ns.?
@@ -2634,9 +2639,14 @@ pub const ThreadPool = struct {
         return handle;
     }
 
-    /// Submit multiple tasks atomically. Returns the count of tasks
-    /// successfully enqueued. If the first task fails, the error propagates;
+    /// Submit multiple tasks sequentially in batch order — NOT atomically.
+    /// Returns the count of tasks actually enqueued; callers must check
+    /// `result.submitted`, which may be less than `tasks.len` under
+    /// backpressure. If the first task fails, the error propagates;
     /// subsequent failures return a partial `SubmitBatchResult`.
+    /// `options.waitable` is unsupported (no per-task handle is returned,
+    /// so waitable descriptors would leak) and returns
+    /// `error.WaitableUnsupported` (Q-NEW-02, #107).
     pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
         // One span per submitBatch call (covers the whole batch as a
         // single producer-side enqueue). Per-task spans would explode

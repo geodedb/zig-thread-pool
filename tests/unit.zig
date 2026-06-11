@@ -243,6 +243,31 @@ test "submitBatch from worker context completes all child tasks" {
     try std.testing.expectEqual(@as(u64, 4), done.load(.acquire));
 }
 
+test "submitBatch rejects waitable options (Q-NEW-02 descriptor leak guard)" {
+    // submitBatch returns only a count; waitable handles would be discarded
+    // and their descriptors leaked until pool exhaustion (#107).
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 1,
+        .max_threads = 1,
+        .queue_capacity = 8,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var batch: [2]thread_pool.BatchTask = undefined;
+    for (&batch) |*t| {
+        t.* = .{ .task_fn = common.counterTask, .ctx = @ptrCast(&counter) };
+    }
+
+    try std.testing.expectError(
+        error.WaitableUnsupported,
+        pool.submitBatch(&batch, .{ .waitable = true }),
+    );
+
+    // The rejected batch must not have enqueued anything: nothing runs.
+    try std.testing.expectEqual(@as(u64, 0), counter.value.load(.acquire));
+}
+
 test "pre-cancelled token prevents task body execution" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 1,
