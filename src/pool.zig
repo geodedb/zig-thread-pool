@@ -2772,6 +2772,9 @@ pub const ThreadPool = struct {
     /// Submit a task, optionally blocking per `options.backpressure`.
     /// Returns a `TaskHandle` that can be passed to `wait()` if
     /// `options.waitable` is true; otherwise returns an invalid handle.
+    /// With `.backpressure = .block`, a submit from a worker thread of
+    /// the same pool can deadlock when the queue is full; see
+    /// `BackpressurePolicy` docs.
     pub fn submit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
         var __obs_span = observability.startSubmitSpan();
         defer __obs_span.end(null);

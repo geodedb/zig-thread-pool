@@ -66,5 +66,5 @@ Update thresholds only after:
 
 ## Open Gaps
 
-- `alloc_count` is currently emitted as `0`; byte accounting is implemented, event-count accounting is not yet separate.
+- `total_alloc_count` counts scratch allocation events (incremented in `src/memory/scratch.zig`); per-size allocation histograms remain future work (RISK-06, #85).
 - CPU time falls back to wall time when the OS sample returns zero or is unavailable.

@@ -176,8 +176,12 @@ pub const Config = struct {
     /// Capacity of the pool-wide inject queue (default-lane).  Rounded
     /// up to a power of two by `normalized()` because the underlying
     /// `BoundedRing` uses bitmask modulo.  Must be > 0; must fit in
-    /// `u32`.  This is the hard cap on *queued* tasks; descriptors are
-    /// separately bounded by `queue_capacity + sum(local_queue_capacity)`.
+    /// `u32`.  Exactly `queue_capacity` task descriptors are allocated
+    /// at `init` (`allocateStorage` sizes the descriptor array to this
+    /// value); this is the hard cap on total in-flight tasks (queued +
+    /// running combined).  Waitable tasks hold their descriptor slot
+    /// until `wait()` returns, so they count against this limit for
+    /// their full lifetime.
     queue_capacity: usize = 1024,
     /// Per-worker local-queue capacity.  Used by `work_stealing` and
     /// `lane_extension`.  Rounded up to a power of two by `normalized()`.
@@ -237,23 +241,30 @@ pub const Config = struct {
     ///
     /// Default `0` = unlimited (preserves pre-R-10 behaviour).
     max_pool_memory_bytes: u64 = 0,
-    /// How long a worker spins before parking on the wake condvar when
-    /// no work is visible.  Lower values reduce wake latency on
-    /// bursty workloads; higher values reduce CPU burn.  Tuned in
-    /// tandem with `spin_before_park_iters`.
+    /// Maximum duration a parked worker waits on the wake condvar before
+    /// re-checking for work and evaluating idle-purge.  Once a worker
+    /// enters the park loop it blocks in `timedWait` for at most this
+    /// long; it then wakes, checks queue depth and pool state, and either
+    /// returns to work-stealing or parks again.  This is NOT the spin
+    /// duration before parking — spinning before parking is controlled by
+    /// `spin_before_park_iters`.  Lower values increase responsiveness
+    /// at the cost of more spurious wake-ups; higher values reduce
+    /// overhead in idle pools.
     idle_park_after_ns: u64 = 250_000,
     /// Idle duration after which a worker purges its scratch arena.
     /// Bounds the "cold cache holding onto per-worker memory" anti-
     /// pattern observed in long-running daemons (see geode RSS
     /// regression hypothesis in `docs/GAP_ANALYSIS.md`).
     idle_purge_after_ns: u64 = 5_000_000,
-    /// Phase G2 (re-land 2026-04-13): default 0. Once the spin's
-    /// `queued_tasks` poll was removed (the dominant cross-core read on
-    /// that cacheline), the spin body became pure CPU burn. Setting this
-    /// to a non-zero value forces a `spinLoopHint` delay loop with only
-    /// a per-iter `state` check — useful for stress tests that need to
-    /// reproduce the polless-spin handshake (see tests/stress.zig:516,
-    /// :75, :290) but not for normal workloads.
+    /// Number of `spinLoopHint` iterations a worker executes before
+    /// entering the park loop and calling `timedWait` on the wake condvar.
+    /// Default 0 disables spinning entirely (worker goes straight to park).
+    /// The park-loop timeout — how long the worker blocks in `timedWait`
+    /// once parked — is governed by `idle_park_after_ns`, not this field.
+    /// Setting this to a non-zero value forces a `spinLoopHint` delay loop
+    /// with only a per-iter `state` check — useful for stress tests that
+    /// need to reproduce the polless-spin handshake (see
+    /// tests/stress.zig:516, :75, :290) but not for normal workloads.
     spin_before_park_iters: usize = 0,
     /// Hard cap on time `ThreadPool.deinit` waits for running tasks to
     /// finish before force-joining workers.  Defaults to 30 seconds —
@@ -671,9 +682,14 @@ pub const WorkerStats = struct {
     local_queue_depth: u32 = 0,
     /// Peak local-queue depth observed since init.
     local_queue_peak: u32 = 0,
-    /// Cumulative park events (futex_wait returns).
+    /// Cumulative park-loop entries.  Incremented once each time a worker
+    /// enters the park loop, including bails where the `timedWait` is
+    /// skipped because work arrived during the is_parked handshake.
     parks: u64 = 0,
-    /// Cumulative wake events (futex_wake arrivals + wake_every_n_tasks).
+    /// Cumulative park-loop exits.  Incremented once on every return from
+    /// the park loop, whether the worker was woken by a submitter signal,
+    /// by a shutdown broadcast, or by the `idle_park_after_ns` timeout
+    /// firing with no signal received.
     wakeups: u64 = 0,
     /// Successful steals from peer local queues or the inject queue.
     steals: u64 = 0,

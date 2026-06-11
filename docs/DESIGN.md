@@ -62,10 +62,11 @@ flowchart LR
 - Optional per-submitter SPMC queues via `registerSubmitter()` —
   cross-thread steal from submitter-owned push queues without paying
   MPMC inject contention.
-- Worker wake selection:
-  - `scan_parked_workers` (default) — rotating probe starting at
-    `submitted % scan_len`.
-  - `idle_queue` — bounded idle-worker ticket queue, opt-in.
+- Worker wake: `scanAndWake` performs a linear scan from a rotating
+  hint (`submitted % scan_len`), wakes the first parked worker it
+  finds, and exits.  The scan is issued at most once per
+  `wake_coalesce_batch` (default 32) submissions so the futex cost
+  is amortised across bursts.
 
 ### `lane_extension`
 
@@ -149,17 +150,6 @@ flowchart TB
 - Explicit purge is only legal while the pool is quiescent.
 - All pool-owned allocations are counted in `total_alloc_bytes`,
   `total_free_bytes`, `live_bytes`, `peak_live_bytes`.
-
-## Runtime Presets
-
-- `RuntimePreset.standard` preserves the stable defaults.
-- `RuntimePreset.tokio_parity` is an explicit benchmark-focused preset
-  that currently enables:
-  - `timestamp_mode = .disabled`
-  - `wake_strategy = .idle_queue`
-
-The preset exists as an opt-in configuration surface. It is not
-silently forced by the benchmark harness.
 
 ## Task Lifecycle
 
@@ -292,7 +282,7 @@ flowchart LR
 | LIFO slot sentinel `0xFFFF_FFFF_FFFF_FFFF` | Gen-tagged entries never collide | `LIFO_SLOT_EMPTY` |
 | `wake_coalesce_batch = 32` default | Amortises scan + futex cost | `notifySubmits` |
 | `inject_batch_size` (32 default) | `popMany` amortises head-CAS | `tryDrainLaneForWorker` |
-| `steal_batch_size` (16 default) | `stealHalf` copies rounded-up half | `nextTask` |
+| `steal_batch_size` (8 default) | `stealHalf` copies rounded-up half | `nextTask` |
 | End-of-struct `Worker.desc_cache` | Iter-11 showed layout-shift costs | `src/pool.zig::Worker` |
 
 ## Observability
@@ -317,7 +307,7 @@ time:
 - `-Dsingle-pool=true` — elide per-pool TLS identity check
   (**UNSAFE** with >1 pool per process).
 - `-Dtimestamp-mode=<m>` — pin `Config.timestamp_mode` to
-  `disabled`/`completion_only`/`full`; drops histogram writes.
+  `disabled`/`full`; drops histogram writes.
 - `-Dscheduler-variant=<v>` — pin `Config.scheduler_variant`; drops
   alternative scheduler's branches from the hot path.
 

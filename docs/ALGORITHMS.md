@@ -515,7 +515,7 @@ and its associated coherence cost disappears.
 flowchart LR
     subgraph Flags
         F1[-Dsingle-pool bool - skip per-pool TLS identity check]
-        F2["-Dtimestamp-mode {disabled, completion_only, full}"]
+        F2["-Dtimestamp-mode {disabled, full}"]
         F3["-Dscheduler-variant {global_queue, work_stealing, lane_extension}"]
     end
     subgraph Branches[Hot-path branches elided]
