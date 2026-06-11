@@ -3,6 +3,15 @@
 //! Usage:
 //!   zig build fuzz                          # default 100 iterations, seed 0xC0FFEE
 //!   FUZZ_SEED=1 FUZZ_ITERATIONS=5000 zig build fuzz
+//!   FUZZ_SCHEDULER=lane_extension zig build fuzz   # pin the scheduler variant
+//!
+//! Scheduler variant selection (GAP-0055, #104):
+//!   - Derived from the seed: seed % 3 -> global_queue / work_stealing /
+//!     lane_extension, so rotating FUZZ_SEED rotates variants.
+//!   - FUZZ_SCHEDULER overrides the derivation ("global_queue",
+//!     "work_stealing", or "lane_extension").
+//!   - A -Dscheduler-variant comptime pin overrides both (the pool would
+//!     reject any other variant with error.BuildOptionMismatch).
 //!
 //! Invariants checked after each iteration (post-shutdown):
 //!   - stats.submitted == stats.completed + stats.cancelled
@@ -18,16 +27,18 @@
 //!     releaseSubmitter is called for every registerSubmitter we issued,
 //!     but cannot read the mask directly from the public API.
 //!
-//! Known bug found during development (iteration 4, seed 0xC0FFEE):
-//!   With the default global_queue scheduler, tasks submitted via a
-//!   registered submitter slot go into submitter_queues[], but
-//!   tryDrainLaneForWorker() short-circuits before reaching the
-//!   submitter-queue steal block when !uses_local (global_queue).
-//!   Those tasks are never executed; queued_tasks never reaches zero;
-//!   shutdown(.drain, null) spins forever.
-//!   Mitigation: this harness uses work_stealing (which DOES drain
-//!   submitter queues) and a 5-second shutdown timeout so it detects
-//!   rather than hangs on regressions.
+//! Historical bug, now fixed (GAP-0056, #105):
+//!   Early versions of this harness hard-coded work_stealing because the
+//!   default global_queue scheduler stranded submitter-slot tasks in
+//!   submitter_queues[] (tryDrainLaneForWorker never consumes them when
+//!   !uses_local), hanging shutdown(.drain, null). Commit 141d979 gated
+//!   the submit-side submitter-queue push on `uses_local`, making
+//!   registerSubmitter a functional no-op under global_queue — submits
+//!   fall through to the inject queue. global_queue therefore now runs
+//!   with the full op table, submitter ops included; the drain behavior
+//!   is pinned by "global_queue + registered submitter drains on
+//!   shutdown" in tests/integration.zig. The 5-second shutdown timeout
+//!   stays as the regression detector.
 
 const std = @import("std");
 const thread_pool = @import("thread_pool");
@@ -50,11 +61,28 @@ const OpKind = enum(u8) {
     // test here is simply "no crash, no allocator leak" — the per-iter
     // invariant block at the bottom of `runOne` catches both.
     double_wait,
+    // GAP-0055 (#104): caller-side WaitGroup add/done/wait round-trip.
+    // Acquires `pool.waitGroup()`, adds 1, submits a task whose body
+    // calls `wg.done()` through ctx, then blocks in `wg.wait()` until
+    // the worker's done() broadcast releases it.  Regression coverage
+    // for 39528a3 (done() now holds the condition mutex before
+    // publishing pending==0, closing the stack-lifetime race against
+    // a returning waiter).
+    wait_group,
 };
 
 fn noop(ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = ctx;
     _ = runtime;
+}
+
+/// Task body for the `wait_group` op: signals the caller-owned WaitGroup.
+/// The caller blocks in `wg.wait()` inside the same op, so the WaitGroup
+/// outlives the task (the wait does not return until this done() runs).
+fn wgDoneTask(ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
+    _ = runtime;
+    const wg: *thread_pool.WaitGroup = @ptrCast(@alignCast(ctx));
+    wg.done();
 }
 
 fn envU64(init: std.process.Init.Minimal, gpa: std.mem.Allocator, key: []const u8, default: u64) u64 {
@@ -69,29 +97,67 @@ fn envU32(init: std.process.Init.Minimal, gpa: std.mem.Allocator, key: []const u
     return std.fmt.parseInt(u32, val, 10) catch default;
 }
 
+/// GAP-0055 (#104): parse FUZZ_SCHEDULER. Unknown values are reported and
+/// ignored (fall back to seed-derived selection) rather than failing the
+/// run, matching the lenient envU64/envU32 parsers above.
+fn envVariant(init: std.process.Init.Minimal, gpa: std.mem.Allocator, key: []const u8) ?thread_pool.SchedulerVariant {
+    const val = init.environ.getAlloc(gpa, key) catch return null;
+    defer gpa.free(val);
+    if (std.mem.eql(u8, val, "global_queue")) return .global_queue;
+    if (std.mem.eql(u8, val, "work_stealing")) return .work_stealing;
+    if (std.mem.eql(u8, val, "lane_extension")) return .lane_extension;
+    std.debug.print(
+        "fuzz: ignoring unknown {s}='{s}' (expected global_queue|work_stealing|lane_extension)\n",
+        .{ key, val },
+    );
+    return null;
+}
+
+/// Pick the scheduler variant for this run: comptime pin > FUZZ_SCHEDULER >
+/// seed % 3. A -Dscheduler-variant build pin must win, otherwise
+/// ThreadPool.init rejects the config with error.BuildOptionMismatch.
+fn pickVariant(init: std.process.Init.Minimal, seed: u64) thread_pool.SchedulerVariant {
+    switch (thread_pool.build_options.scheduler_variant) {
+        .global_queue => return .global_queue,
+        .work_stealing => return .work_stealing,
+        .lane_extension => return .lane_extension,
+        .any => {},
+    }
+    if (envVariant(init, std.heap.page_allocator, "FUZZ_SCHEDULER")) |v| return v;
+    return switch (seed % 3) {
+        0 => .global_queue,
+        1 => .work_stealing,
+        else => .lane_extension,
+    };
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     const seed = envU64(init, std.heap.page_allocator, "FUZZ_SEED", 0xC0FFEE);
     const iterations = envU32(init, std.heap.page_allocator, "FUZZ_ITERATIONS", 100);
+    const variant = pickVariant(init, seed);
 
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        runOne(rng, i, seed) catch |err| {
-            std.debug.print("fuzz FAIL at iteration {d}, seed={d}: {s}\n", .{ i, seed, @errorName(err) });
+        runOne(rng, variant) catch |err| {
+            std.debug.print(
+                "fuzz FAIL at iteration {d}, seed={d}, variant={s}: {s}\n",
+                .{ i, seed, @tagName(variant), @errorName(err) },
+            );
             return 1;
         };
     }
 
-    std.debug.print("fuzz ok: {d} iterations seed={d}\n", .{ iterations, seed });
+    std.debug.print(
+        "fuzz ok: {d} iterations seed={d} variant={s}\n",
+        .{ iterations, seed, @tagName(variant) },
+    );
     return 0;
 }
 
-fn runOne(rng: std.Random, iter: u32, seed: u64) !void {
-    _ = iter;
-    _ = seed;
-
+fn runOne(rng: std.Random, variant: thread_pool.SchedulerVariant) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     // DebugAllocator.deinit() returns CheckResult (.ok or .leak).
     // Defer the check; on leak we panic loudly after deinit.
@@ -103,20 +169,26 @@ fn runOne(rng: std.Random, iter: u32, seed: u64) !void {
     }
     const gpa = gpa_state.allocator();
 
-    // Use work_stealing to ensure submitter-queue tasks are drained.
-    // The global_queue variant does not drain submitter_queues[], causing
-    // shutdown(.drain) to hang when registerSubmitter() was used (see
-    // module-level comment above).
+    // All three variants run the full op table, submitter ops included.
+    // global_queue routes submitter-slot submits to the inject queue
+    // (141d979; see the module-level comment), so nothing is stranded in
+    // submitter_queues[] and shutdown(.drain) terminates on every variant.
+    // lane_extension requires a valid blocking-lane config:
+    // allow_blocking_lane = true and 0 < blocking_workers < max_threads
+    // (types.zig Config.validate).
     const max_threads = rng.intRangeAtMost(usize, 2, 6);
     const want_submitter_queues: bool = rng.boolean();
     const max_submitter_queues: u32 = if (want_submitter_queues) rng.intRangeAtMost(u32, 1, 4) else 0;
+    const lane_ext = variant == .lane_extension;
 
     var pool = try thread_pool.ThreadPool.init(gpa, .{
         .max_threads = max_threads,
         .queue_capacity = 128,
-        .scheduler_variant = .work_stealing,
+        .scheduler_variant = variant,
         .max_submitter_queues = max_submitter_queues,
         .submitter_queue_capacity = if (max_submitter_queues > 0) 64 else 0,
+        .allow_blocking_lane = lane_ext,
+        .blocking_workers = if (lane_ext) 1 else 0,
     });
 
     // Track whether we have an active registered submitter slot.
@@ -180,6 +252,23 @@ fn runOne(rng: std.Random, iter: u32, seed: u64) !void {
                 };
                 t0.join();
                 t1.join();
+            },
+            .wait_group => {
+                // Caller-side add/done/wait round-trip (39528a3 regression
+                // coverage). The wait is bounded in practice: the op runs
+                // only while the pool is live (shutdown ops set shut_down
+                // and break this loop), submit succeeded, and a queued task
+                // on a live pool always executes; done() is then guaranteed.
+                // The harness-level safety net is the 5s shutdown timeout
+                // plus the CI job timeout. On submit failure we balance the
+                // add ourselves so the WaitGroup returns to zero.
+                var wg = pool.waitGroup();
+                wg.add(1);
+                if (pool.submit(wgDoneTask, @ptrCast(&wg), .{})) |_| {
+                    wg.wait();
+                } else |_| {
+                    wg.done();
+                }
             },
         }
     }

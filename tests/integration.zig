@@ -678,3 +678,118 @@ test "max_overflow_workers = 0 produces no overflow activity" {
     try std.testing.expectEqual(@as(u64, 0), stats.overflow_retires);
     try std.testing.expectEqual(@as(u64, 0), stats.overflow_active);
 }
+
+// GAP-0056 (#105): the fuzz harness (tests/fuzz/pool_fuzz.zig) historically
+// documented "global_queue + registerSubmitter + submit" as a drain-hang
+// foot-gun: tasks pushed into submitter_queues[] were never consumed by the
+// global_queue worker loop, so shutdown(.drain, null) spun forever. Commit
+// 141d979 gated the submit-side submitter-queue push on `uses_local` (the
+// same signal the drain side uses), making registerSubmitter a functional
+// no-op under global_queue: submits fall through to the inject queue exactly
+// as for an unregistered caller. The two tests below pin that behavior with
+// a bounded timeout so any regression fails fast instead of hanging CI.
+const Gap0056Submitter = struct {
+    pool: *thread_pool.ThreadPool,
+    counter: *common.Counter,
+    release_slot: bool,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *@This()) void {
+        self.runInner() catch {
+            self.failed.store(true, .release);
+        };
+    }
+
+    fn runInner(self: *@This()) !void {
+        const slot = try self.pool.registerSubmitter();
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            _ = try self.pool.submit(
+                common.counterTask,
+                @ptrCast(self.counter),
+                .{ .backpressure = .block },
+            );
+        }
+        // Owner-thread contract (GAP-0038, #94): release from the thread
+        // that registered, while the slot is quiescent.
+        if (self.release_slot) self.pool.releaseSubmitter(slot);
+    }
+};
+
+test "global_queue + registered submitter drains on shutdown (GAP-0056, #105)" {
+    try common.skipIfSchedulerVariantIncompatible(.global_queue);
+
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .scheduler_variant = .global_queue,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 64,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var submitter = Gap0056Submitter{
+        .pool = &pool,
+        .counter = &counter,
+        .release_slot = true,
+    };
+    const t = try std.Thread.spawn(.{}, Gap0056Submitter.run, .{&submitter});
+    t.join();
+    try std.testing.expect(!submitter.failed.load(.acquire));
+
+    // Pre-141d979 this hung forever; the bounded timeout converts any
+    // regression into a deterministic error.Timeout test failure.
+    try pool.shutdown(.drain, 5 * std.time.ns_per_s);
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 100), stats.submitted);
+    try std.testing.expectEqual(stats.submitted, stats.completed + stats.cancelled);
+    try std.testing.expectEqual(stats.completed, counter.value.load(.acquire));
+    // releaseSubmitter drained the slot's DescCache, so no descriptors
+    // may be live after a full drain.
+    try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
+}
+
+test "global_queue + unreleased submitter drains on shutdown (GAP-0056, #105)" {
+    try common.skipIfSchedulerVariantIncompatible(.global_queue);
+
+    // Harsher variant: the submitter thread exits WITHOUT releasing its
+    // slot before shutdown(.drain). Under global_queue no task entry ever
+    // lands in submitter_queues[] (submit-side push is gated on uses_local),
+    // so the drain must still complete. The slot's DescCache still holds
+    // `.reserved` descriptor indices at shutdown time (the per-submitter
+    // descriptor acquire path is NOT gated on uses_local), so task_desc_live
+    // is intentionally not asserted here — deinit's drainSubmitterDescCaches
+    // (GAP-0040, #96) reclaims them, and std.testing.allocator verifies no
+    // memory leaks.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 256,
+        .scheduler_variant = .global_queue,
+        .max_submitter_queues = 1,
+        .submitter_queue_capacity = 64,
+        .worker_scratch_cap_bytes = 1024,
+    });
+    defer pool.deinit();
+
+    var counter = common.Counter{};
+    var submitter = Gap0056Submitter{
+        .pool = &pool,
+        .counter = &counter,
+        .release_slot = false,
+    };
+    const t = try std.Thread.spawn(.{}, Gap0056Submitter.run, .{&submitter});
+    t.join();
+    try std.testing.expect(!submitter.failed.load(.acquire));
+
+    try pool.shutdown(.drain, 5 * std.time.ns_per_s);
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 100), stats.submitted);
+    try std.testing.expectEqual(stats.submitted, stats.completed + stats.cancelled);
+    try std.testing.expectEqual(stats.completed, counter.value.load(.acquire));
+}
