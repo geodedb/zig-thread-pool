@@ -1999,7 +1999,7 @@ const Core = struct {
         }
 
         if (uses_local) {
-            _ = worker.steal_failures.fetchAdd(1, .release);
+            _ = worker.steal_failures.fetchAdd(1, .monotonic);
         }
         return null;
     }
@@ -2124,7 +2124,7 @@ const Core = struct {
                     worker.owned_queue_len += pushed_count;
                     if (was_empty) self.markWorkerNonEmpty(worker_index);
                 }
-                _ = worker.steals.fetchAdd(n, .release);
+                _ = worker.steals.fetchAdd(n, .monotonic);
                 updatePeakU32(&worker.local_queue_peak, @intCast(worker.owned_queue_len));
                 return first;
             }
@@ -2274,7 +2274,7 @@ const Core = struct {
         if (timestamps_enabled) {
             const idle_started_ns = worker.last_idle_started_ns.load(.acquire);
             if (idle_started_ns != 0 and start_ns >= idle_started_ns) {
-                _ = worker.idle_ns.fetchAdd(start_ns - idle_started_ns, .release);
+                _ = worker.idle_ns.fetchAdd(start_ns - idle_started_ns, .monotonic);
             }
         }
 
@@ -2306,7 +2306,7 @@ const Core = struct {
         const cancelled = if (descriptor.options.cancellation_token) |token| token.isCancelled() else false;
         if (!cancelled) {
             worker.scratch.beginTask() catch {
-                _ = worker.scratch_init_failures.fetchAdd(1, .release);
+                _ = worker.scratch_init_failures.fetchAdd(1, .monotonic);
             };
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
@@ -2319,18 +2319,18 @@ const Core = struct {
     /// QS-003 hot-path helper: post-task bookkeeping + release/broadcast.
     ///
     /// Ordering (load-bearing):
-    ///   1. `complete_ns = nowNs()` — always, so `idle()`'s purge timer is
-    ///      correct regardless of `timestamp_mode`.
-    ///   2. `last_idle_started_ns.store` — release so idle() readers see it.
-    ///   3. `current_task_started_ns.store(0)` when watchdog is enabled.
-    ///   4. exec histogram + busy_ns under `timestamp_mode == .full`.
-    ///   5. `active_tasks.fetchSub` BEFORE state.store(.completed) — an
+    ///   1. `complete_ns = nowNs()` + `last_idle_started_ns.store` — guarded
+    ///      by `timestamps_enabled OR idle_purge_active`; release so idle()
+    ///      readers see the updated value.
+    ///   2. `current_task_started_ns.store(0)` when watchdog is enabled.
+    ///   3. exec histogram + busy_ns under `timestamp_mode == .full`.
+    ///   4. `active_tasks.fetchSub` BEFORE state.store(.completed) — an
     ///      observer waking on `.completed` must see active_tasks already
     ///      decremented, otherwise `shutdown(.drain, …)` can spin.
-    ///   6. Claim sentinel cleared BEFORE broadcast/release — otherwise a
+    ///   5. Claim sentinel cleared BEFORE broadcast/release — otherwise a
     ///      fast-waking observer could re-acquire the descriptor before we
     ///      release the sentinel and trip the double-dequeue panic.
-    ///   7. Waitable descriptors broadcast; non-waitable release to freelist.
+    ///   6. Waitable descriptors broadcast; non-waitable release to freelist.
     inline fn finalizeTask(
         self: *Core,
         worker: *Worker,
@@ -2344,19 +2344,26 @@ const Core = struct {
         const timestamps_enabled = timestampsEnabled(self);
         const watchdog_enabled = self.config.watchdog_interval_ns > 0;
 
-        // Always update last_idle_started_ns so the idle-purge logic in idle() works
-        // regardless of timestamp_mode. Read the clock once.
-        const complete_ns = nowNs();
-        worker.last_idle_started_ns.store(complete_ns, .release);
+        // PERF-NEW-09: guard nowNs() + last_idle_started_ns.store behind the
+        // union of their two consumers:
+        //   (a) timestamps_enabled  → idle_ns accumulation in runTask (line 2275)
+        //                           + exec_ns histogram / busy_ns below
+        //   (b) idle_purge_active   → scratch purge timer in idle() (line 2471)
+        // When neither is active the clock read and the store are dead work.
+        const idle_purge_active = self.config.worker_scratch_cap_bytes != 0 and
+            self.config.idle_purge_after_ns != 0;
+        if (timestamps_enabled or idle_purge_active) {
+            const complete_ns = nowNs();
+            worker.last_idle_started_ns.store(complete_ns, .release);
+            if (timestamps_enabled) {
+                descriptor.complete_ns = complete_ns;
+                const exec_ns = complete_ns -| start_ns;
+                _ = worker.busy_ns.fetchAdd(exec_ns, .monotonic);
+                worker.exec_histogram.observe(exec_ns);
+            }
+        }
         if (watchdog_enabled) {
             worker.current_task_started_ns.store(0, .release);
-        }
-
-        if (timestamps_enabled) {
-            descriptor.complete_ns = complete_ns;
-            const exec_ns = complete_ns -| start_ns;
-            _ = worker.busy_ns.fetchAdd(exec_ns, .release);
-            worker.exec_histogram.observe(exec_ns);
         }
 
         _ = self.counters.active_tasks.fetchSub(1, .monotonic);
@@ -2420,7 +2427,7 @@ const Core = struct {
 
         if (self.state.load(.acquire) != .running) return;
 
-        _ = worker.parks.fetchAdd(1, .release);
+        _ = worker.parks.fetchAdd(1, .monotonic);
 
         worker.park_mutex.lock();
         // SC total-order handshake:
@@ -2439,7 +2446,7 @@ const Core = struct {
         if (lane_counter.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
             worker.park_mutex.unlock();
-            _ = worker.wakeups.fetchAdd(1, .release);
+            _ = worker.wakeups.fetchAdd(1, .monotonic);
             return;
         }
         // OBSERVABILITY-PIVOT / R-03: capture `parked_at_ns` before the
@@ -2451,7 +2458,7 @@ const Core = struct {
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
         worker.is_parked.store(0, .release);
         worker.park_mutex.unlock();
-        _ = worker.wakeups.fetchAdd(1, .release);
+        _ = worker.wakeups.fetchAdd(1, .monotonic);
 
         if (timestamps_enabled_idle) {
             // Only observe wake latency when timedWait returned before the

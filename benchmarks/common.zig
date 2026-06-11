@@ -98,6 +98,12 @@ const SubmitterCtx = struct {
 };
 
 pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const ScenarioSpec, variants: []const thread_pool.SchedulerVariant, output_path: ?[]const u8) !void {
+    // PERF-NEW-04: compute git SHA once at harness entry instead of once
+    // per runScenario call (7 calls × scenarios × variants = ~168 subprocess
+    // forks per bench run).
+    const git_sha_once = try gitSha(allocator, io);
+    defer allocator.free(git_sha_once);
+
     var rows: std.ArrayList(ResultRow) = .empty;
     defer {
         for (rows.items) |row| {
@@ -117,7 +123,7 @@ pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const Sce
             const SAMPLE_COUNT: usize = RUN_COUNT - WARMUP_DISCARD; // 6
             var results: [RUN_COUNT]ResultRow = undefined;
             for (&results) |*r| {
-                r.* = try runScenario(allocator, io, spec, variant);
+                r.* = try runScenario(allocator, io, git_sha_once, spec, variant);
             }
             // Free the discarded warm-up run's allocations.
             for (results[0..WARMUP_DISCARD]) |r| {
@@ -175,7 +181,7 @@ pub fn runScenarios(allocator: std.mem.Allocator, io: std.Io, specs: []const Sce
     }
 }
 
-pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec, variant: thread_pool.SchedulerVariant) !ResultRow {
+pub fn runScenario(allocator: std.mem.Allocator, _: std.Io, git_sha: []const u8, spec: ScenarioSpec, variant: thread_pool.SchedulerVariant) !ResultRow {
     const uses_blocking_lane = spec.lane == .blocking;
     const blocking_workers: u32 = if (uses_blocking_lane)
         @intCast(@max(spec.worker_count / 4, 2))
@@ -259,13 +265,13 @@ pub fn runScenario(allocator: std.mem.Allocator, io: std.Io, spec: ScenarioSpec,
     const completion_summary = summarizeLatencies(completion_latencies);
 
     const throughput = @as(f64, @floatFromInt(spec.task_count)) / (@as(f64, @floatFromInt(wall_end - wall_start)) / std.time.ns_per_s);
-    const git_sha = try gitSha(allocator, io);
+    const git_sha_owned = try allocator.dupe(u8, git_sha);
     const cpu_name = try allocator.dupe(u8, @tagName(builtin.cpu.arch));
 
     const cpu_time_ns = if (cpu_after > cpu_before) cpu_after - cpu_before else wall_end - wall_start;
 
     return .{
-        .git_sha = git_sha,
+        .git_sha = git_sha_owned,
         .run_timestamp_unix_s = @as(i64, @intCast(@divTrunc(clock.nanoTimestamp(), std.time.ns_per_s))),
         .zig_version = builtin.zig_version_string,
         .os = @tagName(builtin.os.tag),

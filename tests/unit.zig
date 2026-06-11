@@ -342,7 +342,9 @@ test "block_with_timeout returns Timeout when queue stays full" {
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
-    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 2_000_000_000 };
+    // Sleep long enough that the queue stays full during the 100 ms
+    // block_with_timeout below (5× margin: 500 ms task vs 100 ms timeout).
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 500_000_000 };
 
     // Fill the queue with long-running tasks.
     for (0..4) |_| {
@@ -373,13 +375,15 @@ test "shutdown with timeout returns Timeout for long-running tasks" {
     defer pool.deinit();
 
     var counter = common.Counter{};
-    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 2_000_000_000 };
+    // 300 ms task vs 50 ms shutdown timeout = 6× margin; task will not finish
+    // before the shutdown timeout fires.
+    var sleeper = common.SleepTaskContext{ .counter = &counter, .sleep_ns = 300_000_000 };
     _ = try pool.submit(common.sleepTask, @ptrCast(&sleeper), .{});
 
     // Give the worker a moment to pick up the task so it becomes active.
     thread_pool.clock.sleep(10_000_000);
 
-    // Shutdown with a 50ms timeout -- the 2-second task won't finish in time.
+    // Shutdown with a 50ms timeout -- the 300ms task won't finish in time.
     const result = pool.core.shutdown(.drain, 50_000_000);
     try std.testing.expectError(error.Timeout, result);
 }
