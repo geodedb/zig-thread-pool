@@ -80,6 +80,53 @@ test "registerSubmitter: max_submitter_queues = 1 yields exactly one slot" {
     try std.testing.expectError(error.NoSubmitterSlots, pool.registerSubmitter());
 }
 
+// PERF-NEW-03 (#117) regression: releaseSubmitter's drain must not silently
+// drop pending submitter-queue entries. A dropped entry strands its
+// descriptor in `.queued` forever and leaves queued_tasks unbalanced, so
+// shutdown(.drain) hangs and `submitted == completed + cancelled` breaks.
+// Post-fix, every drained entry is either re-injected or properly cancelled.
+test "PERF-NEW-03: releaseSubmitter drain loses no tasks (drain shutdown + stats balance)" {
+    const gpa = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(gpa, .{
+        .max_threads = 2,
+        .queue_capacity = 128,
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 2,
+        .submitter_queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var hit = std.atomic.Value(u32).init(0);
+
+    const Worker = struct {
+        fn bump(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const counter: *std.atomic.Value(u32) = @ptrCast(@alignCast(raw));
+            _ = counter.fetchAdd(1, .release);
+        }
+
+        fn run(p: *thread_pool.ThreadPool, counter: *std.atomic.Value(u32)) !void {
+            const slot = try p.registerSubmitter();
+            for (0..32) |_| {
+                _ = try p.submit(bump, @ptrCast(counter), .{});
+            }
+            // Release on the registering thread so the TLS-guarded
+            // desc_cache drain runs and the pending-entry drain executes.
+            p.releaseSubmitter(slot);
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &pool, &hit });
+    t.join();
+
+    // Pre-fix, a dropped entry left queued_tasks unbalanced and this
+    // timed out; post-fix every entry is dispatched or cancelled.
+    try pool.shutdown(.drain, 5 * std.time.ns_per_s);
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(stats.submitted, stats.completed + stats.cancelled);
+    try std.testing.expectEqual(@as(u64, 32), stats.submitted);
+}
+
 // Defense-in-depth (paired with the validate() ceiling added alongside the
 // init fix): values above the bitmap cap surface as a typed error rather than
 // being silently clamped. `normalized()` still clamps for the public init

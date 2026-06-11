@@ -959,18 +959,37 @@ const Core = struct {
             }
         }
 
-        // Drain: bounded spin-retry on inject_queue.tryPush so no task is
-        // silently dropped in the common case. The outer loop terminates
-        // because the submitter queue is bounded; the inner spin is bounded
-        // to prevent livelock if inject_queue consumers are stalled (e.g.
-        // the pool is being torn down while a release races shutdown).
-        const max_push_retries: u32 = 1 << 20;
+        // Drain: push each pending entry to the inject queue with escalating
+        // backoff (spin -> yield -> sleep). If the inject queue stays full
+        // past the cap (pathological: consumers stalled during teardown),
+        // cancel the task properly instead of silently dropping it, so the
+        // descriptor is released and queued_tasks stays balanced (#117).
+        // A silently dropped entry would strand its descriptor in `.queued`
+        // forever, leave queued_tasks unbalanced (shutdown(.drain) hang),
+        // and violate the `submitted == completed + cancelled` invariant.
+        // cancelDescriptor mirrors shutdown's cancel of queued tasks: the
+        // .queued -> .cancelled CAS arbitrates against a racing runTask
+        // (exactly one wins), updates the cancelled counter, signals any
+        // wait_group/waiters, and releases the descriptor.
+        const max_push_retries: u32 = 1 << 14;
         while (self.submitter_queues[idx].stealOne()) |entry| {
             var retries: u32 = 0;
-            while (!self.inject_queue.tryPush(entry)) {
-                std.atomic.spinLoopHint();
-                retries += 1;
-                if (retries >= max_push_retries) break; // pathological: drop to avoid livelock
+            var pushed = false;
+            while (retries < max_push_retries) : (retries += 1) {
+                if (self.inject_queue.tryPush(entry)) {
+                    pushed = true;
+                    break;
+                }
+                if (retries < 64) {
+                    std.atomic.spinLoopHint();
+                } else if (retries < 1024) {
+                    std.Thread.yield() catch {};
+                } else {
+                    clock.sleep(10 * std.time.ns_per_us);
+                }
+            }
+            if (!pushed) {
+                self.cancelDescriptor(entry);
             }
         }
 
