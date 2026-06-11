@@ -39,7 +39,9 @@ pub const TaskContext = @import("pool.zig").TaskContext;
 pub const TaskFn = @import("pool.zig").TaskFn;
 pub const BatchTask = @import("pool.zig").BatchTask;
 
-pub const version = "0.2.4";
+/// Library version, derived at compile time from build.zig.zon (AP2-01).
+/// A release bump requires only one edit in build.zig.zon.
+pub const version: []const u8 = @import("build_options").version;
 
 pub const Config = types.Config;
 /// Explicit error set of `Config.validate` (QR-003, #41).

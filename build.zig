@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 CodePros
 
 const std = @import("std");
+const manifest = @import("build.zig.zon");
 
 const Import = std.Build.Module.Import;
 
@@ -119,6 +120,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "package_name", "thread_pool");
     // `with_otel` always false: the seam is permanently disabled.
     build_options.addOption(bool, "with_otel", false);
+    // Single source of truth for the library version: read from build.zig.zon
+    // so a release bump requires only one edit (AP2-01).
+    build_options.addOption([]const u8, "version", manifest.version);
     const build_options_mod = build_options.createModule();
 
     // Observability seam. Declared as a SHARED NAMED MODULE so every

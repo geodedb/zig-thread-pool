@@ -1745,9 +1745,13 @@ test "clock: nanoTimestamp is monotonic non-decreasing" {
     }
 }
 
-test "version constant matches build manifest" {
-    // Keep in sync with build.zig.zon .version — drift breaks SBOM triage (AP-06).
-    try std.testing.expectEqualStrings("0.2.4", thread_pool.version);
+test "version constant is non-empty and parses as semver" {
+    // AP2-01: thread_pool.version is now derived from build.zig.zon via
+    // build_options so a release bump requires only one edit. Verify the
+    // injected value is non-empty and well-formed; the exact string need
+    // not be hard-coded here because it flows from the manifest automatically.
+    try std.testing.expect(thread_pool.version.len > 0);
+    _ = try std.SemanticVersion.parse(thread_pool.version);
 }
 
 test "SubmitError is an explicit, exhaustively switchable set" {
