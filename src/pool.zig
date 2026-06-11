@@ -494,7 +494,7 @@ const Core = struct {
     local_queues: []LocalQueue,
     descriptors: []TaskDescriptor,
     /// Singly-linked freelist of descriptor slots. Each slot stores the
-    /// index of the next free descriptor (or `0xFFFFFFFF` sentinel).
+    /// index of the next free descriptor (or `free_sentinel` end-of-chain).
     ///
     /// The per-slot atomic is `.monotonic` because the `.acq_rel` /
     /// `.acquire` on `free_top_tagged.cmpxchgWeak` establishes the
@@ -552,6 +552,9 @@ const Core = struct {
     /// Number of `submitter_queues` entries that were fully initialized.
     /// Equals `submitter_queues.len` once the submitter-init block succeeds.
     init_submitter_count: usize = 0,
+
+    /// Freelist terminator — descriptor index sentinel marking end-of-chain.
+    const free_sentinel: u32 = 0xFFFFFFFF;
 
     /// QS-002: `Core.init` is decomposed into four narrow helpers plus an
     /// orchestrator.  The F-002 errdefer ladder is preserved verbatim at
@@ -697,12 +700,12 @@ const Core = struct {
         for (self.descriptors, 0..) |*descriptor, idx| {
             descriptor.* = .{};
             // Build a singly-linked freelist: each slot points to the next.
-            // The last slot uses the sentinel 0xFFFFFFFF (empty).
+            // The last slot uses the sentinel (empty).
             self.free_indices[idx] = std.atomic.Value(u32).init(
                 if (idx + 1 < normalized.queue_capacity)
                     @as(u32, @intCast(idx + 1))
                 else
-                    0xFFFFFFFF,
+                    Core.free_sentinel,
             );
         }
 
@@ -918,6 +921,7 @@ const Core = struct {
                 _ = self.submitter_nonempty.fetchOr(bit, .release);
                 return idx;
             }
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -1005,6 +1009,7 @@ const Core = struct {
             if (self.submitter_free_mask.cmpxchgWeak(current, current | bit, .acq_rel, .acquire) == null) {
                 break; // we won the release
             }
+            std.atomic.spinLoopHint();
         }
 
         // Drain: push each pending entry to the inject queue with escalating
@@ -2395,8 +2400,6 @@ const Core = struct {
         }
     }
 
-    const free_sentinel: u32 = 0xFFFFFFFF;
-
     /// GAP-0037 residual: per-field reset instead of `.* = .{}` so the
     /// atomic fields (`state`, `generation`, `claimed_by`) are never
     /// plain-stored while stale-entry readers concurrently `.load` them.
@@ -2424,6 +2427,7 @@ const Core = struct {
             const next = self.free_indices[head].load(.monotonic);
             const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, next);
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                std.atomic.spinLoopHint();
                 continue;
             }
             var descriptor = &self.descriptors[head];
@@ -2475,6 +2479,7 @@ const Core = struct {
             const new_head_u32 = self.free_indices[cur].load(.monotonic);
             const new_tagged = (@as(u64, aba +% 1) << 32) | @as(u64, new_head_u32);
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                std.atomic.spinLoopHint();
                 continue :retry;
             }
             for (out[0..taken]) |idx| {
@@ -2540,6 +2545,7 @@ const Core = struct {
             }
             if (descriptor.state.cmpxchgWeak(observed, .free, .acq_rel, .acquire)) |actual| {
                 observed = actual;
+                std.atomic.spinLoopHint();
                 continue;
             }
             break;
@@ -2560,6 +2566,7 @@ const Core = struct {
             self.free_indices[descriptor_index].store(head, .monotonic);
             const new_tagged = @as(u64, aba +% 1) << 32 | @as(u64, descriptor_index);
             if (self.free_top_tagged.cmpxchgWeak(tagged, new_tagged, .acq_rel, .acquire)) |_| {
+                std.atomic.spinLoopHint();
                 continue;
             }
             break;
