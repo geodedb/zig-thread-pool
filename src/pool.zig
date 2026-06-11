@@ -618,6 +618,16 @@ const Core = struct {
     /// Signals the watchdog thread to exit. Set by `joinAllWorkers` before
     /// join. Read by `watchdogMain` on each tick.
     watchdog_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Q-NEW-08 (#113) — pairs with `watchdog_cond` to make the watchdog's
+    /// inter-tick sleep interruptible. Stop-signal writers take this mutex
+    /// around the broadcast so the wakeup cannot land between the watchdog's
+    /// flag check and its `timedWait` (lost-wakeup window).
+    watchdog_mutex: sync.Mutex = .{},
+    /// Q-NEW-08 (#113) — watchdog interval wait. `watchdogMain` performs a
+    /// `timedWait(watchdog_interval_ns)` instead of an uninterruptible
+    /// `clock.sleep`, so shutdown wakes it immediately via broadcast and
+    /// `deinit` no longer blocks up to one full interval.
+    watchdog_cond: sync.Condition = .{},
     /// Number of `Worker` entries whose `.scratch` and other fields were
     /// fully initialized by `Core.init` via `worker.* = .{...}`.  Used by
     /// `deinitOwned` so it does not call `worker.scratch.purge()` on entries
@@ -711,6 +721,13 @@ const Core = struct {
                 // rediscover the need when adding a post-watchdog step.
                 if (self.watchdog_thread) |t| {
                     self.watchdog_stop.store(true, .release);
+                    // Q-NEW-08 (#113): wake the watchdog out of its
+                    // interruptible interval wait. Lock around the
+                    // broadcast so it cannot land between the watchdog's
+                    // flag check and its timedWait (lost wakeup).
+                    self.watchdog_mutex.lock();
+                    self.watchdog_cond.broadcast();
+                    self.watchdog_mutex.unlock();
                     t.join();
                     self.watchdog_thread = null;
                 }
@@ -1219,6 +1236,14 @@ const Core = struct {
         // no new threads appear after we start joining.
         if (self.watchdog_thread) |thread| {
             self.watchdog_stop.store(true, .release);
+            // Q-NEW-08 (#113): wake the watchdog out of its interruptible
+            // interval wait so deinit does not block up to one full
+            // watchdog_interval_ns. Lock around the broadcast so it cannot
+            // land between the watchdog's flag check and its timedWait
+            // (lost wakeup).
+            self.watchdog_mutex.lock();
+            self.watchdog_cond.broadcast();
+            self.watchdog_mutex.unlock();
             thread.join();
             self.watchdog_thread = null;
         }
@@ -1720,7 +1745,16 @@ const Core = struct {
         const timeout_ns = self.config.blocking_promotion_timeout_ns;
         const nb: usize = self.config.blocking_workers;
         while (!self.watchdog_stop.load(.acquire)) {
-            clock.sleep(interval_ns);
+            // Q-NEW-08 (#113): interruptible interval wait instead of
+            // clock.sleep. The flag re-check under the mutex closes the
+            // lost-wakeup window: stop-signal writers broadcast while
+            // holding watchdog_mutex, so the broadcast cannot land between
+            // this check and the timedWait going to sleep.
+            self.watchdog_mutex.lock();
+            if (!self.watchdog_stop.load(.acquire)) {
+                self.watchdog_cond.timedWait(&self.watchdog_mutex, interval_ns) catch {};
+            }
+            self.watchdog_mutex.unlock();
             if (self.watchdog_stop.load(.acquire)) break;
 
             self.reapRetiredOverflow();

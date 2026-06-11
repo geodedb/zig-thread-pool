@@ -1822,3 +1822,29 @@ test "ConfigError is an explicit, exhaustively switchable set" {
         error.SubmitterCapExceedsBitmap => {},
     }
 }
+
+test "deinit is not blocked by a long watchdog interval (Q-NEW-08, #113)" {
+    // Q-NEW-08 (#113): watchdogMain used a non-interruptible clock.sleep, so
+    // joinAllWorkers (and therefore deinit) blocked up to one full
+    // watchdog_interval_ns. With a 5s interval, deinit must still return
+    // promptly because the stop signal wakes the watchdog's timed wait.
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .watchdog_interval_ns = 5 * std.time.ns_per_s,
+        .blocking_promotion_timeout_ns = 10 * std.time.ns_per_ms,
+        .max_overflow_workers = 1,
+        .worker_scratch_cap_bytes = 512,
+    });
+    // Give the watchdog thread time to enter its interval wait. Without this,
+    // deinit can set watchdog_stop before the watchdog's first loop iteration
+    // and the test passes vacuously even with a non-interruptible sleep.
+    thread_pool.clock.sleep(100 * std.time.ns_per_ms);
+    const t0 = thread_pool.clock.nanoTimestamp();
+    pool.deinit();
+    const elapsed = thread_pool.clock.nanoTimestamp() - t0;
+    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
+}
