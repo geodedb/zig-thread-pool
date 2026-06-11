@@ -2335,6 +2335,24 @@ const Core = struct {
 
     const free_sentinel: u32 = 0xFFFFFFFF;
 
+    /// GAP-0037 residual: per-field reset instead of `.* = .{}` so the
+    /// atomic fields (`state`, `generation`, `claimed_by`) are never
+    /// plain-stored while stale-entry readers concurrently `.load` them.
+    /// `generation` is deliberately untouched — the caller loads the
+    /// previous value before this reset and stores the bumped value with
+    /// `.release` after it. `state` is already `.free` here (only
+    /// `releaseDescriptor`'s CAS to `.free` puts a slot on the freelist)
+    /// and the caller stores `.reserved` with `.release`; `claimed_by` is
+    /// reset by the caller's sentinel-gated atomic store.
+    fn resetDescriptorForAcquire(descriptor: *TaskDescriptor) void {
+        descriptor.task_fn = null;
+        descriptor.ctx = null;
+        descriptor.options = .{};
+        descriptor.submit_ns = 0;
+        descriptor.start_ns = 0;
+        descriptor.complete_ns = 0;
+    }
+
     fn acquireDescriptor(self: *Core) ?u32 {
         while (true) {
             const tagged = self.free_top_tagged.load(.acquire);
@@ -2347,11 +2365,12 @@ const Core = struct {
                 continue;
             }
             var descriptor = &self.descriptors[head];
-            // Load BEFORE the struct reset (reset re-inits generation to 0),
-            // store AFTER with .release so lockless readers of the new
-            // generation also observe the reset fields.
+            // Load BEFORE the field reset, store AFTER with .release so
+            // lockless readers of the new generation also observe the reset
+            // fields. The reset skips atomic fields entirely (GAP-0037
+            // residual: no plain stores over racing atomics).
             const prev_generation = descriptor.generation.load(.monotonic);
-            descriptor.* = .{};
+            resetDescriptorForAcquire(descriptor);
             var next_gen = prev_generation +% 1;
             if (next_gen == 0) next_gen = 1;
             descriptor.generation.store(next_gen, .release);
@@ -2399,9 +2418,10 @@ const Core = struct {
             for (out[0..taken]) |idx| {
                 const descriptor = &self.descriptors[idx];
                 // Same ordering discipline as acquireDescriptor: load before
-                // the reset, .release store after.
+                // the reset, .release store after. Per-field reset so atomic
+                // fields are never plain-stored (GAP-0037 residual).
                 const prev_generation = descriptor.generation.load(.monotonic);
-                descriptor.* = .{};
+                resetDescriptorForAcquire(descriptor);
                 var next_gen = prev_generation +% 1;
                 if (next_gen == 0) next_gen = 1;
                 descriptor.generation.store(next_gen, .release);
