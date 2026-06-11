@@ -171,6 +171,11 @@ pub fn build(b: *std.Build) void {
     });
     if (tsan) unit_tests.root_module.sanitize_thread = true;
     unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    // Also RUN the in-file module tests (src/**). Previously they were only
+    // compiled by `zig build check` and never executed, so regressions
+    // guarded by tests like GAP-0039 (stats/latency.zig) were invisible to
+    // CI. `check_tests` is the same artifact the check step compiles.
+    unit_step.dependOn(&b.addRunArtifact(check_tests).step);
 
     // Observability seam tests. Two targets:
     //   - `observability_disabled_test.zig` runs under BOTH flag values.
@@ -221,6 +226,7 @@ pub fn build(b: *std.Build) void {
 
     const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
     all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    all_tests_step.dependOn(&b.addRunArtifact(check_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(integration_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(stress_tests).step);
 

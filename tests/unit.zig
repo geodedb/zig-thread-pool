@@ -1740,3 +1740,8 @@ test "clock: nanoTimestamp is monotonic non-decreasing" {
         prev = now;
     }
 }
+
+test "version constant matches build manifest" {
+    // Keep in sync with build.zig.zon .version — drift breaks SBOM triage (AP-06).
+    try std.testing.expectEqualStrings("0.2.4", thread_pool.version);
+}

@@ -599,6 +599,63 @@ test "overflow worker self-retires after idle period" {
     try std.testing.expectEqual(@as(u64, 0), stats2.overflow_active);
 }
 
+test "Q-NEW-10: shutdown retires overflow workers in the accounting" {
+    // joinAllWorkers joins live overflow workers directly (the watchdog is
+    // stopped first), so it must apply the same accounting updates as
+    // reapRetiredOverflow. Pre-fix, an overflow worker still alive at
+    // shutdown left overflow_active nonzero and overflow_retires <
+    // overflow_spawns, breaking the documented Stats invariant
+    // (overflow_active = spawns - retires; retires == spawns after
+    // shutdown).
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = 2,
+        .max_threads = 2,
+        .queue_capacity = 64,
+        .local_queue_capacity = 16,
+        .scheduler_variant = .work_stealing,
+        .watchdog_interval_ns = 5 * std.time.ns_per_ms,
+        .blocking_promotion_timeout_ns = 10 * std.time.ns_per_ms,
+        .max_overflow_workers = 2,
+        .worker_scratch_cap_bytes = 512,
+    });
+    defer pool.deinit();
+
+    var wg = pool.waitGroup();
+    var counter = common.Counter{};
+
+    var gate1 = common.GateTaskContext{ .counter = &counter };
+    var gate2 = common.GateTaskContext{ .counter = &counter };
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate1), .{ .wait_group = &wg });
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate2), .{ .wait_group = &wg });
+    try waitUntilGateStarted(&gate1);
+    try waitUntilGateStarted(&gate2);
+
+    for (0..8) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    }
+
+    // Wait until the watchdog has spawned at least one overflow worker.
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        if (pool.statsSnapshot().overflow_spawns >= 1) break;
+        thread_pool.clock.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(pool.statsSnapshot().overflow_spawns >= 1);
+
+    gate1.release.store(true, .release);
+    gate2.release.store(true, .release);
+    wg.wait();
+
+    // Shut down promptly — typically before the overflow worker self-retires
+    // (idle_retire = 2 watchdog ticks) and gets reaped, so joinAllWorkers
+    // joins a live overflow thread and must retire it in the accounting.
+    try pool.shutdown(.drain, 5 * std.time.ns_per_s);
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(stats.overflow_spawns, stats.overflow_retires);
+    try std.testing.expectEqual(@as(u64, 0), stats.overflow_active);
+}
+
 test "max_overflow_workers = 0 produces no overflow activity" {
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 2,

@@ -700,7 +700,11 @@ pub const ProcessMemoryStats = struct {
     rss_peak_bytes: u64 = 0,
     /// Private (non-shared) bytes resident at sample time.
     private_current_bytes: u64 = 0,
-    /// Peak private bytes over the process lifetime.
+    /// Peak private bytes over the process lifetime.  On Linux the kernel
+    /// keeps no high-water mark for anonymous RSS, so this is the maximum
+    /// `private_current_bytes` observed across samples taken by this
+    /// process (GAP-0031, #17) — it can under-report a transient peak
+    /// that occurred between samples.
     private_peak_bytes: u64 = 0,
 };
 

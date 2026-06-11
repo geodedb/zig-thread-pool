@@ -39,7 +39,7 @@ pub const TaskContext = @import("pool.zig").TaskContext;
 pub const TaskFn = @import("pool.zig").TaskFn;
 pub const BatchTask = @import("pool.zig").BatchTask;
 
-pub const version = "0.2.1";
+pub const version = "0.2.4";
 
 pub const Config = types.Config;
 pub const SchedulerVariant = types.SchedulerVariant;
@@ -62,4 +62,9 @@ pub const DescCache = @import("pool/desc_cache.zig").DescCache;
 
 test {
     std.testing.refAllDecls(@This());
+    // Files not re-exported above must be referenced explicitly or their
+    // in-file tests are never collected (refAllDecls only reaches files
+    // whose top-level decls appear in this module's public surface).
+    _ = @import("stats/latency.zig");
+    _ = @import("stats/process_memory.zig");
 }

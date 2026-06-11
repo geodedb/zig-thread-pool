@@ -109,7 +109,12 @@ pub const LatencyHistogram = struct {
     fn quantileScaled(self: *const LatencyHistogram, numerator: u64, denominator: u64) u64 {
         const c = self.count.load(.monotonic);
         if (c == 0) return 0;
-        const target = @max((c * numerator + (denominator - 1)) / denominator, 1);
+        // GAP-0039 (#95): widen the rank math to u128 — `c * numerator`
+        // overflows u64 once c approaches maxInt(u64)/9999 (~1.8e15
+        // observations for the p9999 lookup). The quotient is <= c, so
+        // narrowing back to u64 is lossless.
+        const target_wide = (@as(u128, c) * numerator + (denominator - 1)) / denominator;
+        const target: u64 = @intCast(@max(target_wide, 1));
         var seen: u64 = 0;
         for (self.counts, 0..) |bucket_atomic, idx| {
             seen += bucket_atomic.load(.monotonic);
@@ -118,6 +123,26 @@ pub const LatencyHistogram = struct {
         return self.max_ns.load(.monotonic);
     }
 };
+
+test "GAP-0039: quantileScaled rank math survives counts near maxInt(u64)/9999" {
+    // A count this large cannot be reached by calling observe() in a test,
+    // so the fields are synthesized directly (same-file access). Pre-fix,
+    // `c * 9999` in quantileScaled overflowed u64 and panicked in Debug.
+    var histogram = LatencyHistogram{};
+    const big: u64 = std.math.maxInt(u64) / 9999 + 1;
+    histogram.count = LatencyHistogram.Atomic.init(big);
+    histogram.counts[3] = LatencyHistogram.Atomic.init(big);
+    histogram.min_ns = LatencyHistogram.Atomic.init(8);
+    histogram.max_ns = LatencyHistogram.Atomic.init(8);
+
+    const summary = histogram.summary();
+    try std.testing.expectEqual(big, summary.count);
+    // All mass sits in bucket 3, so every quantile (including the widest
+    // p9999 rank, the first to overflow pre-fix) resolves to its upper bound.
+    try std.testing.expectEqual(@as(u64, 8), summary.p50_ns);
+    try std.testing.expectEqual(@as(u64, 8), summary.p99_ns);
+    try std.testing.expectEqual(@as(u64, 8), summary.p9999_ns);
+}
 
 test "latency histogram records quantiles" {
     var histogram = LatencyHistogram{};

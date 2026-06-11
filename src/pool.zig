@@ -1085,7 +1085,13 @@ const Core = struct {
     }
 
     pub fn waitGroup(self: *Core) types.WaitGroup {
-        _ = self;
+        // Q-026 (#60): `WaitGroup` is a free-standing synchronisation
+        // object, so construction needs no pool state. The instance method
+        // is kept for API scoping; use `self` to tighten the contract —
+        // handing out a wait-group from a pool that is shutting down (or
+        // already stopped) is a caller bug, since no submission could ever
+        // complete it.
+        std.debug.assert(self.state.load(.acquire) == .running);
         return .{};
     }
 
@@ -1153,6 +1159,20 @@ const Core = struct {
             if (worker.thread) |thread| {
                 thread.join();
                 worker.thread = null;
+                if (worker.is_overflow) {
+                    // Q-NEW-10 (#115): shutdown-path equivalent of
+                    // `reapRetiredOverflow`. Joining an overflow worker here
+                    // (whether it self-retired un-reaped or was still active)
+                    // must retire it in the accounting, or `overflow_active`
+                    // stays nonzero and `overflow_retires < overflow_spawns`
+                    // after shutdown — breaking the Stats invariant
+                    // (`overflow_active = spawns - retires`; retires equals
+                    // spawns after shutdown). The watchdog is already joined
+                    // above, so this cannot race a concurrent reap.
+                    worker.overflow_retired.store(false, .release);
+                    _ = self.counters.overflow_retires.fetchAdd(1, .monotonic);
+                    _ = self.counters.overflow_active.fetchSub(1, .monotonic);
+                }
             }
         }
         self.state.store(.stopped, .release);
@@ -2586,6 +2606,24 @@ const Core = struct {
         }
     }
 
+    /// GAP-0040 (#96): per-submitter equivalent of `drainWorkerDescCaches`.
+    /// Submitters that registered but never called `releaseSubmitter` leave
+    /// `.reserved` descriptor indices in `desc_caches[idx]`; freeing the
+    /// slice without releasing them would strand `task_desc_live` above
+    /// zero forever. Called from `deinitOwned`, after workers are joined —
+    /// deinit implies submitter quiescence, so the SPSC drain is safe.
+    /// Every cache entry is initialised immediately after the slice is
+    /// allocated in `Core.init`, so iterating the full slice is safe even
+    /// on the partial-init errdefer path.
+    fn drainSubmitterDescCaches(self: *Core) void {
+        for (self.desc_caches) |*cache| {
+            var buf: [DescCache.capacity]u32 = undefined;
+            const n = cache.drainAll(&buf);
+            var i: usize = 0;
+            while (i < n) : (i += 1) self.releaseDescriptor(buf[i]);
+        }
+    }
+
     fn deinitOwned(self: *Core) void {
         // Use init_worker_count / init_queue_count / init_submitter_count to
         // bound the cleanup loops: if Core.init fails partway through the
@@ -2595,6 +2633,7 @@ const Core = struct {
         // After a successful init these counts equal the slice lengths, so the
         // hot (non-error) path is unchanged.
         self.drainWorkerDescCaches();
+        self.drainSubmitterDescCaches();
         for (self.workers[0..self.init_worker_count]) |*worker| {
             worker.scratch.purge();
         }
