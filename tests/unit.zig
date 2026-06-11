@@ -1702,3 +1702,16 @@ test "pool.deinit drains per-worker desc_caches" {
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.task_desc_live);
 }
+
+test "clock: nanoTimestamp is monotonic non-decreasing" {
+    // GAP-0036 / AP-01: the clock source must be monotonic (.awake) so that
+    // interval subtractions in pool.zig never underflow when the wall clock
+    // steps backward (NTP correction, VM resume).
+    var prev = thread_pool.clock.nanoTimestamp();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const now = thread_pool.clock.nanoTimestamp();
+        try std.testing.expect(now >= prev);
+        prev = now;
+    }
+}

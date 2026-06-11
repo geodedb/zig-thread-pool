@@ -2016,7 +2016,7 @@ const Core = struct {
         descriptor.start_ns = start_ns;
 
         if (timestamps_enabled) {
-            const wait_ns = start_ns - descriptor.submit_ns;
+            const wait_ns = start_ns -| descriptor.submit_ns;
             worker.wait_histogram.observe(wait_ns);
         }
 
@@ -2110,7 +2110,7 @@ const Core = struct {
 
         if (timestamps_enabled) {
             descriptor.complete_ns = complete_ns;
-            const exec_ns = complete_ns - start_ns;
+            const exec_ns = complete_ns -| start_ns;
             _ = worker.busy_ns.fetchAdd(exec_ns, .release);
             worker.exec_histogram.observe(exec_ns);
         }

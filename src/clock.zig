@@ -4,6 +4,11 @@
 //! `nanoTimestamp` uses `std.Io.Clock.Timestamp.now` on the static
 //! `global_single_threaded` Io (the `now` vtable fn ignores `userdata`).
 //!
+//! The clock source is `.awake` (CLOCK_MONOTONIC on Linux), not `.real`
+//! (AP-01/GAP-0036): backward wall-clock steps — NTP correction, VM resume —
+//! must not underflow interval arithmetic. All consumers compute durations;
+//! none need absolute wall time.
+//!
 //! `sleep` uses `std.posix.system.nanosleep` on POSIX and `ntdll.NtDelayExecution`
 //! on Windows (the old `kernel32.Sleep` wrapper is gone in 0.16). Both are
 //! uncancelable and do not require any async state.
@@ -13,7 +18,7 @@ const builtin = @import("builtin");
 
 pub fn nanoTimestamp() i96 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    return std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+    return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
 pub fn sleep(nanoseconds: u64) void {

@@ -48,7 +48,7 @@ pub const Condition = struct {
     pub fn timedWait(self: *Condition, m: *Mutex, timeout_ns: u64) error{Timeout}!void {
         return self.waitInner(m, .{ .duration = .{
             .raw = .fromNanoseconds(@intCast(timeout_ns)),
-            .clock = .real,
+            .clock = .awake,
         } });
     }
 
