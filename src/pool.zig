@@ -120,6 +120,86 @@ pub const BatchTask = struct {
     ctx: *anyopaque,
 };
 
+/// Errors returned by `submit` / `trySubmit` (QR-004, #43).
+///
+/// `trySubmit` never blocks, so it returns `error.QueueFull` /
+/// `error.TaskPoolExhausted` immediately and never `error.Timeout`;
+/// the set is shared because both paths funnel through the same
+/// submission chain.
+pub const SubmitError = error{
+    /// The pool is shutting down (or already stopped); no new work is
+    /// accepted.
+    ShutdownInProgress,
+    /// Every reachable queue (LIFO slot, local/submitter queue, inject
+    /// queue) rejected the task. Retry later or use a blocking
+    /// `BackpressurePolicy`.
+    QueueFull,
+    /// The task-descriptor freelist is exhausted (`queue_capacity`
+    /// descriptors are live). Retry later or use a blocking
+    /// `BackpressurePolicy`.
+    TaskPoolExhausted,
+    /// `SubmitOptions.lane == .blocking` but the pool was configured
+    /// without `allow_blocking_lane`.
+    BlockingLaneDisabled,
+    /// `backpressure == .block_with_timeout` and the deadline elapsed
+    /// before capacity freed up.
+    Timeout,
+};
+
+/// Errors returned by `submitBatch` (QR-004, #43). Superset of
+/// `SubmitError`: the batch path additionally rejects waitable
+/// submissions, since no per-task handle is returned (Q-NEW-02, #107).
+pub const SubmitBatchError = error{
+    /// `SubmitOptions.waitable` is unsupported by the batch path — the
+    /// per-task handles would leak one descriptor per task.
+    WaitableUnsupported,
+    /// See `SubmitError.ShutdownInProgress`. Returned only when zero
+    /// tasks were submitted; a partial batch returns a success count.
+    ShutdownInProgress,
+    /// See `SubmitError.QueueFull`. Returned only when zero tasks were
+    /// submitted; a partial batch returns a success count.
+    QueueFull,
+    /// See `SubmitError.TaskPoolExhausted`. Returned only when zero
+    /// tasks were submitted; a partial batch returns a success count.
+    TaskPoolExhausted,
+    /// See `SubmitError.BlockingLaneDisabled`. Returned only when zero
+    /// tasks were submitted; a partial batch returns a success count.
+    BlockingLaneDisabled,
+    /// See `SubmitError.Timeout`. Returned only when zero tasks were
+    /// submitted; a partial batch returns a success count.
+    Timeout,
+};
+
+/// Errors returned by `wait` (QR-004, #43).
+pub const WaitError = error{
+    /// The handle is invalid: never waitable, out of bounds, or stale
+    /// (its descriptor generation has already been recycled).
+    InvalidHandle,
+};
+
+/// Errors returned by `shutdown` (QR-004, #43).
+pub const ShutdownError = error{
+    /// `timeout_ns` elapsed with tasks still queued or running. Workers
+    /// are NOT joined on this path; call `shutdown` again or `deinit`.
+    Timeout,
+};
+
+/// Errors returned by `registerSubmitter` (QR-004, #43).
+pub const RegisterSubmitterError = error{
+    /// All `Config.max_submitter_queues` slots are taken (or the API is
+    /// disabled with `max_submitter_queues == 0`).
+    NoSubmitterSlots,
+};
+
+/// Internal error subset shared by `enqueuePush` / `enqueueTask`: the
+/// per-push failures before backpressure/shutdown handling is applied
+/// by `submitInternal` / `submitBatch`.
+const EnqueueError = error{
+    QueueFull,
+    TaskPoolExhausted,
+    BlockingLaneDisabled,
+};
+
 const PoolState = enum(u8) {
     running,
     shutdown_requested,
@@ -816,11 +896,11 @@ const Core = struct {
         self.deinitOwned();
     }
 
-    pub fn trySubmit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    pub fn trySubmit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         return self.submitInternal(task_fn, ctx, options, false);
     }
 
-    pub fn submit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    pub fn submit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         return self.submitInternal(task_fn, ctx, options, true);
     }
 
@@ -842,7 +922,7 @@ const Core = struct {
     /// notify so workers can make progress, then retry; `.return_error`
     /// returns a partial `SubmitBatchResult.submitted` reflecting the count
     /// of tasks actually queued.
-    pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) !SubmitBatchResult {
+    pub fn submitBatch(self: *Core, tasks: []const BatchTask, options: types.SubmitOptions) SubmitBatchError!SubmitBatchResult {
         if (tasks.len == 0) return .{ .submitted = 0 };
 
         // Q-NEW-02 (#107): waitable handles are discarded by the batch path
@@ -910,7 +990,7 @@ const Core = struct {
     /// quiescent (no in-flight submit on it). Cross-thread release is
     /// unsupported — see `releaseSubmitter` for the precise failure mode and
     /// the best-effort fallback behaviour.
-    pub fn registerSubmitter(self: *Core) !usize {
+    pub fn registerSubmitter(self: *Core) RegisterSubmitterError!usize {
         while (true) {
             const mask = self.submitter_free_mask.load(.acquire);
             if (mask == 0) return error.NoSubmitterSlots;
@@ -1050,7 +1130,7 @@ const Core = struct {
         // Note: free_mask bit was already set by the CAS above.
     }
 
-    pub fn wait(self: *Core, handle: types.TaskHandle) !void {
+    pub fn wait(self: *Core, handle: types.TaskHandle) WaitError!void {
         if (!handle.isValid()) return error.InvalidHandle;
         if (handle.index >= self.descriptors.len) return error.InvalidHandle;
 
@@ -1100,7 +1180,7 @@ const Core = struct {
         return .{};
     }
 
-    pub fn shutdown(self: *Core, mode: types.ShutdownMode, timeout_ns: ?u64) !void {
+    pub fn shutdown(self: *Core, mode: types.ShutdownMode, timeout_ns: ?u64) ShutdownError!void {
         const old_state = self.state.swap(.shutdown_requested, .acq_rel);
         if (old_state != .running) {
             // Another shutdown is already in progress or completed.
@@ -1110,7 +1190,7 @@ const Core = struct {
         }
 
         if (mode == .cancel_pending) {
-            try self.cancelQueuedTasks();
+            self.cancelQueuedTasks();
         }
 
         const deadline = if (timeout_ns) |ns| nowNs() + ns else 0;
@@ -1375,7 +1455,7 @@ const Core = struct {
         }
     }
 
-    fn submitInternal(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions, allow_block: bool) !types.TaskHandle {
+    fn submitInternal(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions, allow_block: bool) SubmitError!types.TaskHandle {
         const effective = self.effectiveBackpressure(options);
         const deadline = if (allow_block and effective == .block_with_timeout and options.timeout_ns != null)
             nowNs() + options.timeout_ns.?
@@ -1397,7 +1477,7 @@ const Core = struct {
         }
     }
 
-    fn enqueueTask(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    fn enqueueTask(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) EnqueueError!types.TaskHandle {
         const handle = try self.enqueuePush(task_fn, ctx, options);
 
         // Always update counters so the SC park handshake sees queued work.
@@ -1435,7 +1515,7 @@ const Core = struct {
     /// - `.lane = .default` with TLS submitter being a blocking worker → skips
     ///   LIFO/local path (a blocking worker's caches must not hold default-lane work);
     ///   goes straight to the default inject queue.
-    fn enqueuePush(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    fn enqueuePush(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) EnqueueError!types.TaskHandle {
         if (options.lane == .blocking and !self.config.allow_blocking_lane) {
             return error.BlockingLaneDisabled;
         }
@@ -2337,7 +2417,7 @@ const Core = struct {
         return self.totalQueuedTasks() == 0 and self.counters.active_tasks.load(.acquire) == 0;
     }
 
-    fn cancelQueuedTasks(self: *Core) !void {
+    fn cancelQueuedTasks(self: *Core) void {
         // Task 4b: no decrementQueued here — it moved into cancelDescriptor's
         // CAS-success path. Matches the nextTask/runTask split so a ghost
         // duplicate index popped during cancellation drains doesn't
@@ -2753,7 +2833,7 @@ pub const ThreadPool = struct {
     /// Submit a task without blocking. Returns `error.QueueFull` or
     /// `error.TaskPoolExhausted` immediately if capacity is exhausted,
     /// regardless of the backpressure policy in `options`.
-    pub fn trySubmit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    pub fn trySubmit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         // otel seam: comptime-no-op when -Dwith_otel=false. When
         // enabled, emits one `thread_pool.submit` producer span per
         // public-API submit. The defer-end + errdefer-fail + final
@@ -2775,7 +2855,7 @@ pub const ThreadPool = struct {
     /// With `.backpressure = .block`, a submit from a worker thread of
     /// the same pool can deadlock when the queue is full; see
     /// `BackpressurePolicy` docs.
-    pub fn submit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) !types.TaskHandle {
+    pub fn submit(self: *ThreadPool, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         var __obs_span = observability.startSubmitSpan();
         defer __obs_span.end(null);
         errdefer observability.endSubmitSpan(__obs_span, false);
@@ -2792,7 +2872,7 @@ pub const ThreadPool = struct {
     /// `options.waitable` is unsupported (no per-task handle is returned,
     /// so waitable descriptors would leak) and returns
     /// `error.WaitableUnsupported` (Q-NEW-02, #107).
-    pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) !Core.SubmitBatchResult {
+    pub fn submitBatch(self: *ThreadPool, tasks: []const BatchTask, options: types.SubmitOptions) SubmitBatchError!Core.SubmitBatchResult {
         // One span per submitBatch call (covers the whole batch as a
         // single producer-side enqueue). Per-task spans would explode
         // span volume on flood workloads.
@@ -2812,7 +2892,7 @@ pub const ThreadPool = struct {
     /// thread via thread-local state and MUST be released by that same
     /// thread, with the slot quiescent (no in-flight submit on it). See
     /// `releaseSubmitter`.
-    pub fn registerSubmitter(self: *ThreadPool) !usize {
+    pub fn registerSubmitter(self: *ThreadPool) RegisterSubmitterError!usize {
         return self.core.registerSubmitter();
     }
 
@@ -2832,7 +2912,7 @@ pub const ThreadPool = struct {
     /// Block until a waitable task completes or is cancelled.
     /// The task descriptor is released upon return. Passing an invalid
     /// or non-waitable handle returns `error.InvalidHandle`.
-    pub fn wait(self: *ThreadPool, handle: types.TaskHandle) !void {
+    pub fn wait(self: *ThreadPool, handle: types.TaskHandle) WaitError!void {
         return self.core.wait(handle);
     }
 
@@ -2848,7 +2928,7 @@ pub const ThreadPool = struct {
     /// `.cancel_pending` cancels queued tasks, then waits for active ones.
     /// Pass a `timeout_ns` to bound the wait; returns `error.Timeout`
     /// if the deadline elapses with tasks still in flight.
-    pub fn shutdown(self: *ThreadPool, mode: types.ShutdownMode, timeout_ns: ?u64) !void {
+    pub fn shutdown(self: *ThreadPool, mode: types.ShutdownMode, timeout_ns: ?u64) ShutdownError!void {
         return self.core.shutdown(mode, timeout_ns);
     }
 

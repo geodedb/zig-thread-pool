@@ -142,6 +142,52 @@ pub const QueueKind = enum {
     ring,
 };
 
+/// Errors returned by `Config.validate`. Every member maps 1:1 to a
+/// rejected field combination documented on the corresponding
+/// `Config` field.
+pub const ConfigError = error{
+    /// `max_threads == 0` after normalisation (auto-detect failed).
+    InvalidMaxThreads,
+    /// `max_threads > 64` — exceeds the worker-bitmap width.
+    TooManyWorkers,
+    /// `min_threads == 0` after normalisation.
+    InvalidMinThreads,
+    /// `min_threads > max_threads`.
+    InvalidThreadBounds,
+    /// `queue_capacity` is 0 or exceeds `maxInt(u32)`.
+    InvalidQueueCapacity,
+    /// `local_queue_capacity == 0`.
+    InvalidLocalQueueCapacity,
+    /// `scheduler_variant == .lane_extension` with `blocking_workers == 0`.
+    LaneExtensionRequiresBlockingWorkers,
+    /// `inject_batch_size == 0`.
+    InvalidInjectBatchSize,
+    /// `hot_spinners >= max_threads` — at least one worker must park.
+    InvalidHotSpinners,
+    /// `hot_spinners > 0` with `wake_every_n_tasks == 0`.
+    InvalidWakeThreshold,
+    /// `blocking_workers >= max_threads` — at least one CPU worker required.
+    InvalidBlockingWorkers,
+    /// `blocking_workers > 0` without `allow_blocking_lane = true`.
+    BlockingLaneWithoutFlag,
+    /// `allow_blocking_lane = true` with `blocking_workers == 0`.
+    AllowBlockingLaneRequiresWorkers,
+    /// `blocking_queue_capacity` exceeds `maxInt(u32)`.
+    InvalidBlockingQueueCapacity,
+    /// `blocking_queue_capacity > 0` with `blocking_workers == 0`.
+    BlockingQueueCapacityWithoutLane,
+    /// `blocking_backpressure` set with `blocking_workers == 0`.
+    BlockingBackpressureWithoutLane,
+    /// `cpu_helps_blocking = true` with `blocking_workers == 0`.
+    CpuHelpsBlockingWithoutLane,
+    /// `watchdog_interval_ns > 0` with `max_overflow_workers == 0`.
+    WatchdogWithoutOverflowCap,
+    /// `max_threads + max_overflow_workers > 64` — exceeds the bitmap.
+    OverflowCapExceedsBitmap,
+    /// `max_submitter_queues > 64` — exceeds the submitter bitmap.
+    SubmitterCapExceedsBitmap,
+};
+
 /// Pool-wide configuration.  Constructed by the caller and passed to
 /// `ThreadPool.init`.  Normalisation happens inside
 /// `Config.normalized()` — callers may pass a partial struct with
@@ -162,7 +208,8 @@ pub const QueueKind = enum {
 ///   - `hot_spinners > 0` requires `wake_every_n_tasks > 0`.
 ///   - `blocking_queue_capacity`, `blocking_backpressure`, and
 ///     `cpu_helps_blocking` are gated on `blocking_workers > 0`.
-/// `validate()` rejects inconsistent combinations with a typed error.
+/// `validate()` rejects inconsistent combinations with a typed
+/// `ConfigError`.
 pub const Config = struct {
     /// Minimum number of worker threads spawned at `init`.  0 means
     /// "same as `max_threads`" (the common case).  Clamped to
@@ -407,7 +454,7 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn validate(self: Config) !void {
+    pub fn validate(self: Config) ConfigError!void {
         if (self.max_threads == 0) return error.InvalidMaxThreads;
         if (self.max_threads > 64) return error.TooManyWorkers;
         if (self.min_threads == 0) return error.InvalidMinThreads;

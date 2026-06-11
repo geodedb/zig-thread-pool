@@ -42,6 +42,18 @@ pub const BatchTask = @import("pool.zig").BatchTask;
 pub const version = "0.2.4";
 
 pub const Config = types.Config;
+/// Explicit error set of `Config.validate` (QR-003, #41).
+pub const ConfigError = types.ConfigError;
+/// Explicit error set of `ThreadPool.submit` / `trySubmit` (QR-004, #43).
+pub const SubmitError = @import("pool.zig").SubmitError;
+/// Explicit error set of `ThreadPool.submitBatch` (QR-004, #43).
+pub const SubmitBatchError = @import("pool.zig").SubmitBatchError;
+/// Explicit error set of `ThreadPool.wait` (QR-004, #43).
+pub const WaitError = @import("pool.zig").WaitError;
+/// Explicit error set of `ThreadPool.shutdown` (QR-004, #43).
+pub const ShutdownError = @import("pool.zig").ShutdownError;
+/// Explicit error set of `ThreadPool.registerSubmitter` (QR-004, #43).
+pub const RegisterSubmitterError = @import("pool.zig").RegisterSubmitterError;
 pub const SchedulerVariant = types.SchedulerVariant;
 pub const QueueKind = types.QueueKind;
 pub const TaskLane = types.TaskLane;

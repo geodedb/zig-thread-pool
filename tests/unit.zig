@@ -1745,3 +1745,80 @@ test "version constant matches build manifest" {
     // Keep in sync with build.zig.zon .version — drift breaks SBOM triage (AP-06).
     try std.testing.expectEqualStrings("0.2.4", thread_pool.version);
 }
+
+test "SubmitError is an explicit, exhaustively switchable set" {
+    // QR-004 (#43): the public submit contract is a closed error set. The
+    // else-less switch fails to compile if a member is ever added without
+    // updating the declared set (or vice versa), pinning the API contract.
+    var e: thread_pool.SubmitError = error.QueueFull;
+    _ = &e;
+    switch (e) {
+        error.ShutdownInProgress => {},
+        error.QueueFull => {},
+        error.TaskPoolExhausted => {},
+        error.BlockingLaneDisabled => {},
+        error.Timeout => {},
+    }
+}
+
+test "SubmitBatchError is SubmitError plus WaitableUnsupported" {
+    // QR-004 (#43): batch submit adds exactly one member (Q-NEW-02, #107).
+    var e: thread_pool.SubmitBatchError = error.WaitableUnsupported;
+    _ = &e;
+    switch (e) {
+        error.WaitableUnsupported => {},
+        error.ShutdownInProgress => {},
+        error.QueueFull => {},
+        error.TaskPoolExhausted => {},
+        error.BlockingLaneDisabled => {},
+        error.Timeout => {},
+    }
+}
+
+test "wait/shutdown/registerSubmitter error sets are closed" {
+    // QR-004 (#43): single-member sets — the else-less switches prove no
+    // hidden members exist.
+    var we: thread_pool.WaitError = error.InvalidHandle;
+    _ = &we;
+    switch (we) {
+        error.InvalidHandle => {},
+    }
+    var se: thread_pool.ShutdownError = error.Timeout;
+    _ = &se;
+    switch (se) {
+        error.Timeout => {},
+    }
+    var re: thread_pool.RegisterSubmitterError = error.NoSubmitterSlots;
+    _ = &re;
+    switch (re) {
+        error.NoSubmitterSlots => {},
+    }
+}
+
+test "ConfigError is an explicit, exhaustively switchable set" {
+    // QR-003 (#41): Config.validate returns a closed, documented set.
+    var e: thread_pool.ConfigError = error.InvalidMaxThreads;
+    _ = &e;
+    switch (e) {
+        error.InvalidMaxThreads => {},
+        error.TooManyWorkers => {},
+        error.InvalidMinThreads => {},
+        error.InvalidThreadBounds => {},
+        error.InvalidQueueCapacity => {},
+        error.InvalidLocalQueueCapacity => {},
+        error.LaneExtensionRequiresBlockingWorkers => {},
+        error.InvalidInjectBatchSize => {},
+        error.InvalidHotSpinners => {},
+        error.InvalidWakeThreshold => {},
+        error.InvalidBlockingWorkers => {},
+        error.BlockingLaneWithoutFlag => {},
+        error.AllowBlockingLaneRequiresWorkers => {},
+        error.InvalidBlockingQueueCapacity => {},
+        error.BlockingQueueCapacityWithoutLane => {},
+        error.BlockingBackpressureWithoutLane => {},
+        error.CpuHelpsBlockingWithoutLane => {},
+        error.WatchdogWithoutOverflowCap => {},
+        error.OverflowCapExceedsBitmap => {},
+        error.SubmitterCapExceedsBitmap => {},
+    }
+}
