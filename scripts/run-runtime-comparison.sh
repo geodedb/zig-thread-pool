@@ -36,11 +36,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${ZIG_BIN}" ]]; then
-  if [[ -x "${ROOT_DIR}/zig-0.15.2/zig" ]]; then
-    ZIG_CMD="${ROOT_DIR}/zig-0.15.2/zig"
-  else
-    ZIG_CMD="$(command -v zig)"
-  fi
+  ZIG_CMD="$(command -v zig)"
   (
     cd "${ROOT_DIR}"
     "${ZIG_CMD}" build bench-runtime-zig -Doptimize=ReleaseFast
@@ -57,11 +53,7 @@ TOKIO_COMMIT="$(git -C "${ROOT_DIR}/third_party/tokio" rev-parse HEAD)"
 GO_COMMIT="$(git -C "${ROOT_DIR}/third_party/go" rev-parse HEAD)"
 TOKIO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${ROOT_DIR}/third_party/tokio/tokio/Cargo.toml" | head -n 1)"
 
-if [[ -x "${ROOT_DIR}/zig-0.15.2/zig" ]]; then
-  ZIG_VERSION="$("${ROOT_DIR}/zig-0.15.2/zig" version)"
-else
-  ZIG_VERSION="$(zig version)"
-fi
+ZIG_VERSION="$(zig version)"
 
 GO_BIN="$("${ROOT_DIR}/scripts/ensure-local-go.sh")"
 GO_ROOT="$(cd "$(dirname "${GO_BIN}")/.." && pwd)"

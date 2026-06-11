@@ -1,7 +1,7 @@
 # thread-pool - Zig Library Makefile
 # SPDX-License-Identifier: Apache-2.0
 
-ZIG ?= $(if $(wildcard ./zig-0.15.2/zig),./zig-0.15.2/zig,zig)
+ZIG ?= zig
 BASELINE ?= benchmarks/results/baseline.json
 CURRENT ?= benchmarks/results/latest.json
 

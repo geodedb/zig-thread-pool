@@ -73,6 +73,19 @@ include:
       test_step: "test"
       optimize: "Debug"
       tags: ["company", "linux"]
+  # Single-pool comptime gate (QR-002): unit suite only with
+  # -Dsingle-pool=true so the F-001 identity-check elision keeps
+  # compiling and passing. Integration tests are deliberately NOT
+  # wired here — two_pool_cross_submit requires multiple pools and
+  # must never run under -Dsingle-pool=true.
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.25.1
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit-single-pool"
+      test_step: "test"
+      test_options: "--summary all -Dsingle-pool=true"
+      optimize: "Debug"
+      tags: ["company", "linux"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.25.1
     inputs:
       zig_version: "0.16.0"
@@ -235,7 +248,12 @@ zig-test-windows-stress-0.16.0:
 # ---------------------------------------------------------------
 
 .zig-host-base:
-  image: "ubuntu:24.04"
+  # Pinned by digest (GAP-0042): manifest-list digest for ubuntu:24.04
+  # as of 2026-06-11. Refresh with
+  # `docker buildx imagetools inspect ubuntu:24.04` (or
+  # `skopeo inspect --format '{{.Digest}}' docker://docker.io/library/ubuntu:24.04`)
+  # and update both the digest and this date.
+  image: "ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54"
   interruptible: true
   before_script:
     - apt-get update -qq

@@ -175,6 +175,32 @@ cd benchmarks/external/go_runtime_bench && \
 zig build bench-realistic -Doptimize=ReleaseFast
 ```
 
+## Vendored Runtime Pins
+
+- `third_party/go` is pinned to master commit
+  `a1e7a41560e1f64aa49d30ccbdea5b0e715663c6` (fetched ~2026-04), **not** a
+  release tag (GAP-0047). The local shallow clone carries no release tags
+  containing that commit, and re-pinning now would invalidate every
+  recorded benchmark baseline in this document and in
+  `docs/performance/*/FINAL.md` (the Go leg of each snapshot was built
+  from that exact tree). At the **next benchmark refresh** — i.e. the
+  next time a new full snapshot is being recorded anyway — re-pin the
+  submodule to the nearest Go release tag instead:
+
+  ```bash
+  git -C third_party/go fetch --tags origin
+  git -C third_party/go tag --contains a1e7a41560e1f64aa49d30ccbdea5b0e715663c6
+  git -C third_party/go checkout <release-tag>
+  git add third_party/go
+  ```
+
+  Record the new tag here and treat the first post-re-pin run as a fresh
+  Go baseline (do not compare its multipliers against pre-re-pin
+  snapshots).
+- `third_party/tokio` is pinned via the submodule SHA recorded in
+  `.gitmodules` / the gitlink; the Tokio crate version is read from
+  `third_party/tokio/tokio/Cargo.toml` at run time.
+
 ## Related
 
 - [BENCHMARKS.md](BENCHMARKS.md) — scenario matrix, A/B protocol, full

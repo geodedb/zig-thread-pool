@@ -88,7 +88,18 @@ DEP_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 URL_RE = re.compile(r'\.url\s*=\s*"(?P<url>[^"]+)"')
-HASH_RE = re.compile(r'\.hash\s*=\s*"(?P<hash>[^"]+)"')
+# Package hashes are used to build filesystem paths below, so the
+# accepted alphabet is deliberately tight: Zig package hashes are
+# `<name>-<semver>-<base64ish>` and never contain `/`, `\`, or spaces.
+HASH_RE = re.compile(r'\.hash\s*=\s*"(?P<hash>[A-Za-z0-9._-]+)"')
+
+
+def _printable(s: str) -> str:
+    """Strip non-printable characters before echoing untrusted
+    build.zig.zon content (urls, hashes) to stderr."""
+    return "".join(ch for ch in s if ch.isprintable())
+
+
 # Strip `// ...` line comments BUT NOT when the `//` sits inside a
 # string literal (e.g. inside a `.url = "git+https://..."`).  We walk
 # the text and only strip after we've confirmed we're outside an
@@ -164,13 +175,19 @@ def _parse_dep_entries(deps_block: str) -> List[Tuple[str, str, str | None]]:
     return out
 
 
-def _zon_path_for_hash(project_root: Path, zig_global_cache: Path, pkg_hash: str) -> Path | None:
+def _zon_path_for_hash(
+    project_root: Path, zig_global_cache: Path, pkg_hash: str
+) -> Path | None:
     """Return the cached `build.zig.zon` path for a given package hash,
     or None if neither cache has it.  Zig extracts dependencies into
     `<project>/zig-pkg/<pkg_hash>/` (project-local) and stores tarballs
     in `$ZIG_GLOBAL_CACHE_DIR/p/<pkg_hash>.tar.gz` (global).  Only the
     project-local extraction has a usable `build.zig.zon` on disk —
     we don't want to untar the global cache here."""
+    # Belt-and-braces with HASH_RE: never let a hash escape the cache
+    # directory via path separators or parent-dir traversal.
+    if "/" in pkg_hash or ".." in pkg_hash:
+        return None
     candidate = project_root / "zig-pkg" / pkg_hash / "build.zig.zon"
     if candidate.exists():
         return candidate
@@ -180,7 +197,9 @@ def _zon_path_for_hash(project_root: Path, zig_global_cache: Path, pkg_hash: str
     return None
 
 
-def collect_transitive(root_zon: Path, zig_global_cache: Path) -> Dict[str, Set[Tuple[str, str | None]]]:
+def collect_transitive(
+    root_zon: Path, zig_global_cache: Path
+) -> Dict[str, Set[Tuple[str, str | None]]]:
     """Walk the project's dependency graph.  Returns a map
     name -> set of (hash, url) seen across the transitive closure."""
     project_root = root_zon.parent
@@ -207,7 +226,9 @@ def collect_transitive(root_zon: Path, zig_global_cache: Path) -> Dict[str, Set[
     return result
 
 
-def find_diamonds(graph: Dict[str, Set[Tuple[str, str | None]]]) -> List[Tuple[str, List[Tuple[str, str | None]]]]:
+def find_diamonds(
+    graph: Dict[str, Set[Tuple[str, str | None]]],
+) -> List[Tuple[str, List[Tuple[str, str | None]]]]:
     """Return [(name, [(hash, url), ...]), ...] for every package name
     that appears with more than one distinct hash."""
     diamonds: List[Tuple[str, List[Tuple[str, str | None]]]] = []
@@ -221,7 +242,9 @@ def main(argv: List[str]) -> int:
     project_root = Path(argv[1]).resolve() if len(argv) >= 2 else Path.cwd()
     zon = project_root / "build.zig.zon"
     if not zon.exists():
-        print(f"detect-diamond-deps: no build.zig.zon at {project_root}", file=sys.stderr)
+        print(
+            f"detect-diamond-deps: no build.zig.zon at {project_root}", file=sys.stderr
+        )
         return 2
 
     cache_env = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
@@ -251,10 +274,10 @@ def main(argv: List[str]) -> int:
     print("detect-diamond-deps: DIAMOND DEPS DETECTED", file=sys.stderr)
     print("", file=sys.stderr)
     for name, pinned in diamonds:
-        print(f"  {name}:", file=sys.stderr)
+        print(f"  {_printable(name)}:", file=sys.stderr)
         for h, url in pinned:
-            tail = f"  ({url})" if url else ""
-            print(f"    - {h}{tail}", file=sys.stderr)
+            tail = f"  ({_printable(url)})" if url else ""
+            print(f"    - {_printable(h)}{tail}", file=sys.stderr)
     print("", file=sys.stderr)
     print(
         "Resolve by bumping every transitive consumer to the same hash.\n"
