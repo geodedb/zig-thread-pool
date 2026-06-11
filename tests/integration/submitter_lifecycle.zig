@@ -127,6 +127,82 @@ test "PERF-NEW-03: releaseSubmitter drain loses no tasks (drain shutdown + stats
     try std.testing.expectEqual(@as(u64, 32), stats.submitted);
 }
 
+// GAP-0038 / AP-03 (#94): cross-thread releaseSubmitter must not strand the
+// slot's per-submitter DescCache. Thread A registers a submitter and submits
+// a few tasks through it (the first descriptor acquire on the slot refills
+// the per-submitter cache with a batch, so the cache is warm with reserved
+// indices), then joins WITHOUT releasing — the coordinator (main thread)
+// releases the slot cross-thread. Pre-fix, the TLS-guarded drain was skipped
+// for non-owner callers, leaving the cached descriptors counted in
+// task_desc_live forever (deinitOwned drains worker caches but not
+// per-submitter caches). Post-fix, the cross-thread fallback drain returns
+// them to the global freelist.
+test "GAP-0038: cross-thread releaseSubmitter drains the per-submitter desc cache" {
+    const gpa = std.testing.allocator;
+    var pool = try thread_pool.ThreadPool.init(gpa, .{
+        .max_threads = 2,
+        .queue_capacity = 128,
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 2,
+        .submitter_queue_capacity = 64,
+    });
+    defer pool.deinit();
+
+    var hit = std.atomic.Value(u32).init(0);
+    // registerSubmitter returns the slot index to the registering thread;
+    // hand it to the coordinator through a shared atomic.
+    var slot_out = std.atomic.Value(usize).init(std.math.maxInt(usize));
+
+    const Submitter = struct {
+        fn bump(raw: *anyopaque, _: *thread_pool.TaskContext) void {
+            const counter: *std.atomic.Value(u32) = @ptrCast(@alignCast(raw));
+            _ = counter.fetchAdd(1, .release);
+        }
+
+        fn run(
+            p: *thread_pool.ThreadPool,
+            counter: *std.atomic.Value(u32),
+            slot: *std.atomic.Value(usize),
+        ) !void {
+            const idx = try p.registerSubmitter();
+            slot.store(idx, .release);
+            // 8 submits: the first acquire pulls a batch into the
+            // per-submitter DescCache, the next 7 pop from it — the cache
+            // stays warm (non-empty) when this thread parks.
+            for (0..8) |_| {
+                _ = try p.submit(bump, @ptrCast(counter), .{});
+            }
+            // Intentionally NO releaseSubmitter here: the coordinator
+            // releases the slot cross-thread after join (quiescent slot).
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, Submitter.run, .{ &pool, &hit, &slot_out });
+    t.join();
+
+    const idx = slot_out.load(.acquire);
+    try std.testing.expect(idx != std.math.maxInt(usize));
+
+    // Cross-thread release: main never registered, so the TLS guard does not
+    // match and the #94 fallback drain must run.
+    pool.releaseSubmitter(idx);
+
+    try pool.shutdown(.drain, 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u32, 8), hit.load(.acquire));
+
+    const stats = pool.statsSnapshot();
+    try std.testing.expectEqual(stats.submitted, stats.completed + stats.cancelled);
+    try std.testing.expectEqual(@as(u64, 8), stats.submitted);
+
+    // Drain per-WORKER caches (test accessor mirrors the deinit-time drain)
+    // so the only thing that could keep task_desc_live nonzero is the
+    // per-SUBMITTER cache — which the cross-thread fallback must have
+    // drained. Pre-fix this assertion fails with task_desc_live > 0.
+    pool.drainWorkerDescCachesForTesting();
+    const stats_after = pool.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats_after.task_desc_live);
+}
+
 // Defense-in-depth (paired with the validate() ceiling added alongside the
 // init fix): values above the bitmap cap surface as a typed error rather than
 // being silently clamped. `normalized()` still clamps for the public init

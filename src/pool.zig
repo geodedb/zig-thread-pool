@@ -898,6 +898,15 @@ const Core = struct {
         return .{ .submitted = submitted };
     }
 
+    /// Register the CALLING thread as a dedicated submitter and return its
+    /// slot index.
+    ///
+    /// Owner-thread contract (GAP-0038 / AP-03, #94): a submitter slot is
+    /// bound to the registering thread via thread-local state. The slot MUST
+    /// be released by the SAME thread that registered it, with the slot
+    /// quiescent (no in-flight submit on it). Cross-thread release is
+    /// unsupported — see `releaseSubmitter` for the precise failure mode and
+    /// the best-effort fallback behaviour.
     pub fn registerSubmitter(self: *Core) !usize {
         while (true) {
             const mask = self.submitter_free_mask.load(.acquire);
@@ -912,6 +921,17 @@ const Core = struct {
         }
     }
 
+    /// Release a submitter slot previously returned by `registerSubmitter`.
+    ///
+    /// Owner-thread contract (GAP-0038 / AP-03, #94): the slot must be
+    /// released by the SAME thread that registered it, with the slot
+    /// quiescent (no in-flight submit on it). Cross-thread release is
+    /// unsupported: the library performs a best-effort drain of the slot's
+    /// descriptor cache so cached descriptors are not stranded, but the
+    /// registrant's thread-local fast-path reference CANNOT be cleared from
+    /// another thread — the original owner must not submit through this pool
+    /// after a cross-thread release, or it will race the slot's next
+    /// registrant on the per-submitter cache and queue.
     pub fn releaseSubmitter(self: *Core, idx: usize) void {
         // F-005: bounds-check — idx must be within the allocated submitter
         // queue slice. An out-of-range idx is silently ignored; the caller
@@ -955,6 +975,28 @@ const Core = struct {
                 self.releaseDescriptor(buf[i]);
             }
             tls_submitter_slot = .{};
+        } else if ((self.submitter_free_mask.load(.acquire) & bit) == 0) {
+            // Cross-thread release (unsupported per the owner-thread
+            // contract documented above — GAP-0038 / AP-03, #94): best-effort
+            // drain so cached descriptors are not stranded, which would leave
+            // task_desc_live nonzero forever (deinitOwned drains worker
+            // caches but not per-submitter caches). The registrant's TLS
+            // fast-path reference cannot be cleared from here; the contract
+            // forbids the registrant submitting after a cross-thread release.
+            // If the caller violates quiescence (owner still submitting on
+            // this slot), this drain races the owner's concurrent tryPop on
+            // the SPSC cache — the fallback is best-effort under contract
+            // violation, not a safety guarantee. The free-mask check above
+            // skips the drain when the slot is already free (double release),
+            // so we never touch a cache a new registrant may have claimed;
+            // the CAS loop below bails idempotently in that case.
+            const cache = &self.desc_caches[idx];
+            var buf: [DescCache.capacity]u32 = undefined;
+            const n = cache.drainAll(&buf);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                self.releaseDescriptor(buf[i]);
+            }
         }
 
         while (true) {
@@ -2713,10 +2755,27 @@ pub const ThreadPool = struct {
         return result;
     }
 
+    /// Register the CALLING thread as a dedicated submitter and return its
+    /// slot index. Gives that thread a private submission queue and
+    /// descriptor cache for higher submit throughput.
+    ///
+    /// Owner-thread contract (#94): the slot is bound to the registering
+    /// thread via thread-local state and MUST be released by that same
+    /// thread, with the slot quiescent (no in-flight submit on it). See
+    /// `releaseSubmitter`.
     pub fn registerSubmitter(self: *ThreadPool) !usize {
         return self.core.registerSubmitter();
     }
 
+    /// Release a submitter slot previously returned by `registerSubmitter`.
+    ///
+    /// Owner-thread contract (#94): must be called by the SAME thread that
+    /// registered the slot, with the slot quiescent (no in-flight submit on
+    /// it). Cross-thread release is unsupported — the library performs a
+    /// best-effort drain of the slot's descriptor cache so descriptors are
+    /// not stranded, but the original owner's thread-local fast-path
+    /// reference cannot be cleared remotely, so the owner must not submit
+    /// through this pool afterward.
     pub fn releaseSubmitter(self: *ThreadPool, idx: usize) void {
         self.core.releaseSubmitter(idx);
     }
