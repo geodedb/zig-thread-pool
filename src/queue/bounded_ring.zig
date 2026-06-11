@@ -1,3 +1,9 @@
+//! Lock-free bounded MPMC ring queue used as the pool-wide inject queue.
+//!
+//! Implements the Vyukov two-lock-free design: each slot carries a sequence counter so
+//! producers and consumers can claim slots without a global lock. Buffer size must be a
+//! power of 2. Multiple producers call `tryPush`; multiple consumers call `pop`.
+
 const std = @import("std");
 
 /// Lock-free bounded MPMC queue (Vyukov design).

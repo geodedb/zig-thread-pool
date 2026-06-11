@@ -1,3 +1,10 @@
+//! Per-worker latency histogram collected during task execution.
+//!
+//! Each worker owns one `LatencyHistogram`; `observe` is called only by that worker.
+//! Fields are atomic so `merge` (called from `statsSnapshot` on any thread) can read
+//! them concurrently without a lock. `merge` accumulates per-worker histograms into a
+//! pool-wide aggregate for the stats snapshot.
+
 const std = @import("std");
 const types = @import("../types.zig");
 

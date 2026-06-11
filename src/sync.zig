@@ -17,14 +17,17 @@ inline fn io() std.Io {
 pub const Mutex = struct {
     inner: std.Io.Mutex = .init,
 
+    /// Blocks until the mutex is acquired (uncancelable).
     pub fn lock(self: *Mutex) void {
         self.inner.lockUncancelable(io());
     }
 
+    /// Releases the mutex. Must be called by the thread that holds it.
     pub fn unlock(self: *Mutex) void {
         self.inner.unlock(io());
     }
 
+    /// Attempts to acquire the mutex without blocking. Returns `true` on success.
     pub fn tryLock(self: *Mutex) bool {
         return self.inner.tryLock();
     }
@@ -39,12 +42,14 @@ pub const Condition = struct {
         signals: u16,
     };
 
+    /// Atomically releases `m` and blocks until signalled. Reacquires `m` before returning.
     pub fn wait(self: *Condition, m: *Mutex) void {
         self.waitInner(m, .none) catch |err| switch (err) {
             error.Timeout => unreachable,
         };
     }
 
+    /// Like `wait` but returns `error.Timeout` if `timeout_ns` elapses before a signal.
     pub fn timedWait(self: *Condition, m: *Mutex, timeout_ns: u64) error{Timeout}!void {
         return self.waitInner(m, .{ .duration = .{
             .raw = .fromNanoseconds(@intCast(timeout_ns)),
@@ -101,6 +106,7 @@ pub const Condition = struct {
         return error.Timeout;
     }
 
+    /// Wakes at most one waiter blocked in `wait` or `timedWait`.
     pub fn signal(self: *Condition) void {
         var prev_state = self.state.load(.monotonic);
         while (prev_state.waiters > prev_state.signals) {
@@ -115,6 +121,7 @@ pub const Condition = struct {
         }
     }
 
+    /// Wakes all waiters blocked in `wait` or `timedWait`.
     pub fn broadcast(self: *Condition) void {
         var prev_state = self.state.load(.monotonic);
         while (prev_state.waiters > prev_state.signals) {
@@ -133,10 +140,12 @@ pub const Condition = struct {
 pub const Semaphore = struct {
     inner: std.Io.Semaphore = .{},
 
+    /// Blocks until the semaphore count is greater than zero, then decrements it (uncancelable).
     pub fn wait(self: *Semaphore) void {
         self.inner.waitUncancelable(io());
     }
 
+    /// Increments the semaphore count, waking one waiter if any are blocked.
     pub fn post(self: *Semaphore) void {
         self.inner.post(io());
     }

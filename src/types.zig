@@ -1,3 +1,9 @@
+//! Public API types for `thread-pool`: `Config`, `Stats`, enums, error sets, and handles.
+//!
+//! All types here are data-only (no I/O, no thread spawning). Validation invariants for
+//! `Config` live in `Config.validate`; callers must invoke it before passing a config to
+//! `ThreadPool.init` or `Core.init`.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const sync = @import("sync.zig");

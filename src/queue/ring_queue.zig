@@ -1,3 +1,11 @@
+//! Lock-free SPMC ring queue: per-worker local queue for the `work_stealing` and
+//! `lane_extension` scheduler variants.
+//!
+//! Single producer (owner thread) pushes and pops from `tail` (LIFO). Any thread may
+//! steal from `head` in batches via a seq_cst CAS. The batch-steal CAS is the
+//! linearization point; stealers copy slots before the CAS and discard on loss. Buffer
+//! size must be a power of 2.
+
 const std = @import("std");
 
 /// Lock-free SPMC ring queue modelled after Tokio's

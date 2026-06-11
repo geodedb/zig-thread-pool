@@ -16,11 +16,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Returns a monotonic nanosecond timestamp (CLOCK_MONOTONIC on Linux, equivalent on
+/// other platforms). Safe to call from any thread; does not require an async runtime.
 pub fn nanoTimestamp() i96 {
     const io = std.Io.Threaded.global_single_threaded.io();
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
+/// Sleeps the calling thread for at least `nanoseconds`. Uncancelable; restarts on
+/// EINTR. Does not require any async state.
 pub fn sleep(nanoseconds: u64) void {
     if (builtin.os.tag == .windows) {
         // Negative DelayInterval = relative in 100ns units (NtDelayExecution

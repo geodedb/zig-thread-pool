@@ -1,3 +1,10 @@
+//! Process-wide memory sampling: RSS and private-byte usage on Linux, macOS, and Windows.
+//!
+//! `sample()` reads OS-specific memory stats and returns a `ProcessMemoryStats` snapshot.
+//! All paths are process-scoped (not pool-scoped). A monotonic `private_peak_observed`
+//! tracks the high-water mark across samples because the kernel provides no built-in
+//! anonymous-RSS peak counter on Linux (GAP-0031, #17).
+
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../types.zig");

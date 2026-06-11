@@ -1,3 +1,13 @@
+//! Per-worker scratch allocator and pool-wide memory accounting.
+//!
+//! `WorkerScratch` is single-thread-owned: `beginTask`, `alloc`, and `finishTask` are
+//! lock-free on the owning worker's task path. `purge` acquires `purge_mutex` to
+//! serialize with external quiescent purge callers; it must only be called when the pool
+//! is quiescent (`active_tasks == 0 && queued_tasks == 0`) or from the idle path.
+//!
+//! `Accounting` holds shared atomic counters updated by all workers; reads are unsynchronized
+//! point-in-time snapshots safe for stats collection.
+
 const std = @import("std");
 const sync = @import("../sync.zig");
 

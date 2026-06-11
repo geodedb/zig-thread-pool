@@ -1,3 +1,11 @@
+//! SPSC descriptor-index cache for a single submitter or worker thread.
+//!
+//! Single-writer, single-reader: only one thread touches a `DescCache` at a time.
+//! No atomic operations are used on the push/pop/drain path; the invariant is enforced
+//! by higher-level exclusion (TLS slot ownership for submitters; release CAS for drain).
+//! Capacity is 32 entries (LIFO). Drain-on-release and drain-on-deinit preserve the
+//! `task_desc_live == 0` quiescence invariant.
+
 const std = @import("std");
 
 /// SPSC descriptor cache. The owner (submitter or worker thread) is the

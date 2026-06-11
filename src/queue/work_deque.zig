@@ -1,3 +1,9 @@
+//! Lock-free Chase-Lev work-stealing deque (legacy `queue_kind = .chase_lev` path).
+//!
+//! Owner thread pushes and pops from `bottom` (LIFO). Stealers pop single items from
+//! `top` via a seq_cst CAS. Batch-steal is NOT supported; the default work-stealing
+//! path uses `RingQueue` which provides a correct `stealHalf`.
+
 const std = @import("std");
 
 /// Lock-free Chase-Lev work-stealing deque.

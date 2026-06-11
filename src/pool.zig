@@ -1,3 +1,15 @@
+//! Core scheduler module: `ThreadPool` public facade, `Core` engine, and `Worker` loop.
+//!
+//! Descriptor lifecycle: `free → reserved → queued → running → completed|cancelled → free`.
+//! Generation tags embedded in each `QueueEntry` reject stale queue entries from prior
+//! descriptor generations, preventing double-dispatch on recycle.
+//!
+//! The park/unpark handshake uses seq_cst fences so that a parked worker never misses a
+//! submission that arrived after the idle check but before the futex wait.
+//!
+//! See `docs/DESIGN.md` for the full scheduler design, descriptor lifecycle diagram, and
+//! wake-coalescing strategy.
+
 const std = @import("std");
 const build_options = @import("build_options");
 /// otel observability seam. Comptime-no-op when -Dwith_otel=false; the
@@ -901,6 +913,8 @@ const Core = struct {
         }
     }
 
+    /// Engine implementation of `ThreadPool.deinit`; see wrapper docs for the public contract.
+    /// Initiates a draining shutdown, joins all workers, then releases every owned allocation.
     pub fn deinit(self: *Core) void {
         self.shutdown(.drain, self.config.deinit_timeout_ns) catch {
             std.log.warn("thread-pool deinit timed out after {d}ms with {d} active tasks and {d} queued", .{
@@ -913,10 +927,14 @@ const Core = struct {
         self.deinitOwned();
     }
 
+    /// Engine implementation of `ThreadPool.trySubmit`; never blocks regardless of the
+    /// backpressure policy. Returns `error.QueueFull` or `error.TaskPoolExhausted` immediately.
     pub fn trySubmit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         return self.submitInternal(task_fn, ctx, options, false);
     }
 
+    /// Engine implementation of `ThreadPool.submit`; see wrapper docs for the public contract.
+    /// Honors `options.backpressure` (blocking policies permitted).
     pub fn submit(self: *Core, task_fn: TaskFn, ctx: *anyopaque, options: types.SubmitOptions) SubmitError!types.TaskHandle {
         return self.submitInternal(task_fn, ctx, options, true);
     }
@@ -1147,6 +1165,9 @@ const Core = struct {
         // Note: free_mask bit was already set by the CAS above.
     }
 
+    /// Engine implementation of `ThreadPool.wait`; see wrapper docs for the public contract.
+    /// Blocks under `completion_mutex` until the descriptor reaches `.completed` or `.cancelled`,
+    /// then releases the descriptor back to the freelist.
     pub fn wait(self: *Core, handle: types.TaskHandle) WaitError!void {
         if (!handle.isValid()) return error.InvalidHandle;
         if (handle.index >= self.descriptors.len) return error.InvalidHandle;
@@ -1186,6 +1207,8 @@ const Core = struct {
         }
     }
 
+    /// Engine implementation of `ThreadPool.waitGroup`; see wrapper docs for the public contract.
+    /// Asserts the pool is still running (handing out a WaitGroup while shutting down is a bug).
     pub fn waitGroup(self: *Core) types.WaitGroup {
         // Q-026 (#60): `WaitGroup` is a free-standing synchronisation
         // object, so construction needs no pool state. The instance method
@@ -1197,6 +1220,9 @@ const Core = struct {
         return .{};
     }
 
+    /// Engine implementation of `ThreadPool.shutdown`; see wrapper docs for the public contract.
+    /// Swaps pool state to `.shutdown_requested`, optionally cancels queued tasks, then waits
+    /// for all workers to drain before joining them.
     pub fn shutdown(self: *Core, mode: types.ShutdownMode, timeout_ns: ?u64) ShutdownError!void {
         const old_state = self.state.swap(.shutdown_requested, .acq_rel);
         if (old_state != .running) {
@@ -1346,6 +1372,9 @@ const Core = struct {
         };
     }
 
+    /// Engine implementation of `ThreadPool.statsSnapshot`; see wrapper docs for the public contract.
+    /// Merges per-worker latency histograms and atomic counters into a single `Stats` value.
+    /// Worker stats are unsynchronized point-in-time reads — values may be approximate under load.
     pub fn statsSnapshot(self: *Core) types.Stats {
         var aggregate_wakeups: u64 = 0;
         var aggregate_started: u64 = 0;
@@ -1472,6 +1501,8 @@ const Core = struct {
         };
     }
 
+    /// Engine implementation of `ThreadPool.purgeWorkerCaches`; see wrapper docs for the public contract.
+    /// Returns `error.PoolBusy` unless both `active_tasks` and `queued_tasks` are zero.
     pub fn purgeWorkerCaches(self: *Core) !void {
         if (self.counters.active_tasks.load(.acquire) != 0) return error.PoolBusy;
         if (self.totalQueuedTasks() != 0) return error.PoolBusy;
