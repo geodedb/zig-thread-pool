@@ -233,7 +233,7 @@ def find_diamonds(
     that appears with more than one distinct hash."""
     diamonds: List[Tuple[str, List[Tuple[str, str | None]]]] = []
     for name, pinned in graph.items():
-        if len({h for (h, _u) in pinned}) > 1:
+        if len({h for (h, _) in pinned}) > 1:
             diamonds.append((name, sorted(pinned)))
     return sorted(diamonds, key=lambda x: x[0])
 
