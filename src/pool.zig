@@ -232,7 +232,13 @@ const TaskDescriptor = struct {
     task_fn: ?TaskFn = null,
     ctx: ?*anyopaque = null,
     options: types.SubmitOptions = .{},
-    generation: u64 = 0,
+    /// GAP-0037 / AP-02: atomic because it is read locklessly by
+    /// `runTask`'s stale-entry filter, `cancelDescriptor`, and `wait()`
+    /// while `acquireDescriptor`/`acquireDescriptorBatch` rewrite it
+    /// during slot re-acquisition. The state CAS remains the dispatch
+    /// arbiter; this is a pre-filter, but the acquire/release pairing
+    /// removes the formal data race (mirrors the F-003 free_indices fix).
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     // === Cold fields (metrics/observability only) ===
     submit_ns: u64 = 0,
@@ -1006,7 +1012,7 @@ const Core = struct {
 
         while (true) {
             const descriptor = &self.descriptors[handle.index];
-            if (descriptor.generation != handle.generation) return error.InvalidHandle;
+            if (descriptor.generation.load(.acquire) != handle.generation) return error.InvalidHandle;
             switch (descriptor.state.load(.acquire)) {
                 .completed, .cancelled => {
                     // SEC-018 (F-008): use a CAS to drive the
@@ -1412,7 +1418,9 @@ const Core = struct {
         descriptor.complete_ns = 0;
         descriptor.state.store(.queued, .release);
 
-        const entry = packEntry(descriptor_index, descriptor.generation);
+        // Owner-only read: this thread acquired the slot via
+        // acquireDescriptor (which wrote generation), so .monotonic is safe.
+        const entry = packEntry(descriptor_index, descriptor.generation.load(.monotonic));
         var queued = false;
 
         if (options.lane == .blocking) {
@@ -1488,7 +1496,7 @@ const Core = struct {
         return if (options.waitable)
             .{
                 .index = descriptor_index,
-                .generation = descriptor.generation,
+                .generation = descriptor.generation.load(.monotonic),
                 .waitable = true,
             }
         else
@@ -1961,7 +1969,7 @@ const Core = struct {
         // Stale-entry filter — see `QueueEntry` doc. Reject entries whose
         // generation tag predates the descriptor's current generation, so
         // a recycled slot cannot be double-dispatched through the state CAS.
-        if (@as(u32, @truncate(descriptor.generation)) != entry_gen) {
+        if (@as(u32, @truncate(descriptor.generation.load(.acquire))) != entry_gen) {
             return;
         }
 
@@ -2299,7 +2307,7 @@ const Core = struct {
         const descriptor = &self.descriptors[descriptor_index];
         // Stale-entry filter (matches runTask): entry predates current
         // generation → silently drop without decrementing.
-        if (@as(u32, @truncate(descriptor.generation)) != entry_gen) {
+        if (@as(u32, @truncate(descriptor.generation.load(.acquire))) != entry_gen) {
             return;
         }
         // Gate with the same state CAS pattern runTask uses. A duplicate
@@ -2339,10 +2347,14 @@ const Core = struct {
                 continue;
             }
             var descriptor = &self.descriptors[head];
-            const prev_generation = descriptor.generation;
+            // Load BEFORE the struct reset (reset re-inits generation to 0),
+            // store AFTER with .release so lockless readers of the new
+            // generation also observe the reset fields.
+            const prev_generation = descriptor.generation.load(.monotonic);
             descriptor.* = .{};
-            descriptor.generation = prev_generation +% 1;
-            if (descriptor.generation == 0) descriptor.generation = 1;
+            var next_gen = prev_generation +% 1;
+            if (next_gen == 0) next_gen = 1;
+            descriptor.generation.store(next_gen, .release);
             if (claim_sentinel_enabled) {
                 descriptor.claimed_by.store(-1, .release);
             }
@@ -2386,10 +2398,13 @@ const Core = struct {
             }
             for (out[0..taken]) |idx| {
                 const descriptor = &self.descriptors[idx];
-                const prev_generation = descriptor.generation;
+                // Same ordering discipline as acquireDescriptor: load before
+                // the reset, .release store after.
+                const prev_generation = descriptor.generation.load(.monotonic);
                 descriptor.* = .{};
-                descriptor.generation = prev_generation +% 1;
-                if (descriptor.generation == 0) descriptor.generation = 1;
+                var next_gen = prev_generation +% 1;
+                if (next_gen == 0) next_gen = 1;
+                descriptor.generation.store(next_gen, .release);
                 if (claim_sentinel_enabled) descriptor.claimed_by.store(-1, .release);
                 descriptor.state.store(.reserved, .release);
             }
