@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64-slot success, 1-slot boundary, and `validate()` rejection above the
   bitmap cap. Exercise the full optimisation matrix.
 
-## [0.1.0] - YYYY-MM-DD
+## [0.1.0] - 2026-04-11
 
 ### Added
 

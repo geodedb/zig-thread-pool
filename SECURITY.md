@@ -4,11 +4,12 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
+| < 0.2   | :x:                |
 
 ## Reporting a Vulnerability
 
-**Please do not report security vulnerabilities through public GitHub issues.**
+**Please do not report security vulnerabilities through public GitLab issues.**
 
 Instead, please report them via email to: <security@codepros.dev>
 
@@ -40,7 +41,7 @@ Please include:
 This project implements:
 
 - **Memory Safety**: Zig's compile-time memory safety checks
-- **No Undefined Behavior**: Strict adherence to defined semantics
+- **Memory-safe on tier-1 targets** (x86_64/aarch64 Linux): TSan- and fuzz-clean on `main`; remaining portability caveats for 32-bit/weak-memory targets are tracked in `docs/GAP_ANALYSIS.md`
 - **Dependency Scanning**: Automated security scanning in CI
 - **Secret Detection**: Gitleaks scanning for leaked credentials
 
