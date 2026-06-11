@@ -1,6 +1,6 @@
 # Performance Gap Analysis
 
-Last updated: 2026-06-11
+Last updated: 2026-06-11 (remediation pass)
 
 ## Summary
 
@@ -157,13 +157,13 @@ Input: `.cache/audit/perf-reviewed.json` (23 findings; P0=1, P1=9, P2=10, P3=3).
 
 Fresh code-level scan at commit `39528a3`. Findings verified against source before filing. All issues on GitLab `devnw/zig/thread-pool`. Throughput micro-opts that target the 3 plateau-resistant contended/nested scenarios (`contended_spawn_8x`, `contended_cpu_10us`, `nested_fanout_4x`) are filed at `status::triage` for the maintainer to re-triage against the plateau-pivot rule; each carries a strict A/B-gate instruction.
 
-### Top 5 Risks (2026-06-11 cohort, by PerfScore)
+### Top 5 Risks (2026-06-11 cohort, by PerfScore — post-remediation)
 
 1. **PERF-NEW-05** (PerfScore 80, confirmed) -- harness pays 3x `nowNs()`/task, suppressing `flood_1m`/`contended_spawn_8x` throughput 30-50% vs `-Dtimestamp-mode=disabled`. **Folded into #36** (methodology tracker), not a standalone issue.
-2. **PERF-NEW-01** (PerfScore 48, suspected) -- `BoundedRing.Slot` 16B → 4 slots/cacheline MPMC false sharing on the inject/submitter rings. Default-path, always paid under contention. Est 5-15% on `contended_spawn_8x`. #116.
-3. **PERF-NEW-10** (PerfScore 48, suspected) -- `-Dworker-desc-cache` comptime opt-out (the favoured next Go-gap attack): reclaim Phase-2's ~1.33M ops/s contended ceiling for multi-submitter workloads. Enhancement. #125.
-4. **PERF-NEW-02** (PerfScore 40, confirmed) -- 8 single-writer observability counters use `.release` where `.monotonic` suffices; ~8 redundant fences/task on ARM64 (x86 ~zero). Est 2-5% CPU-bound on ARM. #99.
-5. **PERF-NEW-09** (PerfScore 40, confirmed-code/suspected-impact) -- `finalizeTask` unconditional `nowNs()`+store survives `-Dtimestamp-mode=disabled`; ~20-30ns/task dead work. #124.
+2. **PERF-NEW-01** (PerfScore 48, suspected) -- `BoundedRing.Slot` 16B → 4 slots/cacheline MPMC false sharing on the inject/submitter rings. Default-path, always paid under contention. Est 5-15% on `contended_spawn_8x`. #116. **Open.**
+3. **PERF-NEW-10** (PerfScore 48, suspected) -- `-Dworker-desc-cache` comptime opt-out (the favoured next Go-gap attack): reclaim Phase-2's ~1.33M ops/s contended ceiling for multi-submitter workloads. Enhancement. #125. **Open.**
+4. ~~**PERF-NEW-02**~~ (PerfScore 40) — **Resolved 2026-06-11 (791604c)**; 8 counter sites `.release`→`.monotonic`.
+5. ~~**PERF-NEW-09**~~ (PerfScore 40) — **Resolved 2026-06-11 (791604c)**; `finalizeTask` guard comptime-foldable.
 
 ### Stack-ranked (2026-06-11 cohort)
 
@@ -172,17 +172,17 @@ Fresh code-level scan at commit `39528a3`. Findings verified against source befo
 | 1 | P1 | 80 | PERF-NEW-05 | Harness pays 3x `nowNs()`/task (methodology) | bench | `common.zig:312,331,405,419` | bench-realistic ± `-Dtimestamp-mode=disabled` | [#36](https://gitlab.com/devnw/zig/thread-pool/-/work_items/36) | Pin disabled mode for throughput; sample latency | @benjiv | Within sprint | Folded into #36 |
 | 2 | P2 | 48 | PERF-NEW-01 | BoundedRing `Slot` 16B → 4 slots/line false sharing | queue | `bounded_ring.zig:11-14` | `perf c2c` on Slot range; padded-slot A/B | [#116](https://gitlab.com/devnw/zig/thread-pool/-/work_items/116) | Pad Slot to cache line (A/B gated; +48B/slot) | @benjiv | Next quarter | Open |
 | 3 | P2 | 48 | PERF-NEW-10 | `-Dworker-desc-cache` comptime opt-out (enhancement) | concurrency | `pool.zig:1351,1357,2482` | `-Dworker-desc-cache=false` A/B on contended_* | [#125](https://gitlab.com/devnw/zig/thread-pool/-/work_items/125) | void-field comptime opt-out; default true | @benjiv | Next quarter | Open |
-| 4 | P2 | 40 | PERF-NEW-02 | Counters `.release` where `.monotonic` suffices (ARM) | stats | `pool.zig:1758,1883,2114,2179,2198,2210` | ARM64 bench + objdump stlr→str | [#99](https://gitlab.com/devnw/zig/thread-pool/-/work_items/99) | `.release` → `.monotonic` on 8 single-writer counters | @benjiv | Next quarter | Open |
-| 5 | P2 | 40 | PERF-NEW-09 | `finalizeTask` unconditional `nowNs()`+store survives elision | stats | `pool.zig:2103-2106` | disabled-mode A/B + objdump | [#124](https://gitlab.com/devnw/zig/thread-pool/-/work_items/124) | comptime-foldable guard for idle-purge timestamp | @benjiv | Next quarter | Open |
+| 4 | P2 | 40 | PERF-NEW-02 | Counters `.release` where `.monotonic` suffices (ARM) | stats | `pool.zig:1758,1883,2114,2179,2198,2210` | ARM64 bench + objdump stlr→str | [#99](https://gitlab.com/devnw/zig/thread-pool/-/work_items/99) | `.release` → `.monotonic` on 8 single-writer counters | @benjiv | Next quarter | **Resolved 2026-06-11 (791604c)** |
+| 5 | P2 | 40 | PERF-NEW-09 | `finalizeTask` unconditional `nowNs()`+store survives elision | stats | `pool.zig:2103-2106` | disabled-mode A/B + objdump | [#124](https://gitlab.com/devnw/zig/thread-pool/-/work_items/124) | comptime-foldable guard for idle-purge timestamp | @benjiv | Next quarter | **Resolved 2026-06-11 (791604c)** |
 | 6 | P2 | 36 | PERF-NEW-07 | TaskDescriptor 96B stride cross-descriptor false sharing | concurrency | `pool.zig:229-276,:649` | `perf c2c` across descriptor slab; align(cl) A/B | [#122](https://gitlab.com/devnw/zig/thread-pool/-/work_items/122) | `align(cache_line)` → 128B stride (A/B gated; +32B/desc) | @benjiv | Next quarter | Open |
 | 7 | P2 | 36 | PERF-NEW-08 | Steal victim `@ctz` convergence (wake rotates, steal doesn't) | scheduler | `pool.zig:1862-1864,1831-1834`; ref `:1515-1519` | steals/steal_failures ratio; 3-scenario A/B | [#123](https://gitlab.com/devnw/zig/thread-pool/-/work_items/123) | `rotr(mask, worker_index)` start offset (A/B gated) | @benjiv | Next quarter | Open |
-| 8 | P2 | 24 | PERF-NEW-03 | releaseSubmitter 1M-spin no backoff, then silent task drop | concurrency | `pool.zig:962-968` | stress: release vs stalled inject; spin-cycle count | [#117](https://gitlab.com/devnw/zig/thread-pool/-/work_items/117) | Bounded backoff + observable/re-push instead of drop | @benjiv | Next quarter | Open |
+| 8 | P2 | 24 | PERF-NEW-03 | releaseSubmitter 1M-spin no backoff, then silent task drop | concurrency | `pool.zig:962-968` | stress: release vs stalled inject; spin-cycle count | [#117](https://gitlab.com/devnw/zig/thread-pool/-/work_items/117) | Bounded backoff + observable/re-push instead of drop | @benjiv | Next quarter | **Resolved 2026-06-11 (29422be)** |
 | 9 | P3 | 16 | CI-NEW-01 | bench-regression + bench-micro rebuild executables independently | ci | `.gitlab-ci.yml:260-289` | perf-stage pipeline duration before/after | [#121](https://gitlab.com/devnw/zig/thread-pool/-/work_items/121) | Share `zig-out` artifact from `zig-build-0.16.0`; run prebuilt | @benjiv | Backlog | Open |
-| 10 | P3 | 12 | PERF-NEW-04 | `gitSha()` forks git subprocess per scenario (~168/run) | bench | `common.zig:262,471-488` | `strace -e execve` count rev-parse forks | [#119](https://gitlab.com/devnw/zig/thread-pool/-/work_items/119) | Hoist gitSha to main (compute once) | @benjiv | Backlog | Open |
+| 10 | P3 | 12 | PERF-NEW-04 | `gitSha()` forks git subprocess per scenario (~168/run) | bench | `common.zig:262,471-488` | `strace -e execve` count rev-parse forks | [#119](https://gitlab.com/devnw/zig/thread-pool/-/work_items/119) | Hoist gitSha to main (compute once) | @benjiv | Backlog | **Resolved 2026-06-11 (791604c)** |
 
 ### Advisory doc-note (no separate issue)
 
-**AP-01 -- monotonic clock for timeouts/wait.** `src/clock.zig:16` uses `std.Io.Clock.Timestamp.now(io, .real)` and `src/sync.zig:51` (`Condition.timedWait`) uses `.clock = .real`. The wall clock is subject to NTP steps / settime jumps; a backward step can over-shorten or over-lengthen a `timedWait`, and a forward step can corrupt elapsed-time deltas. **Recommendation:** switch both to `.awake` (monotonic). On Linux the vDSO path for `CLOCK_MONOTONIC` is the same fast path as `CLOCK_REALTIME`, so this is **zero hot-path cost** and strictly more correct than a saturating-subtraction workaround. Low risk; covered by existing timeout/park tests. Filed as a doc-note rather than an issue per audit scope.
+**AP-01 -- monotonic clock for timeouts/wait.** ~~`src/clock.zig:16` uses `std.Io.Clock.Timestamp.now(io, .real)` and `src/sync.zig:51` (`Condition.timedWait`) uses `.clock = .real`.~~ **Resolved 2026-06-11 (df3832a, #92):** both `src/clock.zig` and `src/sync.zig` now use `.awake` (monotonic); backward-step DoS eliminated. Saturating subtraction (`-|`) applied at pool.zig recordTaskStart/finalizeTask. Monotonicity regression test added.
 
 ### Findings by area (2026-06-11 cohort)
 
@@ -198,9 +198,9 @@ Fresh code-level scan at commit `39528a3`. Findings verified against source befo
 
 **Quick wins (< 1 day each)**
 
-- PERF-NEW-02 #99 -- `.release` → `.monotonic` on 8 counters (ARM; no x86 regression).
-- PERF-NEW-04 #119 -- hoist `gitSha()` to main.
-- AP-01 -- `.real` → `.awake` in clock.zig:16 + sync.zig:51.
+- ~~PERF-NEW-02 #99~~ -- **Resolved 2026-06-11 (791604c)**; `.release` → `.monotonic` on 8 counters.
+- ~~PERF-NEW-04 #119~~ -- **Resolved 2026-06-11 (791604c)**; `gitSha()` hoisted to main.
+- ~~AP-01~~ -- **Resolved 2026-06-11 (df3832a / #92)**; `.real` → `.awake` in clock.zig + sync.zig.
 
 **Medium (1-5 days each)**
 
@@ -208,7 +208,7 @@ Fresh code-level scan at commit `39528a3`. Findings verified against source befo
 - PERF-NEW-07 #122 -- `align(cache_line)` TaskDescriptor A/B.
 - PERF-NEW-08 #123 -- per-thief steal rotation A/B.
 - PERF-NEW-09 #124 -- comptime-foldable idle-purge timestamp.
-- PERF-NEW-03 #117 -- bounded backoff + observable drop in releaseSubmitter.
+- ~~PERF-NEW-03 #117~~ -- **Resolved 2026-06-11 (29422be)**; escalating backoff + cancelDescriptor on cap.
 - CI-NEW-01 #121 -- share `zig-out` artifact across perf jobs.
 - PERF-NEW-05 (#36) -- pin disabled mode for throughput scenarios.
 

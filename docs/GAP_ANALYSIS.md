@@ -1,6 +1,6 @@
 # GAP Analysis
 
-Last refreshed: 2026-06-11 (gap-sync: AppSec review `docs/APPSEC_REVIEW_2026-06-11_src.md` + security-review findings synced to GitLab; commit `39528a3`). Prior refresh 2026-04-16.
+Last refreshed: 2026-06-11 (remediation pass: 40+ gaps closed across security, quality, performance, and infra tracks; commit `791604c` and prior; see `docs/GAP_ANALYSIS_RESOLVED.md` for full 2026-06-11 section). Prior gap-sync: AppSec review `docs/APPSEC_REVIEW_2026-06-11_src.md` + security-review findings synced to GitLab; commit `39528a3`). Prior refresh 2026-04-16.
 
 This file mirrors the GitLab issue tracker at
 `devnw/zig/thread-pool`; the tracker is authoritative. Resolved gaps are
@@ -98,44 +98,27 @@ see the issue body for full detail.
 | BENCH-02 | Larger conn-churn RSS-plateau evidence | [#76](https://gitlab.com/devnw/zig/thread-pool/-/issues/76) | NotImplemented | No `conn_churn` scenario (cf. G-011) |
 | RISK-03 | Worker-local purge policy not tuned | [#82](https://gitlab.com/devnw/zig/thread-pool/-/issues/82) | Partial | `idle_purge_after_ns=5ms` default |
 | GAP-9001 | Lane extension (Slices L1-L4b) retroactive tracking | [#87](https://gitlab.com/devnw/zig/thread-pool/-/issues/87) | Partial | Absorbs LANE-L4c; feature shipped |
-| GAP-0036 | AP-01: wall-clock (`.real`) interval subtraction underflows on backward clock step → panic-DoS (safe builds) | [#92](https://gitlab.com/devnw/zig/thread-pool/-/issues/92) | NotImplemented | `src/clock.zig:14-17`; `src/pool.zig:2019,2113,2229,1617`; AppSec AP-01 (Medium) |
 
 ### Low severity (open)
 
 | Gap-ID | Title | Issue | Status | Evidence (summary) |
 | --- | --- | --- | --- | --- |
 | GAP-0027 | Scratch buffer not zeroed between tasks | [#33](https://gitlab.com/devnw/zig/thread-pool/-/issues/33) | NotImplemented | `src/memory/scratch.zig:61,70` |
-| GAP-0029 | SECURITY.md references GitHub issues on a GitLab project | [#37](https://gitlab.com/devnw/zig/thread-pool/-/issues/37) | NotImplemented | `SECURITY.md:11` |
-| GAP-0030 | CHANGELOG.md placeholder date | [#38](https://gitlab.com/devnw/zig/thread-pool/-/issues/38) | NotImplemented | `CHANGELOG.md:18` |
-| GAP-0034 | CODEOWNERS placeholder `@your-username` | [#39](https://gitlab.com/devnw/zig/thread-pool/-/issues/39) | NotImplemented | `CODEOWNERS:3` |
+| GAP-0031 | Linux `private_peak_bytes` reports current not peak (Windows RSS unimplemented) | [#17](https://gitlab.com/devnw/zig/thread-pool/-/issues/17) | Partial | `src/stats/process_memory.zig:57-58`; observed-peak tracking landed `7ab4358`; macOS/Windows contract alignment remains open |
 | SEC-014 | `decrementQueued` fetchSub underflow (CWE-682) | [#27](https://gitlab.com/devnw/zig/thread-pool/-/issues/27) | Partial | `src/pool.zig:1930` |
 | SEC-016 | `purgeWorkerCaches` TOCTOU (CWE-367) | [#29](https://gitlab.com/devnw/zig/thread-pool/-/issues/29) | Partial | `src/pool.zig:950-951` |
 | SEC-018 (#30) | `queue_capacity` non-pow2 on 32-bit bypasses validation (CWE-682) | [#30](https://gitlab.com/devnw/zig/thread-pool/-/issues/30) | Partial | `src/types.zig:216` — distinct from confidential SEC-018 (#23, closed 2026-04-16) |
-| SEC-020 | Unbounded CAS spin without `spinLoopHint` (CWE-400) | [#32](https://gitlab.com/devnw/zig/thread-pool/-/issues/32) | NotImplemented | `src/pool.zig:1816,1852` |
 | PERF-018 | CI reinstalls Zig each job (no cache) | [#42](https://gitlab.com/devnw/zig/thread-pool/-/issues/42) | NotImplemented | `.gitlab-ci.yml:214-222` |
 | PERF-025 | `submitInternal` backpressure backoff curve | [#44](https://gitlab.com/devnw/zig/thread-pool/-/issues/44) | NotImplemented | `src/pool.zig` `waitForCapacity` |
 | PERF-028 | `LatencyHistogram.bucketIndex` -> `@clz` | [#48](https://gitlab.com/devnw/zig/thread-pool/-/issues/48) | NotImplemented | `src/stats/latency.zig:80-88` |
 | PERF-030 | `WorkDeque` top/bottom false sharing | [#52](https://gitlab.com/devnw/zig/thread-pool/-/issues/52) | Partial | `src/queue/work_deque.zig` |
 | PERF-031 | No 4+ worker scenarios in CI-safe bench | [#54](https://gitlab.com/devnw/zig/thread-pool/-/issues/54) | NotImplemented | `benchmarks/bench.zig` |
-| Q-020 | `root.zig` version constant unreferenced | [#56](https://gitlab.com/devnw/zig/thread-pool/-/issues/56) | NotImplemented | `src/root.zig:18` |
-| Q-026 | `Core.waitGroup()` ignores `self` | [#60](https://gitlab.com/devnw/zig/thread-pool/-/issues/60) | NotImplemented | `src/pool.zig:741` |
-| Q-027 | Magic `0xFFFFFFFF` vs `free_sentinel` constant | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | Partial | `src/pool.zig` acquireDescriptor |
-| Q-028 | DESIGN.md calls inject queue "Mutex-protected" | [#65](https://gitlab.com/devnw/zig/thread-pool/-/issues/65) | NotImplemented | `docs/DESIGN.md:120` |
-| Q-029 | DESIGN.md says work-stealing "not currently lock-free" | [#67](https://gitlab.com/devnw/zig/thread-pool/-/issues/67) | NotImplemented | `docs/DESIGN.md:120` |
 | Q-030 | Duplicated `nowNs` / `Counter` / `updatePeak` | [#70](https://gitlab.com/devnw/zig/thread-pool/-/issues/70) | NotImplemented | `src/pool.zig` + `src/stats/latency.zig` |
 | CICD-03 | Automatic baseline benchmark refresh workflow | [#71](https://gitlab.com/devnw/zig/thread-pool/-/issues/71) | NotImplemented | `.gitlab-ci.yml` |
 | DESIGN-02 | Waitable dedicated completion pool | [#72](https://gitlab.com/devnw/zig/thread-pool/-/issues/72) | NotImplemented | `src/pool.zig` |
 | BENCH-01 | Validate scale-bench vs scheduled jobs | [#74](https://gitlab.com/devnw/zig/thread-pool/-/issues/74) | Partial | `benchmarks/scale_bench.zig` |
 | BENCH-03 | CSV export for bench results | [#78](https://gitlab.com/devnw/zig/thread-pool/-/issues/78) | NotImplemented | `benchmarks/compare.zig` |
-| RISK-06 | Alloc event histograms distinct from byte accounting | [#85](https://gitlab.com/devnw/zig/thread-pool/-/issues/85) | Partial | `Stats.total_alloc_count` scalar only; `PERFORMANCE_TARGETS.md:69` "emitted as 0" claim now stale |
-| GAP-0037 | AP-02: non-atomic `descriptor.generation` data race (ghost-duplicate window; 32-bit/weak-memory unsound) | [#93](https://gitlab.com/devnw/zig/thread-pool/-/issues/93) | NotImplemented | `src/pool.zig:235,1940,2318-2321,2365-2368`; AppSec AP-02; same class as fixed F-003 |
-| GAP-0038 | AP-03: cross-thread `releaseSubmitter` skips DescCache drain → SPSC double-use | [#94](https://gitlab.com/devnw/zig/thread-pool/-/issues/94) | NotImplemented | `src/pool.zig:904-974,936-947,1362-1373`; AppSec AP-03 |
-| GAP-0042 | NEW-CI-001: `.gitlab-ci.yml` floating `ubuntu:24.04` image tag (host-based jobs) | [#98](https://gitlab.com/devnw/zig/thread-pool/-/issues/98) | NotImplemented | `.gitlab-ci.yml:238`; relates SEC-008 (#20) |
-| GAP-0045 | INV-01: SECURITY.md supported-versions lists only 0.1.x (current 0.2.4) | [#100](https://gitlab.com/devnw/zig/thread-pool/-/issues/100) | NotImplemented | `SECURITY.md:5-7`; `build.zig.zon:3` |
-| GAP-0046 | INV-03: SECURITY.md "No Undefined Behavior" claim contradicted by AP-02 residual | [#101](https://gitlab.com/devnw/zig/thread-pool/-/issues/101) | NotImplemented | `SECURITY.md:43`; cf. GAP-0037 |
-| GAP-0047 | INV-07: `third_party/go` submodule tracks master, not a release tag | [#102](https://gitlab.com/devnw/zig/thread-pool/-/issues/102) | NotImplemented | `.gitmodules`; relates SEC-001 (#50) |
-| GAP-0054 | SR-NEW-01: Makefile/script fall back to gitignored `./zig-0.15.2/zig` (below min, LIVE) | [#103](https://gitlab.com/devnw/zig/thread-pool/-/issues/103) | NotImplemented | `Makefile:4`; `scripts/run-runtime-comparison.sh:39,60` |
-| GAP-0055 | SR-NEW-02: fuzz harness fuzzes only `work_stealing` happy paths | [#104](https://gitlab.com/devnw/zig/thread-pool/-/issues/104) | NotImplemented | `tests/fuzz/pool_fuzz.zig:21-30,117,129-185` |
+| RISK-06 | Alloc event histograms distinct from byte accounting | [#85](https://gitlab.com/devnw/zig/thread-pool/-/issues/85) | Partial | `Stats.total_alloc_count` scalar only; histogram work remains open (staleness note added `25665bb`) |
 
 ### Informational / Accepted
 
@@ -143,13 +126,42 @@ see the issue body for full detail.
 | --- | --- | --- | --- |
 | APPSEC-F008 | `-Dsingle-pool` comptime elision documented as unsafe with >1 pool | Accepted | `build.zig:36-43`, `src/pool.zig:17`, `CLAUDE.md` |
 | RISK-04 | Adaptive sizing | Accepted non-goal | Documented in DESIGN.md |
-| GAP-0039 | AP-04: `quantileScaled` u64 multiply overflows at ~1.8e15 observations | Open ([#95](https://gitlab.com/devnw/zig/thread-pool/-/issues/95)) | `src/stats/latency.zig:112`; widen to u128. ~58 yr at 1M tasks/s |
-| GAP-0040 | AP-05: `deinitOwned` doesn't drain per-submitter DescCaches → `task_desc_live` non-zero | Open ([#96](https://gitlab.com/devnw/zig/thread-pool/-/issues/96)) | `src/pool.zig:2479-2486,2504-2514`; counter/assertion only, no leak/UAF |
-| GAP-0041 | AP-06: version drift `root.zig` 0.2.1 vs `build.zig.zon` 0.2.4 | Open ([#97](https://gitlab.com/devnw/zig/thread-pool/-/issues/97)) | `src/root.zig:42`; relates Q-020 (#56), distinct (drift vs unreferenced) |
-| GAP-0056 | SR-NEW-03: no test for default `global_queue` + `registerSubmitter` + `submit` + `shutdown(.drain)` | Open ([#105](https://gitlab.com/devnw/zig/thread-pool/-/issues/105)) | `tests/fuzz/pool_fuzz.zig:21-30`; documented drain-hang foot-gun unguarded |
-| GAP-0057 | SR-NEW-04: `detect_diamond_deps.py` permissive hash regex → path traversal + stderr ANSI injection | Open ([#106](https://gitlab.com/devnw/zig/thread-pool/-/issues/106)) | `scripts/detect_diamond_deps.py:91,174-177,256-257`; dev/CI tool only |
 
-## Recently Resolved (2026-04-16 gap-closure sweep)
+## Recently Resolved (2026-06-11 remediation pass)
+
+Full resolution entries in `docs/GAP_ANALYSIS_RESOLVED.md`.
+
+| Gap-ID | Issue | Closure Commit | Notes |
+| --- | --- | --- | --- |
+| GAP-0036 / AP-01 | [#92](https://gitlab.com/devnw/zig/thread-pool/-/issues/92) | `df3832a` | `clock.zig` `.awake`; `sync.zig` timedWait `.awake`; `-\|` at `pool.zig` recordTaskStart/finalizeTask; monotonicity test |
+| Q-NEW-02 / Q-025 | [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) / [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) | `01d7f6a` | submitBatch rejects waitable with `error.WaitableUnsupported`; wrapper doc fixed; "atomically" claim removed |
+| PERF-NEW-03 | [#117](https://gitlab.com/devnw/zig/thread-pool/-/issues/117) | `29422be` | Escalating backoff spin→yield→sleep; `cancelDescriptor` on cap — no silent drop |
+| GAP-0037 / AP-02 | [#93](https://gitlab.com/devnw/zig/thread-pool/-/issues/93) | `e2e7210` + `fd2aca7` | generation now `std.atomic.Value(u64)`; per-field reset avoids plain-store over atomics |
+| GAP-0038 / AP-03 | [#94](https://gitlab.com/devnw/zig/thread-pool/-/issues/94) | `bf44fec` | Owner-thread contract documented on 4 APIs; cross-thread best-effort drain fallback; integration test |
+| GAP-0039 / AP-04 | [#95](https://gitlab.com/devnw/zig/thread-pool/-/issues/95) | `7ab4358` | `quantileScaled` u128 widening + boundary test |
+| GAP-0040 / AP-05 | [#96](https://gitlab.com/devnw/zig/thread-pool/-/issues/96) | `7ab4358` | `drainSubmitterDescCaches` in `deinitOwned` |
+| GAP-0041 / AP-06 + Q-020 | [#97](https://gitlab.com/devnw/zig/thread-pool/-/issues/97) / [#56](https://gitlab.com/devnw/zig/thread-pool/-/issues/56) | `7ab4358` | `root.zig` version 0.2.4 + pinning test referencing the constant |
+| Q-026 | [#60](https://gitlab.com/devnw/zig/thread-pool/-/issues/60) | `7ab4358` | `waitGroup` asserts running state, uses `self` |
+| Q-NEW-10 | [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) | `7ab4358` | `joinAllWorkers` overflow accounting + integration test |
+| SEC-020 | [#32](https://gitlab.com/devnw/zig/thread-pool/-/issues/32) | `c2b1446` | `spinLoopHint` in 6 CAS retry loops, failure-path-only placement |
+| Q-027 | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | `c2b1446` | `free_sentinel` at Core scope, used everywhere incl. `initDescriptorFreelist` |
+| GAP-0045 + GAP-0046 + GAP-0029 + SEC-002 + GAP-0034 + GAP-0030 | [#100](https://gitlab.com/devnw/zig/thread-pool/-/issues/100) / [#101](https://gitlab.com/devnw/zig/thread-pool/-/issues/101) / [#37](https://gitlab.com/devnw/zig/thread-pool/-/issues/37) / [#40](https://gitlab.com/devnw/zig/thread-pool/-/issues/40) / [#39](https://gitlab.com/devnw/zig/thread-pool/-/issues/39) / [#38](https://gitlab.com/devnw/zig/thread-pool/-/issues/38) | `3af7bec` | SECURITY.md versions/GitLab/UB-claim/owner; CODEOWNERS `@benjiv`; CHANGELOG date |
+| Q-NEW-03 + Q-NEW-04 + Q-NEW-05 + Q-NEW-06 + Q-NEW-07 + Q-NEW-09 | [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108)–[#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112) / [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) | `25665bb` | DESIGN.md phantom features removed, `steal_batch_size` 8, `completion_only` removed, `types.zig` docs corrected |
+| QR-005 | [#49](https://gitlab.com/devnw/zig/thread-pool/-/issues/49) | `25665bb` | `.block` deadlock warning on submit wrapper |
+| QR-003 + QR-004 | [#41](https://gitlab.com/devnw/zig/thread-pool/-/issues/41) / [#43](https://gitlab.com/devnw/zig/thread-pool/-/issues/43) | `e554f2b` | `ConfigError` 20 members; `SubmitError`/`SubmitBatchError`/`WaitError`/`ShutdownError`/`RegisterSubmitterError` on Core + ThreadPool; `root.zig` re-exports; 4 else-less switch tests |
+| Q-NEW-08 | [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) | `e549ec7` | Watchdog condvar `timedWait`; broadcast at both stop sites; <2s deinit test |
+| QR-009 + QS-009 + GAP-0044 | [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) / [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) | `0291001` | `//!` headers on 9 files; `///` on 8 Core methods + sync/clock fns |
+| PERF-NEW-02 + PERF-NEW-09 + PERF-NEW-04 | [#99](https://gitlab.com/devnw/zig/thread-pool/-/issues/99) / [#124](https://gitlab.com/devnw/zig/thread-pool/-/issues/124) / [#119](https://gitlab.com/devnw/zig/thread-pool/-/issues/119) | `791604c` | 8 counter sites `.release`→`.monotonic`; `finalizeTask` guard comptime-foldable; `gitSha` hoisted ~168→1 forks |
+| NEW-003 | [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) | `791604c` | Test sleeps 2s→500/300ms |
+| GAP-0054 | [#103](https://gitlab.com/devnw/zig/thread-pool/-/issues/103) | `9c94036` | Makefile `ZIG?=zig`; script fallbacks removed |
+| GAP-0042 | [#98](https://gitlab.com/devnw/zig/thread-pool/-/issues/98) | `9c94036` | `ubuntu:24.04` pinned `@sha256:786a8b...` with refresh procedure |
+| GAP-0047 | [#102](https://gitlab.com/devnw/zig/thread-pool/-/issues/102) | `9c94036` | RUNTIME_COMPARISON.md Vendored Runtime Pins note; re-pin instruction lives in the doc |
+| GAP-0057 | [#106](https://gitlab.com/devnw/zig/thread-pool/-/issues/106) | `9c94036` + `34fe026` | `HASH_RE` tightened, traversal guard, printable sanitization |
+| QR-002 | [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) | `9c94036` | `zig-test-unit-single-pool-0.16.0` CI job; local run green |
+| GAP-0056 | [#105](https://gitlab.com/devnw/zig/thread-pool/-/issues/105) | `61f88d2` | 2 integration tests; foot-gun confirmed FIXED by pre-existing `141d979` — noted in close comment |
+| GAP-0055 | [#104](https://gitlab.com/devnw/zig/thread-pool/-/issues/104) | `61f88d2` | Fuzz 3-variant rotation via `seed%3` + `FUZZ_SCHEDULER` override; WaitGroup op; header updated |
+
+## Previously Resolved (2026-04-16 gap-closure sweep)
 
 Full resolution entries in `docs/GAP_ANALYSIS_RESOLVED.md`.
 
@@ -173,7 +185,7 @@ Full resolution entries in `docs/GAP_ANALYSIS_RESOLVED.md`.
 - **G-011** re-opened: `docs/GAP_ANALYSIS_RESOLVED.md:49-55` had claimed closure;
   scan shows the scenario names never landed.
 
-## Security Risk Assessment (post-AppSec-remediation 2026-04-15; refreshed 2026-06-11)
+## Security Risk Assessment (post-AppSec-remediation 2026-04-15; remediation pass 2026-06-11)
 
 All three Critical + High memory-safety findings (SEC-005, SEC-017, SEC-004,
 SEC-003) closed in commits `de49d69` / `bace578` / `214ca3c`. TSan and fuzz
@@ -183,30 +195,32 @@ honest 5-12% throughput cost.
 **AppSec review 2026-06-11 (`docs/APPSEC_REVIEW_2026-06-11_src.md`, commit
 `39528a3`):** re-verified all prior Critical/High findings + the
 `submitter_free_mask` shift-UB bug + F-004…F-011 as fixed and not regressed;
-the `39528a3` WaitGroup broadcast guard is correct and race-free. **No new
-Critical or High.** New findings: 1 Medium (AP-01 clock underflow, GAP-0036),
-2 Low (AP-02/AP-03, GAP-0037/0038) plus 4 supporting-review Low items
-(GAP-0042/0047/0054/0055), and 3 Info (AP-04 + SR-NEW-03/04,
-GAP-0039/0056/0057). AP-01 is the only finding with real-world DoS impact and
-should be fixed before the next release tag.
+the `39528a3` WaitGroup broadcast guard is correct and race-free.
+
+**2026-06-11 remediation pass:** AP-01 (GAP-0036 clock underflow panic-DoS),
+AP-02 (GAP-0037 non-atomic generation), AP-03 (GAP-0038 cross-thread DescCache),
+AP-04 (GAP-0039 overflow), AP-05 (GAP-0040 DescCache drain), GAP-0042 (base-image
+pin), GAP-0054 (Makefile fallback), GAP-0055 (fuzz coverage), GAP-0056 (integration
+test for drain foot-gun), GAP-0057 (detect_diamond_deps hardening), SEC-020
+(spinLoopHint), GAP-0045/0046 (SECURITY.md), GAP-0029/0030/0034 (repo hygiene),
+GAP-0047 (Go submodule note) all closed. **No Critical or High security findings
+remain open.** Remaining open security items: SEC-008 (CI tag pinning), SEC-021
+(fuzz job `allow_failure`), SEC-007, SEC-011.
 
 Outstanding security items tracked on GitLab (not duplicated here). Snapshot
-of `kind::security` status counts as of 2026-06-11 (delta vs 2026-04-16 in
-parentheses):
+of `kind::security` status counts after 2026-06-11 remediation pass:
 
 | Severity | Open | Partial | Total |
 | --- | ---: | ---: | ---: |
 | Critical | 0 | 0 | 0 |
 | High | 0 | 0 | 0 |
-| Medium | 5 (+1) | 1 | 6 |
-| Low | 10 (+6) | 3 | 13 |
-| Info | 3 (+3) | 0 | 3 |
+| Medium | 3 | 1 | 4 |
+| Low | 4 | 3 | 7 |
+| Info | 0 | 0 | 0 |
 
-Top open security items: **GAP-0036 (AP-01 clock underflow panic-DoS — new,
-highest priority)**, SEC-008 (CI tag pinning; see also GAP-0042 base-image
-pin), SEC-021 (fuzz job `allow_failure`; see also GAP-0055 fuzz coverage),
-SEC-007 (scratch init failures observability), SEC-011 + GAP-0037 (latent
-descriptor ordering / non-atomic generation).
+Top open security items: SEC-008 (CI tag pinning), SEC-021 (fuzz job
+`allow_failure`), SEC-007 (scratch init failures observability), SEC-011
+(latent descriptor ordering).
 
 ## Cross-platform Status
 
@@ -218,7 +232,7 @@ descriptor ordering / non-atomic generation).
 
 ## Next Review Date
 
-2026-05-16
+2026-07-11
 
 ## Revision History
 
@@ -232,3 +246,4 @@ descriptor ordering / non-atomic generation).
 | 2026-04-15 | AppSec remediation | F-001/F-005/F-008 closed; honest 5-12% throughput cost documented |
 | 2026-04-16 | Gap sync | Canonical gap set rebuilt (75 -> 38 distinct after dedup). Closed G-001..G-006, G-008, G-009, G-012, G-013 on GitLab. Re-opened G-011. Minted GAP-9001 for LANE-L4b retroactive tracking. Created 30+ GitLab issues for open findings; tables in this file now link to them. |
 | 2026-06-11 | Gap sync | Synced AppSec review (`docs/APPSEC_REVIEW_2026-06-11_src.md`) + security-review findings at commit `39528a3`. Created GAP-0036…0042, 0045…0047, 0054…0057 (14 GitLab issues #92-#98, #100-#106). Refreshed evidence on GAP-0031 (#17), G-010 (#10), Q-027 (#62), GAP-0029 (#37), RISK-06 (#85). Closed PERF-029 (#51, condvar-based drain). Noted Q-004 resolved as dup of GAP-0014 (no issue). |
+| 2026-06-11 | Remediation pass | Closed 40+ gaps across security (GAP-0036..0042, 0045..0047, 0054..0057, SEC-002/020, GAP-0029/0030/0034), quality (Q-NEW-01..10, Q-020/025..027, QR-002..005/009, QS-009, NEW-003, GAP-0044), and performance (PERF-NEW-02..04/09) tracks. GAP-0031 reduced scope (observed-peak landed, Windows RSS remains open). RISK-06 staleness note added. 40 GitLab issues closed (#32, #37..43, #49, #56, #59, #60, #62, #92..100, #102..117, #119, #120, #124). See `docs/GAP_ANALYSIS_RESOLVED.md` § "2026-06-11 Remediation Pass". |

@@ -751,3 +751,238 @@ report (tests, A/B data, platform-issue audit).
   and is intentionally not edited here; recorded as resolved-by-duplicate for
   cross-reference only.
 - **Resolved date:** 2026-06-11
+
+---
+
+## 2026-06-11 Remediation Pass
+
+### GAP-0036 / AP-01: Clock underflow panic-DoS [RESOLVED]
+
+- **Issue:** [#92](https://gitlab.com/devnw/zig/thread-pool/-/issues/92) (closed)
+- **Category:** Security / correctness
+- **Severity:** Medium
+- **Resolution:** `src/clock.zig` switched to `.awake` (monotonic); `src/sync.zig` timedWait uses `.awake`; saturating subtraction (`-|`) applied at `pool.zig` recordTaskStart/finalizeTask; monotonicity regression test added.
+- **Evidence:** commit `df3832a`; `src/clock.zig:16`; `src/sync.zig:51`; `pool.zig` recordTaskStart/finalizeTask
+- **Resolved date:** 2026-06-11
+
+### Q-NEW-02 + Q-025: submitBatch waitable leak + "atomically" doc [RESOLVED]
+
+- **Issue:** [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) (closed); [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) (closed)
+- **Category:** Quality / api-contract
+- **Severity:** High (Q-NEW-02) + Medium (Q-025)
+- **Resolution:** `submitBatch` now returns `error.WaitableUnsupported` when `options.waitable=true`; public wrapper doc no longer says "atomically".
+- **Evidence:** commit `01d7f6a`; `src/pool.zig:836-888` (waitable guard); `src/pool.zig:2637` (wrapper doc)
+- **Resolved date:** 2026-06-11
+
+### PERF-NEW-03: releaseSubmitter unbounded spin + silent drop [RESOLVED]
+
+- **Issue:** [#117](https://gitlab.com/devnw/zig/thread-pool/-/issues/117) (closed)
+- **Category:** Performance / correctness
+- **Severity:** P2
+- **Resolution:** Escalating backoff (spin→yield→sleep); `cancelDescriptor` called on capacity hit — no silent task drop.
+- **Evidence:** commit `29422be`; `src/pool.zig:962-968`
+- **Resolved date:** 2026-06-11
+
+### GAP-0037 / AP-02: Non-atomic descriptor.generation [RESOLVED]
+
+- **Issue:** [#93](https://gitlab.com/devnw/zig/thread-pool/-/issues/93) (closed)
+- **Category:** Security / concurrency
+- **Severity:** Low
+- **Resolution:** `descriptor.generation` promoted to `std.atomic.Value(u64)`; per-field reset avoids plain-store over atomics.
+- **Evidence:** commits `e2e7210` + `fd2aca7`; `src/pool.zig:235`
+- **Resolved date:** 2026-06-11
+
+### GAP-0038 / AP-03: Cross-thread releaseSubmitter DescCache drain [RESOLVED]
+
+- **Issue:** [#94](https://gitlab.com/devnw/zig/thread-pool/-/issues/94) (closed)
+- **Category:** Security / concurrency
+- **Severity:** Low
+- **Resolution:** Owner-thread contract documented on 4 APIs; cross-thread best-effort drain fallback added; integration test covers the path.
+- **Evidence:** commit `bf44fec`; `src/pool.zig:904-974`
+- **Resolved date:** 2026-06-11
+
+### GAP-0039 / AP-04: quantileScaled overflow [RESOLVED]
+
+- **Issue:** [#95](https://gitlab.com/devnw/zig/thread-pool/-/issues/95) (closed)
+- **Category:** Correctness
+- **Severity:** Low (Informational in practice)
+- **Resolution:** `quantileScaled` intermediate multiply widened to u128; boundary test added.
+- **Evidence:** commit `7ab4358`; `src/stats/latency.zig:112`
+- **Resolved date:** 2026-06-11
+
+### GAP-0040 / AP-05: deinitOwned DescCache not drained [RESOLVED]
+
+- **Issue:** [#96](https://gitlab.com/devnw/zig/thread-pool/-/issues/96) (closed)
+- **Category:** Correctness
+- **Severity:** Low (Informational in practice)
+- **Resolution:** `drainSubmitterDescCaches` called in `deinitOwned`; `task_desc_live == 0` assertion now passes cleanly.
+- **Evidence:** commit `7ab4358`; `src/pool.zig:2479-2486`
+- **Resolved date:** 2026-06-11
+
+### GAP-0041 / AP-06 + Q-020: Version drift + unreferenced constant [RESOLVED]
+
+- **Issue:** [#97](https://gitlab.com/devnw/zig/thread-pool/-/issues/97) (closed); [#56](https://gitlab.com/devnw/zig/thread-pool/-/issues/56) (closed)
+- **Category:** Quality
+- **Severity:** Low
+- **Resolution:** `root.zig` version constant updated to 0.2.4; pinning test references the constant; drift and unreferenced-constant findings both closed.
+- **Evidence:** commit `7ab4358`; `src/root.zig:42`
+- **Resolved date:** 2026-06-11
+
+### Q-026: Core.waitGroup() ignores self [RESOLVED]
+
+- **Issue:** [#60](https://gitlab.com/devnw/zig/thread-pool/-/issues/60) (closed)
+- **Category:** Quality / correctness
+- **Severity:** Low
+- **Resolution:** `waitGroup` now asserts running state and uses `self` correctly.
+- **Evidence:** commit `7ab4358`; `src/pool.zig:741`
+- **Resolved date:** 2026-06-11
+
+### Q-NEW-10: joinAllWorkers overflow accounting [RESOLVED]
+
+- **Issue:** [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) (closed)
+- **Category:** Quality / observability
+- **Severity:** Low
+- **Resolution:** Overflow counter update on shutdown join + integration test.
+- **Evidence:** commit `7ab4358`; `src/pool.zig:1080-1085`
+- **Resolved date:** 2026-06-11
+
+### SEC-020: Unbounded CAS spin without spinLoopHint [RESOLVED]
+
+- **Issue:** [#32](https://gitlab.com/devnw/zig/thread-pool/-/issues/32) (closed)
+- **Category:** Security / CWE-400
+- **Severity:** Low
+- **Resolution:** `spinLoopHint` inserted in 6 CAS retry loops; failure-path-only placement avoids unnecessary hints on success.
+- **Evidence:** commit `c2b1446`; `src/pool.zig:1816,1852` (and 4 other sites)
+- **Resolved date:** 2026-06-11
+
+### Q-027: Magic 0xFFFFFFFF raw literal [RESOLVED]
+
+- **Issue:** [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) (closed)
+- **Category:** Quality / readability
+- **Severity:** Low
+- **Resolution:** `free_sentinel` constant hoisted to Core scope and used everywhere including `initDescriptorFreelist`.
+- **Evidence:** commit `c2b1446`; `src/pool.zig:699,2304`
+- **Resolved date:** 2026-06-11
+
+### GAP-0045 + GAP-0046 + GAP-0029 + SEC-002 + GAP-0034 + GAP-0030: Repo/SECURITY.md hygiene cluster [RESOLVED]
+
+- **Issues:** [#100](https://gitlab.com/devnw/zig/thread-pool/-/issues/100), [#101](https://gitlab.com/devnw/zig/thread-pool/-/issues/101), [#37](https://gitlab.com/devnw/zig/thread-pool/-/issues/37), [#40](https://gitlab.com/devnw/zig/thread-pool/-/issues/40), [#39](https://gitlab.com/devnw/zig/thread-pool/-/issues/39), [#38](https://gitlab.com/devnw/zig/thread-pool/-/issues/38) (all closed)
+- **Category:** Security / hygiene
+- **Resolution:** SECURITY.md supported versions updated to 0.2.4; GitLab issue links corrected; "No Undefined Behavior" claim qualified; CODEOWNERS set to `@benjiv`; CHANGELOG placeholder date fixed.
+- **Evidence:** commit `3af7bec`; `SECURITY.md`, `CODEOWNERS`, `CHANGELOG.md`
+- **Resolved date:** 2026-06-11
+
+### Q-NEW-03 + Q-NEW-04 + Q-NEW-05 + Q-NEW-06 + Q-NEW-07 + Q-NEW-09: DESIGN.md / types.zig doc-accuracy cluster [RESOLVED]
+
+- **Issues:** [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108)–[#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112), [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) (all closed)
+- **Category:** Quality / docs
+- **Resolution:** DESIGN.md phantom features (RuntimePreset, wake_strategy, idle_queue) removed; `steal_batch_size` corrected to 8; `completion_only` mode removed from docs; `queue_capacity` descriptor-bound doc corrected; `idle_park_after_ns` mechanism clarified; parks/wakeups counter semantics reworded.
+- **Evidence:** commit `25665bb`; `docs/DESIGN.md`, `src/types.zig`
+- **Resolved date:** 2026-06-11
+
+### QR-005: SubmitOptions .block deadlock footgun undocumented [RESOLVED]
+
+- **Issue:** [#49](https://gitlab.com/devnw/zig/thread-pool/-/issues/49) (closed)
+- **Category:** Quality / docs
+- **Severity:** Medium
+- **Resolution:** `.block` deadlock warning cross-referenced from submit/submitBatch wrapper docs.
+- **Evidence:** commit `25665bb`; `src/types.zig:268-275`
+- **Resolved date:** 2026-06-11
+
+### QR-003 + QR-004: Explicit error sets [RESOLVED]
+
+- **Issues:** [#41](https://gitlab.com/devnw/zig/thread-pool/-/issues/41), [#43](https://gitlab.com/devnw/zig/thread-pool/-/issues/43) (closed)
+- **Category:** Quality / api-contract
+- **Severity:** Medium
+- **Resolution:** `ConfigError` declared with 20 members; `SubmitError`, `SubmitBatchError`, `WaitError`, `ShutdownError`, `RegisterSubmitterError` declared on Core + ThreadPool; `root.zig` re-exports all; 4 else-less switch tests added.
+- **Evidence:** commit `e554f2b`; `src/types.zig`, `src/pool.zig`, `src/root.zig`
+- **Resolved date:** 2026-06-11
+
+### Q-NEW-08: Watchdog non-interruptible sleep [RESOLVED]
+
+- **Issue:** [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) (closed)
+- **Category:** Quality / reliability
+- **Severity:** Medium
+- **Resolution:** Watchdog uses condvar `timedWait`; broadcast at both stop sites; <2s deinit test passes.
+- **Evidence:** commit `e549ec7`; `src/pool.zig:1543-1545`
+- **Resolved date:** 2026-06-11
+
+### QR-009 + QS-009 + GAP-0044: Module headers and Core method docs [RESOLVED]
+
+- **Issues:** [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34), [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) (closed)
+- **Category:** Quality / docs
+- **Severity:** Medium
+- **Resolution:** `//!` module-level headers added to 9 source files; `///` doc comments added to 8 Core methods and sync/clock functions.
+- **Evidence:** commit `0291001`; `src/pool.zig`, `src/sync.zig`, `src/clock.zig` (and 6 other files)
+- **Resolved date:** 2026-06-11
+
+### PERF-NEW-02 + PERF-NEW-09 + PERF-NEW-04 + NEW-003: Counter ordering + elision + gitSha + test sleeps [RESOLVED]
+
+- **Issues:** [#99](https://gitlab.com/devnw/zig/thread-pool/-/issues/99), [#124](https://gitlab.com/devnw/zig/thread-pool/-/issues/124), [#119](https://gitlab.com/devnw/zig/thread-pool/-/issues/119), [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) (all closed)
+- **Category:** Performance / quality
+- **Resolution:** 8 single-writer observability counter sites changed `.release`→`.monotonic` (ARM64 fence savings); `finalizeTask` idle-purge timestamp guarded by comptime-foldable check; `gitSha()` hoisted to main reducing ~168 git subprocess forks per run to 1; unit test `sleep_ns` reduced from 2s to 500/300ms.
+- **Evidence:** commit `791604c`; `src/pool.zig` (8 counter sites, finalizeTask guard); `benchmarks/common.zig:262`
+- **Resolved date:** 2026-06-11
+
+### GAP-0054: Makefile/script zig-0.15.2 fallback [RESOLVED]
+
+- **Issue:** [#103](https://gitlab.com/devnw/zig/thread-pool/-/issues/103) (closed)
+- **Category:** Infra
+- **Severity:** Medium
+- **Resolution:** `Makefile` uses `ZIG?=zig`; `scripts/run-runtime-comparison.sh` fallback to gitignored `./zig-0.15.2/zig` removed.
+- **Evidence:** commit `9c94036`; `Makefile:4`; `scripts/run-runtime-comparison.sh`
+- **Resolved date:** 2026-06-11
+
+### GAP-0042: ubuntu:24.04 floating image tag [RESOLVED]
+
+- **Issue:** [#98](https://gitlab.com/devnw/zig/thread-pool/-/issues/98) (closed)
+- **Category:** Security / infra / CWE-829
+- **Severity:** Low
+- **Resolution:** `ubuntu:24.04` pinned to `@sha256:786a8b...` in `.gitlab-ci.yml`; refresh procedure documented in comments.
+- **Evidence:** commit `9c94036`; `.gitlab-ci.yml:238`
+- **Resolved date:** 2026-06-11
+
+### GAP-0047: third_party/go submodule tracks master [RESOLVED]
+
+- **Issue:** [#102](https://gitlab.com/devnw/zig/thread-pool/-/issues/102) (closed)
+- **Category:** Security / infra
+- **Severity:** Low
+- **Resolution:** Deliberate no-re-pin to preserve baselines; re-pin instruction documented in `docs/RUNTIME_COMPARISON.md` Vendored Runtime Pins note.
+- **Evidence:** commit `9c94036`; `docs/RUNTIME_COMPARISON.md`
+- **Resolved date:** 2026-06-11
+
+### GAP-0057: detect_diamond_deps.py hash regex + injection [RESOLVED]
+
+- **Issue:** [#106](https://gitlab.com/devnw/zig/thread-pool/-/issues/106) (closed)
+- **Category:** Security / dev-tool
+- **Severity:** Low
+- **Resolution:** `HASH_RE` tightened; traversal guard added; ANSI/non-printable sanitization applied to stderr output.
+- **Evidence:** commits `9c94036` + `34fe026`; `scripts/detect_diamond_deps.py:91,174-177,256-257`
+- **Resolved date:** 2026-06-11
+
+### QR-002: -Dsingle-pool CI gate [RESOLVED]
+
+- **Issue:** [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) (closed)
+- **Category:** Quality / ci-cd
+- **Severity:** High
+- **Resolution:** `zig-test-unit-single-pool-0.16.0` CI job added; local run green.
+- **Evidence:** commit `9c94036`; `.gitlab-ci.yml`
+- **Resolved date:** 2026-06-11
+
+### GAP-0056: No test for global_queue + registerSubmitter + drain foot-gun [RESOLVED]
+
+- **Issue:** [#105](https://gitlab.com/devnw/zig/thread-pool/-/issues/105) (closed)
+- **Category:** Quality / tests
+- **Severity:** Low (Informational)
+- **Resolution:** 2 integration tests added; drain-hang foot-gun confirmed FIXED by pre-existing commit `141d979` (noted in close comment).
+- **Evidence:** commit `61f88d2`; `tests/integration.zig`
+- **Resolved date:** 2026-06-11
+
+### GAP-0055: Fuzz harness only fuzzes work_stealing [RESOLVED]
+
+- **Issue:** [#104](https://gitlab.com/devnw/zig/thread-pool/-/issues/104) (closed)
+- **Category:** Security / tests
+- **Severity:** Low
+- **Resolution:** 3-variant rotation via `seed%3` + `FUZZ_SCHEDULER` environment override; WaitGroup operation added to fuzz corpus; fuzz harness header updated.
+- **Evidence:** commit `61f88d2`; `tests/fuzz/pool_fuzz.zig:21-30`
+- **Resolved date:** 2026-06-11

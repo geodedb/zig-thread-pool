@@ -1,24 +1,48 @@
 # Quality Gap Analysis
 
-Last updated: 2026-06-11
+Last updated: 2026-06-11 (remediation pass)
 
 ## Summary
 
-- **Critical:** 0 | **High:** 3 open + 3 closed | **Medium:** 15 | **Low:** 12 | **Info:** 0 (2026-04-16 pass + legacy, unchanged)
-- **2026-06-11 re-review pass:** 11 new findings — **High:** 1 | **Medium:** 6 | **Low:** 4 (plus Q-NEW-01 folded into #59 and NEW-002 folded into #34); **3 legacy items closed** (Q-028, Q-029, Q-006)
-- **Total open findings (new audit):** 29 open + 3 closed on 2026-04-16 (QS-002, QS-003, QS-008)
-- **Legacy Q-xxx open items carried over:** 12 (from 2026-04-11 audit pass); 3 closed 2026-06-11 (Q-028, Q-029, Q-006)
+- **Critical:** 0 | **High:** 1 open + 4 closed | **Medium:** 7 open + ~12 closed | **Low:** 5 open + ~10 closed | **Info:** 0
+- **2026-06-11 re-review pass:** 11 new findings — **High:** 1 | **Medium:** 6 | **Low:** 4 (plus Q-NEW-01 folded into #59 and NEW-002 folded into #34); **3 legacy items closed** (Q-028, Q-029, Q-006); **all 10 Q-NEW items closed in remediation pass**
+- **2026-06-11 remediation pass:** closed Q-NEW-01..10, NEW-003, Q-020, Q-025, Q-026, Q-027, QR-002, QR-003, QR-004, QR-005, QR-009, QS-009, GAP-0044 scope
+- **Remaining open:** QS-001, QS-004, QS-005, QR-001, QS-015, QS-016, QS-018, QS-HYG, NEW-001/GAP-0043 (#118 types.zig split, deferred)
 - **Formal gates (2026-04-16):** `zig fmt` clean, `zig build check` clean, `zig build test` 47 pass / 1 skip / 0 fail; `test-all` + TSan stress all pass post-closure
 
-### Top 5 Risks (2026-06-11 re-review pass, by PriorityScore)
+### Top 5 Risks (post-remediation 2026-06-11, by PriorityScore)
 
-1. **Q-NEW-02** submitBatch leaks waitable descriptors → pool exhaustion (PriorityScore 60, High) — [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107)
-2. **Q-NEW-03** DESIGN.md documents phantom features (RuntimePreset/wake_strategy/idle_queue) (PriorityScore 36, Medium) — [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108)
-3. **Q-NEW-08** Watchdog non-interruptible sleep blocks shutdown up to watchdog_interval_ns (PriorityScore 36, Medium) — [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113)
-4. **QS-001** Split 2745-line src/pool.zig monolith (PriorityScore 80, High, carried) — [#14](https://gitlab.com/devnw/zig/thread-pool/-/issues/14)
-5. **Q-NEW-04..07** DESIGN.md / types.zig doc-accuracy cluster (PriorityScore 24 each, Medium) — [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109)–[#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112)
+1. **QS-001** Split 2745-line src/pool.zig monolith (PriorityScore 80, High) — [#14](https://gitlab.com/devnw/zig/thread-pool/-/issues/14)
+2. **QR-001** Unit tests for lane/watchdog/overflow slices (PriorityScore 48, High) — [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) — note: #24 was closed for -Dsingle-pool CI gate (QR-002); QR-001 has its own separate issue at the original GitLab link
+3. **QS-004** Simplify 93-line Core.enqueuePush (PriorityScore 32, Medium) — [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) (scope reduced to code simplification; //! headers portion closed)
+4. **QS-HYG** Repo hygiene cluster (PriorityScore 24, Medium) — [#77](https://gitlab.com/devnw/zig/thread-pool/-/issues/77)
+5. **NEW-001** types.zig 978 lines > 800 threshold (PriorityScore 16, Low, deferred) — [#118](https://gitlab.com/devnw/zig/thread-pool/-/issues/118)
 
-### Closed This Sweep (2026-06-11)
+### Closed This Sweep (2026-06-11 remediation pass)
+
+| Gap-ID | Issue | Resolution evidence |
+|--------|-------|---------------------|
+| Q-NEW-02 | [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) | `submitBatch` returns `error.WaitableUnsupported`; commit `01d7f6a`; `src/pool.zig:836-888` |
+| Q-025 / Q-NEW-01 | [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) | Wrapper doc rewritten (no "atomically"); commit `01d7f6a`; `src/pool.zig:2637` |
+| Q-NEW-08 | [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) | Watchdog condvar `timedWait`; broadcast at both stop sites; `<2s` deinit test; commit `e549ec7` |
+| Q-NEW-03 | [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108) | DESIGN.md phantom features removed; commit `25665bb` |
+| Q-NEW-04 | [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109) | `steal_batch_size` corrected to 8; commit `25665bb`; `docs/DESIGN.md:295` |
+| Q-NEW-05 | [#110](https://gitlab.com/devnw/zig/thread-pool/-/issues/110) | `completion_only` removed from DESIGN.md + ALGORITHMS.md; commit `25665bb` |
+| Q-NEW-06 | [#111](https://gitlab.com/devnw/zig/thread-pool/-/issues/111) | `queue_capacity` descriptor-bound doc corrected; commit `25665bb` |
+| Q-NEW-07 | [#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112) | `idle_park_after_ns` mechanism clarified; commit `25665bb` |
+| Q-NEW-09 | [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) | parks/wakeups counter semantics reworded; commit `25665bb` |
+| Q-NEW-10 | [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) | `joinAllWorkers` overflow accounting + integration test; commit `7ab4358` |
+| NEW-003 | [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) | Test sleeps 2s→500/300ms; commit `791604c` |
+| Q-020 | [#56](https://gitlab.com/devnw/zig/thread-pool/-/issues/56) | `root.zig` version 0.2.4 + pinning test; commit `7ab4358` |
+| Q-026 | [#60](https://gitlab.com/devnw/zig/thread-pool/-/issues/60) | `waitGroup` asserts running state, uses `self`; commit `7ab4358` |
+| Q-027 | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | `free_sentinel` at Core scope; commit `c2b1446`; `src/pool.zig:699,2304` |
+| QR-002 | [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) | `zig-test-unit-single-pool-0.16.0` CI job; commit `9c94036` |
+| QR-003 | [#41](https://gitlab.com/devnw/zig/thread-pool/-/issues/41) | `ConfigError` 20 members; commit `e554f2b` |
+| QR-004 | [#43](https://gitlab.com/devnw/zig/thread-pool/-/issues/43) | Explicit error sets + 4 else-less switch tests; commit `e554f2b` |
+| QR-005 | [#49](https://gitlab.com/devnw/zig/thread-pool/-/issues/49) | `.block` deadlock warning on submit wrappers; commit `25665bb` |
+| QR-009 + QS-009 | [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) / [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) | `//!` headers on 9 files; `///` on 8 Core methods + sync/clock fns; commit `0291001` |
+
+### Closed Gap-Sync Sweep (2026-06-11, pre-remediation)
 
 | Gap-ID | Issue | Resolution evidence |
 |--------|-------|---------------------|
@@ -40,17 +64,17 @@ All findings `confidence::confirmed` (verified against source at commit `39528a3
 
 | Rank | Severity | PriorityScore | Category | Finding | Component | Evidence | Issue URL | Fix Summary | Effort | Status |
 |------|----------|---------------|----------|---------|-----------|----------|-----------|-------------|--------|--------|
-| 1 | High | 60 | api-contract/reliability | Q-NEW-02 submitBatch accepts `options.waitable=true` but discards every handle → waitable descriptors never released → pool exhaustion after `queue_capacity` such tasks | src/pool.zig:836-888 (:854 discards handle); finalizeTask :2135-2141; wait() :976-999 | submitBatch passes `options` to enqueuePush, binds handle to `\|_\|`; finalizeTask only `releaseDescriptor`s non-waitable; wait() is sole waitable release path but no handle is returned | [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) | Reject waitable in submitBatch (error) or strip+document | S | Open |
-| 2 | Medium | 36 | reliability/concurrency | Q-NEW-08 Watchdog `clock.sleep(interval)` non-interruptible → shutdown/deinit blocks up to full `watchdog_interval_ns` | src/pool.zig:1543-1545; join :1057-1061 | watchdog_stop set then thread.join() while watchdog parked in sleep | [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) | stop-condvar timedWait or document worst-case delay | S-M | Open |
-| 3 | Medium | 36 | docs | Q-NEW-03 DESIGN.md describes phantom features: RuntimePreset, wake_strategy, scan_parked_workers, idle_queue — none exist in any .zig | docs/DESIGN.md:65-68,153-162 | `grep -rn` finds none in src/ | [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108) | Delete Runtime Presets section + dual-strategy framing | S | Open |
-| 4 | Medium | 24 | docs | Q-NEW-04 DESIGN.md says `steal_batch_size` default 16; actual 8 | docs/DESIGN.md:295 vs src/types.zig:349 | `steal_batch_size: usize = 8` | [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109) | Fix doc value to 8 | S | Open |
-| 5 | Medium | 24 | docs | Q-NEW-05 Docs reference nonexistent timestamp mode `completion_only`; actual enum `{full, disabled}` | docs/DESIGN.md:320 + docs/ALGORITHMS.md:518 vs src/types.zig:107-110, build.zig:69 | enum has only full/disabled; build flag {any,full,disabled} | [#110](https://gitlab.com/devnw/zig/thread-pool/-/issues/110) | Drop `completion_only` from both docs | S | Open |
-| 6 | Medium | 24 | docs | Q-NEW-06 `queue_capacity` doc claims descriptors bounded by `queue_capacity + sum(local_queue_capacity)`; actually exactly `queue_capacity` allocated | src/types.zig:178-181 vs src/pool.zig:649 | `alloc(TaskDescriptor, normalized.queue_capacity)` | [#111](https://gitlab.com/devnw/zig/thread-pool/-/issues/111) | Fix doc; links to Q-NEW-02 capacity reasoning | S | Open |
-| 7 | Medium | 24 | docs | Q-NEW-07 `idle_park_after_ns` doc inverts mechanism (says spin duration; actually parked `timedWait` timeout; spin = `spin_before_park_iters`) | src/types.zig:240-243 vs src/pool.zig:2207,2221 | used as `park_cond.timedWait(..., idle_park_after_ns)` | [#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112) | Reword doc; clarify spin knob | S | Open |
-| 8 | Low | 24 | tests/ergonomics | NEW-003 unit.zig timeout tests use 2s sleeps → ~10s suite inflation | tests/unit.zig:309-360 | two `sleep_ns = 2_000_000_000` fixtures | [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) | Shrink sleeps to ~100ms | S | Open |
-| 9 | Low | 16 | docs/observability | Q-NEW-09 parks/wakeups counters count attempts/timeouts not futex events, contradicting docs | src/types.zig:675-677 vs src/pool.zig:2179,2199,2210 | parks++ before timedWait; wakeups++ on early-return + timeout | [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) | Reword docs or move increments | S | Open |
-| 10 | Low | 16 | observability/reliability | Q-NEW-10 joinAllWorkers joins overflow threads without updating overflow_retires/overflow_active | src/pool.zig:1080-1085 vs src/types.zig:761-767 | join loop nulls thread, no counter update | [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) | Update counters on shutdown join or doc caveat | S | Open |
-| 11 | Low | 16 | maintainability | NEW-001 src/types.zig (978 lines) exceeds 800-line threshold (QS-001 scoped pool.zig only) | src/types.zig (wc -l = 978) | — | [#118](https://gitlab.com/devnw/zig/thread-pool/-/issues/118) | Split config/stats/lane submodules behind re-exports | M | Open |
+| 1 | High | 60 | api-contract/reliability | Q-NEW-02 submitBatch accepts `options.waitable=true` but discards every handle → waitable descriptors never released → pool exhaustion after `queue_capacity` such tasks | src/pool.zig:836-888 (:854 discards handle); finalizeTask :2135-2141; wait() :976-999 | submitBatch passes `options` to enqueuePush, binds handle to `\|_\|`; finalizeTask only `releaseDescriptor`s non-waitable; wait() is sole waitable release path but no handle is returned | [#107](https://gitlab.com/devnw/zig/thread-pool/-/issues/107) | Reject waitable in submitBatch (error) or strip+document | S | **Closed 2026-06-11 (01d7f6a)** |
+| 2 | Medium | 36 | reliability/concurrency | Q-NEW-08 Watchdog `clock.sleep(interval)` non-interruptible → shutdown/deinit blocks up to full `watchdog_interval_ns` | src/pool.zig:1543-1545; join :1057-1061 | watchdog_stop set then thread.join() while watchdog parked in sleep | [#113](https://gitlab.com/devnw/zig/thread-pool/-/issues/113) | stop-condvar timedWait or document worst-case delay | S-M | **Closed 2026-06-11 (e549ec7)** |
+| 3 | Medium | 36 | docs | Q-NEW-03 DESIGN.md describes phantom features: RuntimePreset, wake_strategy, scan_parked_workers, idle_queue — none exist in any .zig | docs/DESIGN.md:65-68,153-162 | `grep -rn` finds none in src/ | [#108](https://gitlab.com/devnw/zig/thread-pool/-/issues/108) | Delete Runtime Presets section + dual-strategy framing | S | **Closed 2026-06-11 (25665bb)** |
+| 4 | Medium | 24 | docs | Q-NEW-04 DESIGN.md says `steal_batch_size` default 16; actual 8 | docs/DESIGN.md:295 vs src/types.zig:349 | `steal_batch_size: usize = 8` | [#109](https://gitlab.com/devnw/zig/thread-pool/-/issues/109) | Fix doc value to 8 | S | **Closed 2026-06-11 (25665bb)** |
+| 5 | Medium | 24 | docs | Q-NEW-05 Docs reference nonexistent timestamp mode `completion_only`; actual enum `{full, disabled}` | docs/DESIGN.md:320 + docs/ALGORITHMS.md:518 vs src/types.zig:107-110, build.zig:69 | enum has only full/disabled; build flag {any,full,disabled} | [#110](https://gitlab.com/devnw/zig/thread-pool/-/issues/110) | Drop `completion_only` from both docs | S | **Closed 2026-06-11 (25665bb)** |
+| 6 | Medium | 24 | docs | Q-NEW-06 `queue_capacity` doc claims descriptors bounded by `queue_capacity + sum(local_queue_capacity)`; actually exactly `queue_capacity` allocated | src/types.zig:178-181 vs src/pool.zig:649 | `alloc(TaskDescriptor, normalized.queue_capacity)` | [#111](https://gitlab.com/devnw/zig/thread-pool/-/issues/111) | Fix doc; links to Q-NEW-02 capacity reasoning | S | **Closed 2026-06-11 (25665bb)** |
+| 7 | Medium | 24 | docs | Q-NEW-07 `idle_park_after_ns` doc inverts mechanism (says spin duration; actually parked `timedWait` timeout; spin = `spin_before_park_iters`) | src/types.zig:240-243 vs src/pool.zig:2207,2221 | used as `park_cond.timedWait(..., idle_park_after_ns)` | [#112](https://gitlab.com/devnw/zig/thread-pool/-/issues/112) | Reword doc; clarify spin knob | S | **Closed 2026-06-11 (25665bb)** |
+| 8 | Low | 24 | tests/ergonomics | NEW-003 unit.zig timeout tests use 2s sleeps → ~10s suite inflation | tests/unit.zig:309-360 | two `sleep_ns = 2_000_000_000` fixtures | [#120](https://gitlab.com/devnw/zig/thread-pool/-/issues/120) | Shrink sleeps to ~100ms | S | **Closed 2026-06-11 (791604c)** |
+| 9 | Low | 16 | docs/observability | Q-NEW-09 parks/wakeups counters count attempts/timeouts not futex events, contradicting docs | src/types.zig:675-677 vs src/pool.zig:2179,2199,2210 | parks++ before timedWait; wakeups++ on early-return + timeout | [#114](https://gitlab.com/devnw/zig/thread-pool/-/issues/114) | Reword docs or move increments | S | **Closed 2026-06-11 (25665bb)** |
+| 10 | Low | 16 | observability/reliability | Q-NEW-10 joinAllWorkers joins overflow threads without updating overflow_retires/overflow_active | src/pool.zig:1080-1085 vs src/types.zig:761-767 | join loop nulls thread, no counter update | [#115](https://gitlab.com/devnw/zig/thread-pool/-/issues/115) | Update counters on shutdown join or doc caveat | S | **Closed 2026-06-11 (7ab4358)** |
+| 11 | Low | 16 | maintainability | NEW-001 src/types.zig (978 lines) exceeds 800-line threshold (QS-001 scoped pool.zig only) | src/types.zig (wc -l = 978) | — | [#118](https://gitlab.com/devnw/zig/thread-pool/-/issues/118) | Split config/stats/lane submodules behind re-exports | M | Open (deferred) |
 
 **Folded (no new issue):**
 
@@ -66,14 +90,14 @@ All findings `confidence::confirmed` (verified against source at commit `39528a3
 | 3 | High | 60 | readability | QS-002 Extract allocateStorage/initDescriptorFreelist/initWorkers/spawnWorkers | src/pool.zig:408-554 | [#15](https://gitlab.com/devnw/zig/thread-pool/-/issues/15) | Target 30-40 line orchestrator | M | **Closed 2026-04-16 (301392b)** — see `GAP_ANALYSIS_RESOLVED.md` |
 | 4 | High | 60 | docs/api-contract | QS-008 Add /// to 24 undocumented public symbols in types.zig | src/types.zig:4-378 | [#18](https://gitlab.com/devnw/zig/thread-pool/-/issues/18) | Enum + struct + method doc blocks | M | **Closed 2026-04-16 (429caab)** — see `GAP_ANALYSIS_RESOLVED.md` |
 | 5 | High | 48 | tests | QR-001 Unit tests for lane/watchdog/overflow slices | tests/unit.zig | [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) | 6 new unit tests + injectable clock | M | Open |
-| 6 | High | 48 | reliability/ci-cd | QR-002 CI gate for -Dsingle-pool + comptime safety assertion | build.zig, .gitlab-ci.yml | [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) | Add test-single-pool job | S | Open |
-| 7 | Medium | 36 | docs | QS-009 Document ThreadPool.init, registerSubmitter, releaseSubmitter | src/pool.zig:1986-2070 | [#31](https://gitlab.com/devnw/zig/thread-pool/-/issues/31) | /// on 3 methods + F-005 cite | S | Open |
-| 8 | Medium | 36 | api-contract | QR-003 Declare ConfigError explicit error set | src/types.zig:234 | [#41](https://gitlab.com/devnw/zig/thread-pool/-/issues/41) | 19-variant error set + signature update | S | Open |
-| 9 | Medium | 36 | api-contract | QR-004 Declare SubmitError/WaitError/ShutdownError/RegisterError/PurgeError | src/pool.zig | [#43](https://gitlab.com/devnw/zig/thread-pool/-/issues/43) | Explicit sets through facade | S-M | Open |
-| 10 | Medium | 32 | readability | QS-004 Simplify 93-line Core.enqueuePush (8-level indent) | src/pool.zig:1017-1109 | [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) | 3-branch dispatch helper extraction | M | Open |
-| 11 | Medium | 32 | docs | QR-009 Add module-level //! headers to pool.zig and types.zig | src/pool.zig, src/types.zig | [#58](https://gitlab.com/devnw/zig/thread-pool/-/issues/58) | Invariants listed at file head | S | Open |
+| 6 | High | 48 | reliability/ci-cd | QR-002 CI gate for -Dsingle-pool + comptime safety assertion | build.zig, .gitlab-ci.yml | [#24](https://gitlab.com/devnw/zig/thread-pool/-/issues/24) | Add test-single-pool job | S | **Closed 2026-06-11 (9c94036)** |
+| 7 | Medium | 36 | docs | QS-009 Document ThreadPool.init, registerSubmitter, releaseSubmitter | src/pool.zig:1986-2070 | [#28](https://gitlab.com/devnw/zig/thread-pool/-/issues/28) | /// on 3 methods + F-005 cite | S | **Closed 2026-06-11 (0291001)** |
+| 8 | Medium | 36 | api-contract | QR-003 Declare ConfigError explicit error set | src/types.zig:234 | [#41](https://gitlab.com/devnw/zig/thread-pool/-/issues/41) | 19-variant error set + signature update | S | **Closed 2026-06-11 (e554f2b)** |
+| 9 | Medium | 36 | api-contract | QR-004 Declare SubmitError/WaitError/ShutdownError/RegisterError/PurgeError | src/pool.zig | [#43](https://gitlab.com/devnw/zig/thread-pool/-/issues/43) | Explicit sets through facade | S-M | **Closed 2026-06-11 (e554f2b)** |
+| 10 | Medium | 32 | readability | QS-004 Simplify 93-line Core.enqueuePush (8-level indent) | src/pool.zig:1017-1109 | [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) | 3-branch dispatch helper extraction | M | Open (scope: code simplification; //! header portion closed via QR-009) |
+| 11 | Medium | 32 | docs | QR-009 Add module-level //! headers to pool.zig and types.zig | src/pool.zig, src/types.zig | [#34](https://gitlab.com/devnw/zig/thread-pool/-/issues/34) | Invariants listed at file head | S | **Closed 2026-06-11 (0291001)** — 9 files covered |
 | 12 | Medium | 24 | readability | QS-005 Extract helpers from statsSnapshot/nextTask/idle | src/pool.zig | [#45](https://gitlab.com/devnw/zig/thread-pool/-/issues/45) | Preserve SC handshake verbatim | M | Open |
-| 13 | Medium | 24 | api-contract/docs | QR-005 Document SubmitOptions defaults + .block deadlock footgun | src/types.zig:268-275 | [#49](https://gitlab.com/devnw/zig/thread-pool/-/issues/49) | /// on struct + cross-link Config | S | Open |
+| 13 | Medium | 24 | api-contract/docs | QR-005 Document SubmitOptions defaults + .block deadlock footgun | src/types.zig:268-275 | [#49](https://gitlab.com/devnw/zig/thread-pool/-/issues/49) | /// on struct + cross-link Config | S | **Closed 2026-06-11 (25665bb)** |
 | 14 | Medium | 24 | api-contract | QR-006 Document or fix Stats.worker_stats aliasing/lifetime | src/types.zig:378-409 | [#53](https://gitlab.com/devnw/zig/thread-pool/-/issues/53) | Either doc + single-caller rule, or dupe slice | S-M | Open |
 | 15 | Medium | 24 | reliability/tests | QR-007 Inject clock source for deterministic watchdog tests | src/pool.zig:1176-1203 | [#61](https://gitlab.com/devnw/zig/thread-pool/-/issues/61) | NowFn typedef or watchdogTick extraction | M | Open |
 | 16 | Medium | 24 | hygiene (cluster) | QS-HYG Repo hygiene: CODEOWNERS, SECURITY.md, Makefile, zig-0.15.2/, stray binaries, topology.zig | Repo-wide | [#77](https://gitlab.com/devnw/zig/thread-pool/-/issues/77) | Collapsed meta issue (6 sub-tasks) | M | Open |
@@ -101,15 +125,17 @@ These items predate the 2026-04-16 QS/QR scan and remain open pending separate r
 | Q-023 | Medium | 40 | maintainability | deinitOwned missing recordOwnedFree for inject_queue buffer | pool.zig:678 vs :149 | Open |
 | Q-024 | Medium | 40 | api-contract | process_memory.private_peak_bytes reports current not peak on Linux | process_memory.zig:73-74 | Open |
 | Q-004 | Medium | 28 | tests | .block backpressure policy untested | tests/*.zig | Partially Fixed |
-| Q-025 | Medium | 24 | docs | submitBatch doc says "atomically" — residual public wrapper only (Q-NEW-01) | [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) | Open — residual at pool.zig:2637 (Core doc + USAGE.md fixed) |
+| Q-025 | Medium | 24 | docs | submitBatch doc says "atomically" — residual public wrapper only (Q-NEW-01) | [#59](https://gitlab.com/devnw/zig/thread-pool/-/issues/59) | **Closed 2026-06-11 (01d7f6a)** — wrapper doc fixed |
 | Q-018 | Low | 12 | perf | compare.zig readDocument leak mitigated but no explicit free | compare.zig:45 | Open |
-| Q-026 | Low | 12 | readability | Core.waitGroup() ignores self parameter | pool.zig:244-247 | Open |
+| Q-026 | Low | 12 | readability | Core.waitGroup() ignores self parameter | pool.zig:244-247 | **Closed 2026-06-11 (7ab4358)** |
 | Q-030 | Low | 12 | maintainability | Code duplication: nowNs()/Counter/updatePeak | multi-file | Open |
-| Q-020 | Low | 8 | maintainability | version constant in root.zig unreferenced | root.zig:16 | Open |
-| Q-021 | Low | 8 | cleanup | CODEOWNERS contains placeholder @your-username | CODEOWNERS:3 | **Superseded by QS-HYG sub-task** |
-| Q-027 | Low | 8 | readability | Magic sentinel 0xFFFFFFFF raw literal — residual at pool.zig:699 (free_sentinel exists :2304) | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | Open — residual at pool.zig:699 |
+| Q-020 | Low | 8 | maintainability | version constant in root.zig unreferenced | root.zig:16 | **Closed 2026-06-11 (7ab4358)** |
+| Q-021 | Low | 8 | cleanup | CODEOWNERS contains placeholder @your-username | CODEOWNERS:3 | **Superseded by QS-HYG sub-task** (CODEOWNERS fixed `3af7bec`) |
+| Q-027 | Low | 8 | readability | Magic sentinel 0xFFFFFFFF raw literal — residual at pool.zig:699 (free_sentinel exists :2304) | [#62](https://gitlab.com/devnw/zig/thread-pool/-/issues/62) | **Closed 2026-06-11 (c2b1446)** — free_sentinel at Core scope |
 
-> **Closed 2026-06-11 (removed from open list):** Q-028 ([#65](https://gitlab.com/devnw/zig/thread-pool/-/issues/65)), Q-029 ([#67](https://gitlab.com/devnw/zig/thread-pool/-/issues/67)), Q-006 (doc-only). See "Closed This Sweep (2026-06-11)" above for evidence.
+> **Closed 2026-06-11 gap-sync (removed from open list):** Q-028 ([#65](https://gitlab.com/devnw/zig/thread-pool/-/issues/65)), Q-029 ([#67](https://gitlab.com/devnw/zig/thread-pool/-/issues/67)), Q-006 (doc-only). See "Closed Gap-Sync Sweep (2026-06-11)" above for evidence.
+>
+> **Closed 2026-06-11 remediation pass:** Q-020, Q-025, Q-026, Q-027 — see "Closed This Sweep (2026-06-11 remediation pass)" above for evidence.
 
 ## Findings by Category (2026-06-11 re-review pass)
 
