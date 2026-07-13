@@ -97,31 +97,48 @@ pub fn BoundedRing(comptime T: type) type {
         /// factor (flood_1m_batched median lift ~+14% at drain=32 vs
         /// per-item pop loop; see 2026-04-14-inject-head-contention audit).
         ///
-        /// Correctness: tail-minus-head is re-checked under a strong head CAS
-        /// before any slot is read, so we never reserve past the producer's
-        /// committed writes. Per-slot sequence spin bounds the wait on a
-        /// slow producer that may have advanced tail ahead of its value
-        /// store. Returns 0 on CAS race (caller falls through to other
-        /// work-search sources) rather than retrying — drain fast path
-        /// prefers freshness over best-effort reservation.
+        /// Correctness (check-then-reserve, 2026-07-13): `tail` may run ahead
+        /// of the producers' VALUE/SEQUENCE stores (`tryPush` claims the slot
+        /// via a tail CAS *before* writing), so tail-minus-head counts
+        /// reserved-but-unpublished slots. The previous implementation
+        /// reserved that whole range and then SPUN UNBOUNDED on each slot's
+        /// sequence waiting for the mid-push producer — on an oversubscribed
+        /// cgroup-throttled host (shared CI runners), consumers spinning in
+        /// that loop burn exactly the CPU quota the preempted producer needs
+        /// to finish its publish: a livelock observed as multi-hour silent
+        /// test-shard hangs. Now the PUBLISHED PREFIX is measured first (one
+        /// acquire load per slot) and only that prefix is reserved by the
+        /// head CAS — after a CAS win the reserved slots are guaranteed
+        /// published (a published, unconsumed slot can only transition via a
+        /// consumer that first advances head past it, and head was ours), so
+        /// the copy loop needs no waiting at all. A producer stalled on the
+        /// FIRST slot truncates the batch to 0 and the caller falls through
+        /// to other work-search sources — matching the documented
+        /// "prefers freshness over best-effort reservation" contract.
         pub fn popMany(self: *Self, buf: []T) usize {
+            if (buf.len == 0) return 0;
             const head = self.head.load(.monotonic);
             const tail = self.tail.load(.acquire);
             const avail_signed = @as(isize, @intCast(tail)) -% @as(isize, @intCast(head));
             if (avail_signed <= 0) return 0;
             const avail: usize = @intCast(avail_signed);
-            const take = @min(avail, buf.len);
+            const want = @min(avail, buf.len);
+
+            // Published-prefix scan: stop at the first slot whose producer
+            // has claimed (tail passed it) but not yet published.
+            var take: usize = 0;
+            while (take < want) : (take += 1) {
+                const slot = &self.buffer[(head +% take) & self.mask];
+                if (slot.sequence.load(.acquire) != head +% take +% 1) break;
+            }
             if (take == 0) return 0;
+
             if (self.head.cmpxchgStrong(head, head +% take, .monotonic, .monotonic)) |_| {
                 return 0;
             }
             var i: usize = 0;
             while (i < take) : (i += 1) {
                 const slot = &self.buffer[(head +% i) & self.mask];
-                const expected_seq = head +% i +% 1;
-                while (slot.sequence.load(.acquire) != expected_seq) {
-                    std.atomic.spinLoopHint();
-                }
                 buf[i] = slot.value;
                 slot.sequence.store(head +% i +% self.buffer.len, .release);
             }
@@ -255,4 +272,40 @@ test "bounded ring wraparound" {
             try std.testing.expectEqual(@as(?u32, @intCast(round * 4 + i)), ring.pop());
         }
     }
+}
+
+test "bounded ring popMany truncates at a stalled producer instead of spinning" {
+    // Regression for the 2026-07-13 consumer livelock: a producer preempted
+    // between its tail-claim CAS and its value/sequence publish left
+    // `tail > published`, and popMany reserved the whole range then spun
+    // unbounded on the unpublished slot. Under the old implementation this
+    // test HANGS (the spin never exits — nothing will publish slot 3);
+    // under check-then-reserve it returns the published prefix immediately.
+    const Ring = BoundedRing(u32);
+    var ring = try Ring.init(std.testing.allocator, 8);
+    defer ring.deinit();
+
+    try std.testing.expect(ring.tryPush(1));
+    try std.testing.expect(ring.tryPush(2));
+
+    // Emulate a mid-push producer: claim the third slot exactly as
+    // `tryPush`'s CAS does, but write neither value nor sequence.
+    const stalled_tail = ring.tail.load(.monotonic);
+    try std.testing.expect(ring.tail.cmpxchgStrong(stalled_tail, stalled_tail +% 1, .monotonic, .monotonic) == null);
+
+    var buf: [8]u32 = undefined;
+    // Published prefix (2 items) comes back without touching the stalled slot.
+    try std.testing.expectEqual(@as(usize, 2), ring.popMany(buf[0..]));
+    try std.testing.expectEqual(@as(u32, 1), buf[0]);
+    try std.testing.expectEqual(@as(u32, 2), buf[1]);
+    // Stalled slot is now FIRST: nothing consumable — return 0, do not wait.
+    try std.testing.expectEqual(@as(usize, 0), ring.popMany(buf[0..]));
+
+    // Producer wakes up and completes its publish (same stores tryPush does).
+    const slot = &ring.buffer[@as(usize, @intCast(stalled_tail)) & ring.mask];
+    slot.value = 3;
+    slot.sequence.store(stalled_tail +% 1, .release);
+
+    try std.testing.expectEqual(@as(usize, 1), ring.popMany(buf[0..]));
+    try std.testing.expectEqual(@as(u32, 3), buf[0]);
 }

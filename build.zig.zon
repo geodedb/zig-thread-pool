@@ -1,6 +1,6 @@
 .{
     .name = .thread_pool,
-    .version = "0.2.5",
+    .version = "0.2.7",
     .fingerprint = 0x2b20b508067550d7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
