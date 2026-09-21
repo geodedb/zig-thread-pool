@@ -254,7 +254,7 @@ zig-test-windows-stress-0.16.0:
   # `docker buildx imagetools inspect ubuntu:24.04` (or
   # `skopeo inspect --format '{{.Digest}}' docker://docker.io/library/ubuntu:24.04`)
   # and update both the digest and this date.
-  image: "ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d"
+  image: "ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78"
   interruptible: true
   before_script:
     - apt-get update -qq
