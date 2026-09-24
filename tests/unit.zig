@@ -933,7 +933,7 @@ test "fuzz Config validation never panics" {
     }.testOne, .{});
 }
 
-test "phase g2: worker returns from idle when lifo slot filled during spin window" {
+test "phase g2: a parked worker wakes for work submitted after the spin window" {
     // SONNY-2427: this test used to assert that the task ran < 1 ms after
     // submit. That bound belongs to the OS scheduler, not the pool: with
     // both workers parked, `scanAndWake` signals one within microseconds
@@ -1508,10 +1508,12 @@ test "sync.Condition: a signal racing a timedWait timeout is never orphaned" {
     //
     // This thread is the only waiter and signals are only sent under `m`,
     // so each time timedWait returns (holding `m`) no waiter or reserved
-    // signal may remain. The race needs two CPUs: against the unfixed exit
-    // path these 20k waits found orphans in 99/100 unpinned runs and
-    // 90/100 runs on two pinned CPUs (Debug + ReleaseSafe), none on one
-    // CPU (SONNY-2427). The fixed exit path cannot orphan.
+    // signal may remain. The race is rare on one CPU (it needs a preemption
+    // between the waiter's last signal check and its exit), so this test
+    // only detects it with two or more CPUs: against the unfixed exit path
+    // these 20k waits found orphans in 99/100 unpinned runs and 90/100 runs
+    // on two pinned CPUs (Debug + ReleaseSafe), none on one CPU
+    // (SONNY-2427). The fixed exit path cannot orphan.
     var m: thread_pool.sync.Mutex = .{};
     var c: thread_pool.sync.Condition = .{};
     var stop = std.atomic.Value(bool).init(false);

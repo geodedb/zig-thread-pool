@@ -567,7 +567,7 @@ The race exists in main (c1425a4) but is masked by the staggered-exit timing the
 
 **Kept (permanent):**
 
-- `tests/unit.zig` — `"phase g2: worker returns from idle when lifo slot filled during spin window"` — regression guard for the idle-spin fast path (passes against pre-G2 code; will catch regressions in any future re-attempt).
+- `tests/unit.zig` — `"phase g2: a parked worker wakes for work submitted after the spin window"` (renamed from "…lifo slot filled during spin window", SONNY-2427) — regression guard that a parked worker is woken for new work (no lost wakeup, bounded by a park timeout and watchdog). It no longer asserts a < 1 ms wake latency: that bound measured the OS scheduler, not the pool, and flaked under CPU contention.
 - `tests/stress.zig` — `"phase g2: aggressive spin flood - no lost wakeups"` — aggressive-spin stress harness (passes against pre-G2 code; will be the primary signal for detecting the scheduler race during the follow-up fix).
 - `cad50f1` unit-test timing fix.
 

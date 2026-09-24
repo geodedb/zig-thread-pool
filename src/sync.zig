@@ -50,6 +50,9 @@ pub const Condition = struct {
     }
 
     /// Like `wait` but returns `error.Timeout` if `timeout_ns` elapses before a signal.
+    /// A signal that arrives after the deadline but before the waiter leaves the
+    /// wait is still consumed and reported as a wakeup (return without error), so
+    /// no signal is ever orphaned by a timed-out waiter.
     pub fn timedWait(self: *Condition, m: *Mutex, timeout_ns: u64) error{Timeout}!void {
         return self.waitInner(m, .{ .duration = .{
             .raw = .fromNanoseconds(@intCast(timeout_ns)),
