@@ -1497,6 +1497,75 @@ test "sync.Condition signal wakes waiter" {
     t.join();
 }
 
+test "sync.Condition: a signal racing a timedWait timeout is never orphaned" {
+    // SONNY-2427: signal()/broadcast() reserve a wake by bumping
+    // `state.signals` while `waiters > signals`. A timed-out waiter used to
+    // leave with a blind `fetchSub` of its waiter count, so a signal landing
+    // between its last check for signals and that fetchSub was orphaned
+    // (signals > waiters). While an orphan sits in `state`, signal() and
+    // broadcast() skip the next waiter (they only fire while waiters >
+    // signals): it sleeps its whole timeout, or forever in `wait`.
+    //
+    // This thread is the only waiter and signals are only sent under `m`,
+    // so each time timedWait returns (holding `m`) no waiter or reserved
+    // signal may remain. The race needs two CPUs: against the unfixed exit
+    // path these 20k waits found orphans in 99/100 unpinned runs and
+    // 90/100 runs on two pinned CPUs (Debug + ReleaseSafe), none on one
+    // CPU (SONNY-2427). The fixed exit path cannot orphan.
+    var m: thread_pool.sync.Mutex = .{};
+    var c: thread_pool.sync.Condition = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    var waiting = std.atomic.Value(bool).init(false);
+
+    const Signaler = struct {
+        fn run(
+            mm: *thread_pool.sync.Mutex,
+            cc: *thread_pool.sync.Condition,
+            stop_flag: *std.atomic.Value(bool),
+            waiting_flag: *std.atomic.Value(bool),
+        ) void {
+            var prng = std.Random.DefaultPrng.init(0x2427);
+            const random = prng.random();
+            while (!stop_flag.load(.acquire)) {
+                if (!waiting_flag.load(.acquire)) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                // Jitter the signal across the waiter's timeout so some
+                // land in its exit path.
+                var spins = random.uintLessThan(u32, 4096);
+                while (spins > 0) : (spins -= 1) std.atomic.spinLoopHint();
+                mm.lock();
+                cc.signal();
+                mm.unlock();
+            }
+        }
+    };
+    const signaler = try std.Thread.spawn(.{}, Signaler.run, .{ &m, &c, &stop, &waiting });
+    defer {
+        stop.store(true, .release);
+        signaler.join();
+    }
+
+    var orphaned: usize = 0;
+    var round: usize = 0;
+    while (round < 20_000) : (round += 1) {
+        m.lock();
+        waiting.store(true, .release);
+        c.timedWait(&m, 5 * std.time.ns_per_us) catch {};
+        waiting.store(false, .release);
+        const state = c.state.load(.monotonic);
+        if (state.waiters != 0 or state.signals != 0) {
+            orphaned += 1;
+            // Reset under `m` (no signal() in flight) so each orphan is
+            // counted once.
+            c.state.store(.{ .waiters = 0, .signals = 0 }, .monotonic);
+        }
+        m.unlock();
+    }
+    try std.testing.expectEqual(@as(usize, 0), orphaned);
+}
+
 test "sync.Semaphore permits balance" {
     var s: thread_pool.sync.Semaphore = .{};
     s.post();
