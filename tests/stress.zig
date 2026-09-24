@@ -202,6 +202,141 @@ test "RingQueue: 1 owner + 4 stealers — no duplicates, no losses" {
     for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.acquire));
 }
 
+/// Records one value handed out by the ring: counts it in `seen`, or in
+/// `never_pushed` when it is outside every round's range (a slot that was
+/// never written).
+fn recordRingTake(seen: []std.atomic.Value(u32), never_pushed: *std.atomic.Value(u64), value: u32) void {
+    if (value >= seen.len) {
+        _ = never_pushed.fetchAdd(1, .monotonic);
+        return;
+    }
+    _ = seen[value].fetchAdd(1, .monotonic);
+}
+
+test "RingQueue: owner push/pop rounds vs 3 batch stealers — no overrun, loss, or duplicate (SONNY-2448)" {
+    // SONNY-2448: stealHalf loads head and tail, copies up to half the
+    // queue, then claims the copy with a CAS on head alone. The old owner
+    // pop took items from the tail, so it could take items inside a
+    // stealer's copied batch before the claim landed, and the claim still
+    // succeeded. Those items were handed out twice (duplicate); an item
+    // the owner pushed back into the batch's slots sat below head, out of
+    // reach (lost); and with no push, head passed tail and pop walked
+    // through consumed and never-written slots (overrun).
+    //
+    // This reproduces the pool's shape: the owner pushes a 3-item burst
+    // and pops until empty while three threads batch-steal, and every
+    // value is accounted for. The 1-owner/4-stealer test above rarely
+    // reaches the window, because its 1,024-deep ring keeps the owner far
+    // from the stealers' batches, and its per-value checks are
+    // std.debug.assert calls that compile out in ReleaseFast, the mode
+    // this suite runs in.
+    //
+    // Bounded: fixed rounds, a bounded pop loop per round, stealHalf's own
+    // retry cap, and a wall-clock watchdog far above the normal runtime.
+    const allocator = std.testing.allocator;
+    const rounds: u32 = 200_000;
+    const per_round: u32 = 3;
+    const stealer_count = 3;
+    const watchdog_ns: i96 = 120 * std.time.ns_per_s;
+
+    var q = try thread_pool.RingQueue(u32).init(allocator, 256);
+    defer q.deinit();
+
+    const seen = try allocator.alloc(std.atomic.Value(u32), rounds * per_round);
+    defer allocator.free(seen);
+    for (seen) |*s| s.* = std.atomic.Value(u32).init(0);
+    var never_pushed = std.atomic.Value(u64).init(0);
+    var stop = std.atomic.Value(bool).init(false);
+
+    const Stealer = struct {
+        fn run(
+            ring: *thread_pool.RingQueue(u32),
+            seen_arr: []std.atomic.Value(u32),
+            bad: *std.atomic.Value(u64),
+            halt: *const std.atomic.Value(bool),
+        ) void {
+            var buf: [32]u32 = undefined;
+            while (!halt.load(.acquire)) {
+                const n = ring.stealHalf(buf[0..]);
+                for (buf[0..n]) |value| recordRingTake(seen_arr, bad, value);
+            }
+        }
+    };
+
+    var threads: [stealer_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        stop.store(true, .release);
+        for (threads[0..spawned]) |t| t.join();
+    }
+    while (spawned < stealer_count) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{}, Stealer.run, .{ &q, seen, &never_pushed, &stop });
+    }
+
+    // Rounds after which the owner found head past tail.
+    var overruns: u64 = 0;
+    var push_failures: u64 = 0;
+    const start_ns = thread_pool.clock.nanoTimestamp();
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        if (round % 4096 == 0 and thread_pool.clock.nanoTimestamp() - start_ns > watchdog_ns) {
+            return error.WatchdogExpired;
+        }
+        var i: u32 = 0;
+        while (i < per_round) : (i += 1) {
+            if (!q.tryPush(round * per_round + i)) push_failures += 1;
+        }
+        var pops: usize = 0;
+        while (q.pop()) |value| {
+            recordRingTake(seen, &never_pushed, value);
+            pops += 1;
+            // No round queues more than `per_round` items; an overrun ring
+            // kept returning slots while tail wrapped.
+            if (pops > q.capacity()) break;
+        }
+        const h = q.head.load(.acquire);
+        const t = q.tail.load(.monotonic);
+        if (t -% h > q.capacity()) {
+            overruns += 1;
+            // Only reachable when head has passed tail: every slot below
+            // head is already claimed, so publish the ring as empty (the
+            // owner is tail's only writer) and keep counting.
+            q.tail.store(h, .release);
+        }
+    }
+
+    // Join the stealers, then take whatever they left.
+    stop.store(true, .release);
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0;
+    var leftovers: [32]u32 = undefined;
+    var drains: usize = 0;
+    while (drains <= q.capacity()) : (drains += 1) {
+        const n = q.stealHalf(leftovers[0..]);
+        if (n == 0) break;
+        for (leftovers[0..n]) |value| recordRingTake(seen, &never_pushed, value);
+    }
+
+    var lost: u64 = 0;
+    var duplicated: u64 = 0;
+    for (seen) |*s| {
+        const count = s.load(.monotonic);
+        if (count == 0) lost += 1 else if (count > 1) duplicated += 1;
+    }
+    const garbage = never_pushed.load(.monotonic);
+    if (overruns != 0 or lost != 0 or duplicated != 0 or garbage != 0 or push_failures != 0) {
+        std.debug.print(
+            "\nRingQueue race (SONNY-2448): rounds={d} overruns={d} lost={d} duplicated={d} never_pushed={d} push_failures={d}\n",
+            .{ rounds, overruns, lost, duplicated, garbage, push_failures },
+        );
+    }
+    try std.testing.expectEqual(@as(u64, 0), overruns);
+    try std.testing.expectEqual(@as(u64, 0), lost);
+    try std.testing.expectEqual(@as(u64, 0), duplicated);
+    try std.testing.expectEqual(@as(u64, 0), garbage);
+    try std.testing.expectEqual(@as(u64, 0), push_failures);
+}
+
 test "coalesced wake: submitter never stalls forever on backpressure" {
     // Small queue + 4 submitters + 2 workers: submitters must block
     // frequently. With wake_coalesce_batch=32 there are more missed

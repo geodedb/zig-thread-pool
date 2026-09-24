@@ -235,3 +235,199 @@ test "ring queue: wraparound via head advance" {
     try std.testing.expect(q.tryPush(5));
     try std.testing.expect(!q.tryPush(6)); // full (head=1, tail=5, capacity=4)
 }
+
+// SONNY-2448: deterministic replays of the owner-pop vs batch-steal race.
+//
+// `stealHalf` loads `head` and `tail`, copies up to half the queue, and only
+// then claims the copy with a CAS on `head`. A stealer can be preempted
+// between the copy and the CAS for any length of time. These replays hold
+// that window open: `StealReplay.snapshot` performs stealHalf's steps up to
+// the claim, the owner runs `pop`/`tryPush` inside the window, and
+// `StealReplay.finish` performs the claim. A claim that fails is a stale
+// copy that stealHalf discards and retries, so `finish` then calls the real
+// `stealHalf`. Every value handed out, by the owner or by a claimed batch,
+// goes through a `Ledger`, which checks that each pushed value was taken
+// exactly once and that nothing else was.
+//
+// In the pool, the three outcomes these replays pin were: a panic on a
+// never-written slot (`index out of bounds: index 2863311530` in runTask,
+// i.e. 0xAAAAAAAA), a task that never ran and hung its wait group, and a
+// task dispatched twice.
+
+/// Test-only record of every value pushed to, and taken from, a replayed
+/// queue.
+const Ledger = struct {
+    pushed: [16]bool = [_]bool{false} ** 16,
+    taken: [16]u8 = [_]u8{0} ** 16,
+    /// Values handed out that were never pushed: a slot that was never
+    /// written, or one whose value was already consumed and overwritten.
+    never_pushed: usize = 0,
+
+    fn push(self: *Ledger, q: *RingQueue(u32), value: u32) !void {
+        try std.testing.expect(q.tryPush(value));
+        self.pushed[value] = true;
+    }
+
+    fn take(self: *Ledger, value: u32) void {
+        if (value >= self.pushed.len or !self.pushed[value]) {
+            self.never_pushed += 1;
+            return;
+        }
+        self.taken[value] += 1;
+    }
+
+    /// The owner pops until `pop` reports empty. No queue ever holds more
+    /// than `capacity` items, so a pop that returns more has walked past
+    /// the items that exist.
+    fn drain(self: *Ledger, q: *RingQueue(u32)) !void {
+        var pops: usize = 0;
+        while (q.pop()) |value| {
+            pops += 1;
+            if (pops > q.capacity()) return error.PopNeverEmpties;
+            self.take(value);
+        }
+    }
+
+    fn expectNothingNeverPushed(self: *const Ledger) !void {
+        if (self.never_pushed != 0) {
+            std.debug.print("{d} value(s) handed out were never pushed\n", .{self.never_pushed});
+            return error.NeverPushedValue;
+        }
+    }
+
+    fn expectNoDuplicate(self: *const Ledger) !void {
+        for (self.taken, 0..) |count, value| {
+            if (count > 1) {
+                std.debug.print("value {d} was taken {d} times\n", .{ value, count });
+                return error.DuplicateTake;
+            }
+        }
+    }
+
+    fn expectNoneLost(self: *const Ledger) !void {
+        for (self.pushed, self.taken, 0..) |pushed, count, value| {
+            if (pushed and count == 0) {
+                std.debug.print("value {d} was pushed but never taken\n", .{value});
+                return error.LostValue;
+            }
+        }
+    }
+
+    fn expectEachTakenOnce(self: *const Ledger) !void {
+        try self.expectNothingNeverPushed();
+        try self.expectNoDuplicate();
+        try self.expectNoneLost();
+    }
+};
+
+/// Test-only: `stealHalf` split at its claim.
+const StealReplay = struct {
+    head: u32,
+    n: u32,
+    batch: [8]u32 = undefined,
+
+    /// stealHalf's steps before its CAS: load head, then tail; size the
+    /// batch at half the queue, rounded up; copy the batch's slots.
+    fn snapshot(q: *RingQueue(u32)) StealReplay {
+        const h = q.head.load(.acquire);
+        const t = q.tail.load(.acquire);
+        var steal: StealReplay = .{ .head = h, .n = (t -% h + 1) / 2 };
+        std.debug.assert(steal.n <= steal.batch.len);
+        for (steal.batch[0..steal.n], 0..) |*slot, i| {
+            slot.* = q.buffer[(h +% @as(u32, @intCast(i))) & q.mask].load(.monotonic);
+        }
+        return steal;
+    }
+
+    /// stealHalf's claim: the same CAS on `head`. On success the stealer
+    /// owns its copied batch. On failure it discards the copy and retries,
+    /// which here is a call to the real `stealHalf`.
+    fn finish(self: *const StealReplay, q: *RingQueue(u32), ledger: *Ledger) void {
+        if (q.head.cmpxchgStrong(self.head, self.head +% self.n, .seq_cst, .monotonic) == null) {
+            for (self.batch[0..self.n]) |value| ledger.take(value);
+            return;
+        }
+        var retry: [8]u32 = undefined;
+        const n = q.stealHalf(retry[0..]);
+        for (retry[0..n]) |value| ledger.take(value);
+    }
+};
+
+fn expectHeadNotPastTail(q: *RingQueue(u32)) !void {
+    const h = q.head.load(.monotonic);
+    const t = q.tail.load(.monotonic);
+    if (t -% h > q.capacity()) {
+        std.debug.print("head {d} is past tail {d}\n", .{ h, t });
+        return error.HeadPastTail;
+    }
+}
+
+test "ring queue replay (SONNY-2448): a batch claim never moves head past tail" {
+    // Old LIFO pop: the owner took 3 and 2 from the tail, the claim (head
+    // still 0) landed anyway, and head = 2 was past tail = 1. Later pops
+    // returned 1 again, then slots never written, while tail wrapped.
+    var q = try RingQueue(u32).init(std.testing.allocator, 8);
+    defer q.deinit();
+    var ledger: Ledger = .{};
+    for ([_]u32{ 1, 2, 3 }) |value| try ledger.push(&q, value);
+
+    const steal = StealReplay.snapshot(&q); // head 0, tail 3: batch {1, 2}
+    try std.testing.expectEqual(@as(u32, 2), steal.n);
+    ledger.take(q.pop().?);
+    ledger.take(q.pop().?);
+    steal.finish(&q, &ledger);
+
+    try expectHeadNotPastTail(&q);
+    try ledger.drain(&q);
+    try ledger.expectEachTakenOnce();
+    try std.testing.expectEqual(@as(usize, 0), q.len());
+
+    // The queue is still usable.
+    try ledger.push(&q, 4);
+    try ledger.drain(&q);
+    try ledger.expectEachTakenOnce();
+}
+
+test "ring queue replay (SONNY-2448): a push inside an in-flight batch is never lost" {
+    // Old LIFO pop: the owner took 3 and 2, then pushed 4 into slot 1,
+    // inside the stealer's batch. The claim landed (head 2 == tail 2), so
+    // 4 sat below head and no pop or steal could reach it; in the pool
+    // that task never ran and its wait group never completed.
+    var q = try RingQueue(u32).init(std.testing.allocator, 8);
+    defer q.deinit();
+    var ledger: Ledger = .{};
+    for ([_]u32{ 1, 2, 3 }) |value| try ledger.push(&q, value);
+
+    const steal = StealReplay.snapshot(&q); // batch {1, 2}
+    ledger.take(q.pop().?);
+    ledger.take(q.pop().?);
+    try ledger.push(&q, 4);
+    steal.finish(&q, &ledger);
+
+    try ledger.drain(&q);
+    try ledger.expectNoneLost();
+    try expectHeadNotPastTail(&q);
+    try ledger.expectEachTakenOnce();
+}
+
+test "ring queue replay (SONNY-2448): the owner and a stealer never take the same item" {
+    // Old LIFO pop: the owner took 4 and 3, then 2 from inside the
+    // stealer's batch {1, 2}. The claim landed, so 2 was handed out twice;
+    // in the pool, the second dispatch of that entry reached runTask.
+    var q = try RingQueue(u32).init(std.testing.allocator, 8);
+    defer q.deinit();
+    var ledger: Ledger = .{};
+    for ([_]u32{ 1, 2, 3, 4 }) |value| try ledger.push(&q, value);
+
+    const steal = StealReplay.snapshot(&q); // head 0, tail 4: batch {1, 2}
+    try std.testing.expectEqual(@as(u32, 2), steal.n);
+    ledger.take(q.pop().?);
+    ledger.take(q.pop().?);
+    ledger.take(q.pop().?);
+    steal.finish(&q, &ledger);
+
+    try ledger.expectNoDuplicate();
+    try expectHeadNotPastTail(&q);
+    try ledger.drain(&q);
+    try ledger.expectEachTakenOnce();
+}
