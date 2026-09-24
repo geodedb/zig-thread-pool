@@ -612,6 +612,9 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
         .allow_blocking_lane = true,
         .blocking_workers = 1,
         .blocking_queue_capacity = 512,
+        // Bounds deinit if a task is ever lost (the waits below then fail
+        // with WaitGroupDeadline instead of hanging).
+        .deinit_timeout_ns = 5 * std.time.ns_per_s,
     });
     defer pool.deinit();
 
@@ -636,7 +639,9 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
     for (0..64) |_| {
         _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &default_wg });
     }
-    default_wg.wait();
+    // Deadline-bounded, not `wait()`: lane_extension workers use local
+    // ring queues, and a lost task (SONNY-2448) must fail, not hang.
+    try common.waitPendingZero(&default_wg, 10 * std.time.ns_per_s);
 
     gate.release.store(true, .release);
     for (0..15) |_| {
@@ -646,7 +651,7 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
             .{ .wait_group = &blocking_wg, .lane = .blocking },
         );
     }
-    blocking_wg.wait();
+    try common.waitPendingZero(&blocking_wg, 10 * std.time.ns_per_s);
 
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 80), counter.value.load(.acquire));
@@ -736,61 +741,68 @@ test "max_pool_memory_bytes rejects scratch growth past budget" {
     try std.testing.expectEqual(@as(u64, 0), scratch_total);
 }
 
-test "wake-latency histogram populates under realistic load" {
+test "wake-latency histogram records a signal-driven wake of a parked worker" {
     // OBSERVABILITY-PIVOT / R-03: when timestamps are enabled, the pool
-    // records the delta between parking on `park_cond.timedWait` and
-    // that call returning due to a signal from a submitter. Idle-timeout
-    // returns are excluded. A bursty submission pattern with a
-    // relatively-short park timeout is the most reliable way to get
-    // workers to park and wake multiple times inside a single test.
+    // records the delta between parking on `park_cond.timedWait` and that
+    // call returning before `idle_park_after_ns`. Timeout returns are
+    // excluded.
+    //
+    // SONNY-2427: this test used to run bursts separated by 200 µs sleeps
+    // with a 10 ms park timeout, and needed a signal-driven wake to land
+    // within 10 ms of a park. Wake coalescing left only one submit that
+    // could supply it, so under CPU contention it failed (1/1,200 runs).
+    // Now: both workers are observed parked before the submit, every
+    // submit runs the wake scan, and the park timeout is far longer than
+    // the watchdog, so the task can only run through a recorded wake.
     if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
+    const watchdog_ns: i96 = 10 * std.time.ns_per_s;
+    const park_timeout_ns: u64 = 60 * std.time.ns_per_s;
+
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 2,
         .max_threads = 2,
         .queue_capacity = 256,
-        // Short spin so workers actually park between bursts instead of
-        // busy-looping through spin_before_park_iters.
         .spin_before_park_iters = 0,
-        // 10ms idle-park timeout — long enough that it doesn't fire
-        // during the short sleeps we use between bursts, short enough
-        // that a stuck test aborts quickly rather than hanging.
-        .idle_park_after_ns = 10_000_000,
-        .default_backpressure = .block,
+        // A timeout return is not recorded, and cannot happen within the
+        // watchdog: only a wake can bring a worker back.
+        .idle_park_after_ns = park_timeout_ns,
+        // Every submit scans for a parked worker (the default coalesces
+        // scans to every 32nd submit).
+        .wake_coalesce_batch = 1,
+        // Bounds deinit on the failure path: joinAllWorkers broadcasts
+        // the parked workers awake after this deadline.
+        .deinit_timeout_ns = 5 * std.time.ns_per_s,
     });
     defer pool.deinit();
 
-    // Three small bursts separated by 200us pauses give workers time to
-    // finish, idle long enough for the spin loop to expire, park, and
-    // then wake on the next burst.
-    for (0..3) |_| {
-        var wg = pool.waitGroup();
-        var counter = common.Counter{};
-        for (0..16) |_| {
-            _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    // Wait until both workers are inside the park handshake. A worker
+    // sets `is_parked` before its final queue check, and nothing is
+    // queued yet, so it goes on to wait; the submitter's scan sees
+    // `is_parked` and signals under the park mutex.
+    const setup_ns = thread_pool.clock.nanoTimestamp();
+    while (true) {
+        var parked: usize = 0;
+        for (pool.core.workers) |*w| {
+            if (w.is_parked.load(.seq_cst) == 1) parked += 1;
         }
-        wg.wait();
-        // Sleep longer than the spin iters but shorter than the park
-        // timeout so workers do park but are not purged.
-        thread_pool.clock.sleep(200_000);
+        if (parked == pool.core.workers.len) break;
+        if (thread_pool.clock.nanoTimestamp() - setup_ns > watchdog_ns) return error.WorkersNeverParked;
+        thread_pool.clock.sleep(50 * std.time.ns_per_us);
     }
+    try std.testing.expectEqual(@as(u64, 0), pool.statsSnapshot().wake_latency_ns.count);
 
-    // Final burst + wait, then snapshot.
     var wg = pool.waitGroup();
     var counter = common.Counter{};
-    for (0..32) |_| {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
-    }
-    wg.wait();
+    _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    try common.waitPendingZero(&wg, watchdog_ns);
+    try std.testing.expectEqual(@as(u64, 1), counter.value.load(.acquire));
 
+    // The worker that ran the task recorded its wake before running it,
+    // and the wait group's completion orders that record before this read.
     const stats = pool.statsSnapshot();
-    // At least one wake was signal-driven rather than timeout-driven —
-    // the bursty cadence plus 10ms timeout makes this reliable.
     try std.testing.expect(stats.wake_latency_ns.count > 0);
-    // The histogram caps at `idle_park_after_ns` (10ms here) by
-    // construction, so max must be strictly less than that.
-    try std.testing.expect(stats.wake_latency_ns.max_ns < 10_000_000);
-    // min can be 0 if the first observation rounded into bucket 0, so we
-    // only require that mean is populated.
+    // Recorded wakes are strictly shorter than the park timeout.
+    try std.testing.expect(stats.wake_latency_ns.max_ns < park_timeout_ns);
     try std.testing.expect(stats.wake_latency_ns.mean_ns > 0);
 }
 

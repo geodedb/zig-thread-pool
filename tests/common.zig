@@ -96,6 +96,25 @@ pub fn gateTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
     _ = ctx.counter.value.fetchAdd(1, .monotonic);
 }
 
+/// Waits until `wg` has no pending tasks by polling `pendingCount()`, and
+/// fails with `error.WaitGroupDeadline` after `timeout_ns`. Unlike
+/// `wg.wait()`, a task the pool loses fails the test fast instead of
+/// hanging it. The poll sleeps rather than spins so it never competes for
+/// CPU with the workers it waits on.
+pub fn waitPendingZero(wg: *const thread_pool.WaitGroup, timeout_ns: i96) !void {
+    const start_ns = thread_pool.clock.nanoTimestamp();
+    while (wg.pendingCount() != 0) {
+        if (thread_pool.clock.nanoTimestamp() - start_ns > timeout_ns) {
+            std.debug.print("wait group still has {d} pending task(s) after {d} ms\n", .{
+                wg.pendingCount(),
+                @divTrunc(timeout_ns, std.time.ns_per_ms),
+            });
+            return error.WaitGroupDeadline;
+        }
+        thread_pool.clock.sleep(50 * std.time.ns_per_us);
+    }
+}
+
 pub const RecursiveContext = struct {
     pool: *thread_pool.ThreadPool,
     counter: *Counter,
