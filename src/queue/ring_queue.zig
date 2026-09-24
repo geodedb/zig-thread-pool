@@ -4,9 +4,11 @@
 //! Single producer (owner thread) pushes to `tail`. The owner and any stealer take
 //! from `head`, so the queue is FIFO for everyone: the owner pops one item with a CAS
 //! on `head`, stealers take batches with the same CAS. The CAS is the linearization
-//! point; stealers copy slots before it and discard the copy on loss. LIFO locality
-//! for "task spawns task" comes from the pool's per-worker `lifo_slot`, not from this
-//! queue. Buffer size must be a power of 2.
+//! point; stealers copy slots before it and discard the copy on loss. The pool's
+//! per-worker `lifo_slot` only holds the FIRST worker-context submit while it is
+//! occupied; a task spawning N children runs child 1 from the slot and children
+//! 2..N oldest-first out of this queue, not last-in-first-out over the whole
+//! fan-out. Buffer size must be a power of 2.
 
 const std = @import("std");
 
@@ -94,9 +96,11 @@ pub fn RingQueue(comptime T: type) type {
         ///
         /// Claims the item with the same CAS on `head` that `stealHalf` uses,
         /// so an in-flight batch steal whose copy covers this item fails its
-        /// claim and retries. The loop is bounded: a failed CAS means a
-        /// stealer took at least one item, and only the owner (which is here)
-        /// can add items, so it runs at most `capacity` times.
+        /// claim and retries. Uses `cmpxchgStrong` (not `Weak`) so the only
+        /// retry source is a genuine loss to a stealer, not a spurious
+        /// failure: the loop is bounded because a failed CAS means a
+        /// stealer took at least one item, and only the owner (which is
+        /// here) can add items, so it runs at most `capacity` times.
         pub fn pop(self: *Self) ?T {
             while (true) {
                 const h = self.head.load(.acquire);
@@ -104,7 +108,7 @@ pub fn RingQueue(comptime T: type) type {
                 const t = self.tail.load(.monotonic);
                 if (t == h) return null;
                 const value = self.buffer[h & self.mask].load(.monotonic);
-                if (self.head.cmpxchgWeak(h, h +% 1, .seq_cst, .monotonic) == null) {
+                if (self.head.cmpxchgStrong(h, h +% 1, .seq_cst, .monotonic) == null) {
                     return value;
                 }
             }

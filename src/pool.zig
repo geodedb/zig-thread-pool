@@ -274,8 +274,15 @@ const LocalQueue = union(enum) {
 
     /// Owner-only take. Order depends on the queue kind: `chase_lev` pops
     /// the newest entry (LIFO from `bottom`); `ring` pops the oldest (FIFO
-    /// from `head`, SONNY-2448). The pool relies on neither order: the
-    /// newest local submit is served first by `Worker.lifo_slot`.
+    /// from `head`, SONNY-2448). `Worker.lifo_slot` does not give full LIFO
+    /// locality over this queue: it only holds the FIRST worker-context
+    /// submit while the slot is occupied. A task that spawns N children
+    /// runs child 1 from the slot, then children 2..N oldest-first out of
+    /// this queue (fork-join locality changed from v0.2.7's LIFO-from-tail
+    /// pop). Adopting Tokio's slot policy — a new submit replaces the slot
+    /// entry and pushes the bumped entry onto this queue instead of falling
+    /// through to it — would restore full LIFO locality; that is a possible
+    /// follow-up, not implemented here.
     fn popBottom(self: *LocalQueue) ?QueueEntry {
         return switch (self.*) {
             .chase_lev => |*q| q.popBottom(),

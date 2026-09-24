@@ -789,7 +789,13 @@ test "wake-latency histogram records a signal-driven wake of a parked worker" {
         if (thread_pool.clock.nanoTimestamp() - setup_ns > watchdog_ns) return error.WorkersNeverParked;
         thread_pool.clock.sleep(50 * std.time.ns_per_us);
     }
-    try std.testing.expectEqual(@as(u64, 0), pool.statsSnapshot().wake_latency_ns.count);
+    // Baseline rather than an exact-zero assertion: `timedWait` can return
+    // early on a spurious OS wake (not a timeout, not our submit's signal)
+    // before either worker ever sees a task, and the recorder (src/pool.zig,
+    // `parkWorker`) can't tell that apart from a real wake — it only checks
+    // that the return happened before `idle_park_after_ns` elapsed. Record
+    // count/max now and assert the delta after the submit instead.
+    const baseline = pool.statsSnapshot().wake_latency_ns;
 
     var wg = pool.waitGroup();
     var counter = common.Counter{};
@@ -799,9 +805,17 @@ test "wake-latency histogram records a signal-driven wake of a parked worker" {
 
     // The worker that ran the task recorded its wake before running it,
     // and the wait group's completion orders that record before this read.
+    // No-lost-wakeup property: at least one additional wake was recorded
+    // between the baseline above and here, i.e. the submit's signal (or a
+    // spurious wake racing it) was not dropped.
     const stats = pool.statsSnapshot();
-    try std.testing.expect(stats.wake_latency_ns.count > 0);
-    // Recorded wakes are strictly shorter than the park timeout.
+    try std.testing.expect(stats.wake_latency_ns.count > baseline.count);
+    // Recorded wakes are strictly shorter than the park timeout. Note: this
+    // test no longer independently proves that a timeout return is never
+    // recorded as a wake — that guarantee now rests solely on the
+    // `delta_ns < idle_park_after_ns` gate in `parkWorker`, not on this
+    // test's baseline being exactly zero. That check was deliberately given
+    // up to make the test robust to a spurious pre-submit wake.
     try std.testing.expect(stats.wake_latency_ns.max_ns < park_timeout_ns);
     try std.testing.expect(stats.wake_latency_ns.mean_ns > 0);
 }

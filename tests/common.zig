@@ -101,6 +101,17 @@ pub fn gateTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 /// `wg.wait()`, a task the pool loses fails the test fast instead of
 /// hanging it. The poll sleeps rather than spins so it never competes for
 /// CPU with the workers it waits on.
+///
+/// `pendingCount()` is an atomic load that bypasses `WaitGroup.mutex`
+/// entirely (unlike `wg.wait()`, which takes the mutex and so cannot
+/// return before `done()` has released it). That means this function can
+/// observe `pending == 0` and return while a worker thread is still
+/// inside `WaitGroup.done()`, between its `pending` decrement and its
+/// `mutex.unlock()`. Callers therefore must not let `wg` go out of scope
+/// (or be reused for another round) until the pool itself is
+/// deinit-joined (`pool.deinit()`, which joins every worker thread) — at
+/// that point no worker can still be touching `wg`. This is true at every
+/// current call site.
 pub fn waitPendingZero(wg: *const thread_pool.WaitGroup, timeout_ns: i96) !void {
     const start_ns = thread_pool.clock.nanoTimestamp();
     while (wg.pendingCount() != 0) {
