@@ -1692,9 +1692,14 @@ test "pool.deinit drains per-worker desc_caches" {
     // returned to the global freelist at pool teardown, so task_desc_live
     // reaches zero.  The explicit drainWorkerDescCachesForTesting hook
     // mirrors the drain that deinitOwned runs, letting us assert the
-    // invariant while the pool is still live (statsSnapshot requires a
-    // live pool).  Without the drain, workers hold ~32 cached-but-unused
-    // indices each and task_desc_live remains > 0 after wg.wait().
+    // invariant before deinit frees the pool (statsSnapshot needs it).
+    //
+    // SONNY-2427: both snapshots follow `shutdown(.drain)`, which joins
+    // the workers — the same order deinit uses (join, then drain).
+    // `wg.wait()` alone does not order them: finalizeTask calls
+    // `wait_group.done()` before `releaseDescriptor()`, so a worker
+    // preempted between the two still counts a live descriptor when
+    // wg.wait() returns.
     const allocator = std.testing.allocator;
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = 2,
@@ -1705,6 +1710,11 @@ test "pool.deinit drains per-worker desc_caches" {
     });
     defer pool.deinit();
 
+    // Every child is submitted from the parent's worker thread, so only
+    // that worker's DescCache refills: 100 children take 4 batches of 32
+    // and leave 28 indices cached but unused. (The old 96 is a multiple of
+    // 32, which left the cache empty and the drain with nothing to do.)
+    const children = 100;
     var done = std.atomic.Value(u64).init(0);
     const Ctx = struct {
         pool: *thread_pool.ThreadPool,
@@ -1713,9 +1723,7 @@ test "pool.deinit drains per-worker desc_caches" {
         fn parent(raw: *anyopaque, _: *thread_pool.TaskContext) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var i: usize = 0;
-            // 96 children across 2 workers ensures both caches refill at
-            // least once, leaving cached-but-unused indices when tasks end.
-            while (i < 96) : (i += 1) {
+            while (i < children) : (i += 1) {
                 _ = self.pool.submit(child, @ptrCast(self), .{
                     .wait_group = self.wg,
                     .backpressure = .block,
@@ -1735,6 +1743,12 @@ test "pool.deinit drains per-worker desc_caches" {
         .backpressure = .block,
     });
     wg.wait();
+    try pool.shutdown(.drain, 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, children), done.load(.monotonic));
+
+    // Workers are joined, so every descriptor still live is a cached,
+    // never-used index: the drain below has work to do.
+    try std.testing.expect(pool.statsSnapshot().task_desc_live > 0);
 
     // Drain worker caches before asserting; this exercises the same code
     // path that deinitOwned calls internally at shutdown.
