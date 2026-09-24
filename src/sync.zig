@@ -101,9 +101,29 @@ pub const Condition = struct {
             }
         }
 
-        const prev_state = self.state.fetchSub(.{ .waiters = 1, .signals = 0 }, .monotonic);
-        std.debug.assert(prev_state.waiters > 0);
-        return error.Timeout;
+        // Timed out. Leave the waiter count with a CAS, never a blind
+        // fetchSub: signal()/broadcast() reserve a wake by bumping
+        // `signals` while `waiters > signals`, so a reservation landing
+        // after the check above would be orphaned (signals > waiters) and
+        // later signal()/broadcast() calls would skip the next waiter
+        // (SONNY-2427). If the CAS fails because a signal arrived, consume
+        // it and report a wakeup — std.Thread.Condition's timeout path in
+        // Zig 0.15.
+        var state = self.state.load(.monotonic);
+        while (true) {
+            if (state.signals > 0) {
+                state = self.state.cmpxchgWeak(state, .{
+                    .waiters = state.waiters - 1,
+                    .signals = state.signals - 1,
+                }, .acquire, .monotonic) orelse return;
+            } else {
+                std.debug.assert(state.waiters > 0);
+                state = self.state.cmpxchgWeak(state, .{
+                    .waiters = state.waiters - 1,
+                    .signals = 0,
+                }, .monotonic, .monotonic) orelse return error.Timeout;
+            }
+        }
     }
 
     /// Wakes at most one waiter blocked in `wait` or `timedWait`.
