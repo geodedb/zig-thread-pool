@@ -1,31 +1,36 @@
 //! Lock-free SPMC ring queue: per-worker local queue for the `work_stealing` and
 //! `lane_extension` scheduler variants.
 //!
-//! Single producer (owner thread) pushes and pops from `tail` (LIFO). Any thread may
-//! steal from `head` in batches via a seq_cst CAS. The batch-steal CAS is the
-//! linearization point; stealers copy slots before the CAS and discard on loss. Buffer
-//! size must be a power of 2.
+//! Single producer (owner thread) pushes to `tail`. The owner and any stealer take
+//! from `head`, so the queue is FIFO for everyone: the owner pops one item with a CAS
+//! on `head`, stealers take batches with the same CAS. The CAS is the linearization
+//! point; stealers copy slots before it and discard the copy on loss. LIFO locality
+//! for "task spawns task" comes from the pool's per-worker `lifo_slot`, not from this
+//! queue. Buffer size must be a power of 2.
 
 const std = @import("std");
 
 /// Lock-free SPMC ring queue modelled after Tokio's
 /// `runtime/scheduler/multi_thread/queue.rs` and Go's `runq*` in
-/// `runtime/proc.go`. Single producer (owner) pushes to `tail` and pops
-/// from `tail` LIFO. Any thread may steal from `head` in batches.
+/// `runtime/proc.go`. Single producer (owner) pushes to `tail`. The owner
+/// pops one item from `head` (FIFO, like Go's `runqget` and Tokio's
+/// `pop`); any thread may steal from `head` in batches.
 ///
 /// Correctness sketch:
 /// - Owner is the sole writer of `tail` and of slot contents.
-/// - Stealers synchronize with each other via a seq_cst CAS on `head`.
-///   The CAS is the linearization point: all slot reads within a single
-///   batch are committed atomically from the stealer's POV.
-/// - Owner never writes to any index `i` where `head <= i < tail`, so
-///   stealers that copy slots between their `head` load and their CAS on
-///   `head` cannot race the owner — worst case another stealer wins
-///   the CAS and this stealer's slot reads are discarded.
-/// - Owner-vs-stealer race on the last element: same pattern as
-///   Chase-Lev's `popBottom`. Owner does a seq_cst fence and re-reads
-///   `head` before claiming the slot; if the stealer has moved head past
-///   the slot, the owner backs off.
+/// - Every take, owner or stealer, claims its items with a seq_cst CAS on
+///   `head`. The CAS is the linearization point: a claim succeeds only if
+///   `head` has not moved since the claimant loaded it, so no item is
+///   claimed twice and `head` never passes `tail`.
+/// - Owner never writes to any index `i` where `head <= i < tail`. A
+///   stealer copies slots between its `head` load and its CAS; if the owner
+///   reuses one of those slots, `head` must have moved first, so the CAS
+///   fails and the copy is discarded.
+/// - SONNY-2448: before v0.2.8 the owner popped LIFO from `tail` and
+///   arbitrated only the last element. A stealer's batch claim could then
+///   land after the owner had taken (or re-pushed into) the batch's slots:
+///   duplicates, lost tasks, and `head` past `tail`. Popping from `head`
+///   removes that window. The replays at the bottom of this file pin it.
 ///
 /// Buffer size must be a power of 2.
 pub fn RingQueue(comptime T: type) type {
@@ -64,11 +69,11 @@ pub fn RingQueue(comptime T: type) type {
             const t = self.tail.load(.acquire);
             const h = self.head.load(.acquire);
             const diff = t -% h;
-            // Owner's `pop` transiently stores `tail = t-1` before the empty-check;
-            // a stealer reading that intermediate tail with a still-current head
-            // computes `t -% h` as a wrapped value > capacity. Clamp to 0 so
-            // callers (stats peak tracking, empty-victim skip) see a consistent
-            // "empty or near-empty" state rather than ~u32_max.
+            // `tail` is loaded before `head`. If items were pushed and taken in
+            // between, `head` can be ahead of the loaded `tail`, and `t -% h`
+            // wraps to a value > capacity. Clamp to 0 so callers (stats peak
+            // tracking, empty-victim skip) see "empty or near-empty" rather
+            // than ~u32_max.
             if (diff > @as(u32, @intCast(self.buffer.len))) return 0;
             return diff;
         }
@@ -84,31 +89,25 @@ pub fn RingQueue(comptime T: type) type {
             return true;
         }
 
-        /// Owner-only. Pop from the tail (LIFO). Returns null if empty.
+        /// Owner-only. Pop the oldest item from `head` (FIFO). Returns null
+        /// if empty.
+        ///
+        /// Claims the item with the same CAS on `head` that `stealHalf` uses,
+        /// so an in-flight batch steal whose copy covers this item fails its
+        /// claim and retries. The loop is bounded: a failed CAS means a
+        /// stealer took at least one item, and only the owner (which is here)
+        /// can add items, so it runs at most `capacity` times.
         pub fn pop(self: *Self) ?T {
-            const t = self.tail.load(.monotonic);
-            const new_tail = t -% 1;
-            // Reserve the slot by dropping tail first; seq_cst pair with
-            // stealers' CAS on head resolves the last-element race.
-            self.tail.store(new_tail, .seq_cst);
-            const h = self.head.load(.seq_cst);
-            if (h == t) {
-                // Queue was empty — restore tail and bail.
-                self.tail.store(t, .monotonic);
-                return null;
-            }
-            const value = self.buffer[new_tail & self.mask].load(.monotonic);
-            if (h == new_tail) {
-                // Last element: race with stealers.
-                if (self.head.cmpxchgStrong(h, h +% 1, .seq_cst, .monotonic) != null) {
-                    // A stealer won; queue is now empty.
-                    self.tail.store(t, .monotonic);
-                    return null;
+            while (true) {
+                const h = self.head.load(.acquire);
+                // Owner is tail's only writer: its own last store is current.
+                const t = self.tail.load(.monotonic);
+                if (t == h) return null;
+                const value = self.buffer[h & self.mask].load(.monotonic);
+                if (self.head.cmpxchgWeak(h, h +% 1, .seq_cst, .monotonic) == null) {
+                    return value;
                 }
-                // We won — publish the empty state.
-                self.tail.store(t, .monotonic);
             }
-            return value;
         }
 
         /// Any thread. Steal up to `(len+1)/2` items into `dst`. Returns the
@@ -117,14 +116,12 @@ pub fn RingQueue(comptime T: type) type {
         /// monotonically increasing within the u32 range we actually use.
         pub fn stealHalf(self: *Self, dst: []T) usize {
             if (dst.len == 0) return 0;
-            // Retry budget. The transient `avail > capacity` window (owner
-            // mid-pop) and CAS-contention retries should resolve within a
-            // handful of iterations; anything longer signals either a genuine
-            // livelock (e.g. pre-existing head-past-tail wrap state reached
-            // via a still-uncharacterized race in pop/steal) or a degenerate
-            // contention pattern that's better served by moving to the next
-            // victim. Cap rather than spin forever so shutdown cannot stall
-            // waiting for a livelocked worker to leave stealHalf.
+            // Retry budget. The transient `avail > capacity` read (a stale
+            // `head`, see below) and CAS-contention retries resolve within a
+            // handful of iterations; anything longer is a degenerate
+            // contention pattern better served by moving to the next victim.
+            // Cap rather than spin forever so shutdown cannot stall waiting
+            // for a worker to leave stealHalf.
             var retries: u32 = 0;
             while (true) {
                 if (retries >= 256) return 0;
@@ -134,11 +131,10 @@ pub fn RingQueue(comptime T: type) type {
                 const t = self.tail.load(.acquire);
                 const avail = t -% h;
                 if (avail == 0) return 0;
-                // Owner's `pop` transiently stores `tail = t-1` before checking
-                // for the empty race; a stealer observing that intermediate
-                // tail alongside an unchanged head sees `avail` wrap past
-                // buffer capacity. Treat it as a transient inconsistent read
-                // and retry rather than trusting the value.
+                // `head` was loaded before `tail`. If the owner popped and
+                // pushed in between, `avail` can exceed capacity. Treat it as
+                // an inconsistent read and retry rather than trusting it
+                // (Go's `runqgrab` does the same).
                 if (avail > @as(u32, @intCast(self.buffer.len))) continue;
                 // Steal half (round up) — matches Tokio/Go.
                 var n: u32 = (avail + 1) / 2;
@@ -152,14 +148,14 @@ pub fn RingQueue(comptime T: type) type {
                 if (self.head.cmpxchgStrong(h, h +% n, .seq_cst, .monotonic) == null) {
                     return n;
                 }
-                // CAS failed: another stealer (or owner last-element race)
-                // moved head. Retry — the slot reads are discarded.
+                // CAS failed: the owner or another stealer moved head. Retry;
+                // the slot reads are discarded.
             }
         }
     };
 }
 
-test "ring queue: push/pop LIFO" {
+test "ring queue: owner push/pop is FIFO" {
     const Q = RingQueue(u32);
     var q = try Q.init(std.testing.allocator, 8);
     defer q.deinit();
@@ -167,10 +163,32 @@ test "ring queue: push/pop LIFO" {
     try std.testing.expect(q.tryPush(1));
     try std.testing.expect(q.tryPush(2));
     try std.testing.expect(q.tryPush(3));
-    try std.testing.expectEqual(@as(?u32, 3), q.pop());
-    try std.testing.expectEqual(@as(?u32, 2), q.pop());
     try std.testing.expectEqual(@as(?u32, 1), q.pop());
+    try std.testing.expectEqual(@as(?u32, 2), q.pop());
+    try std.testing.expectEqual(@as(?u32, 3), q.pop());
     try std.testing.expectEqual(@as(?u32, null), q.pop());
+}
+
+test "ring queue: pop and push wrap the ring" {
+    const Q = RingQueue(u32);
+    var q = try Q.init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    var next_push: u32 = 0;
+    var next_pop: u32 = 0;
+    var round: u32 = 0;
+    while (round < 10) : (round += 1) {
+        while (q.tryPush(next_push)) next_push += 1;
+        try std.testing.expectEqual(@as(usize, 4), q.len());
+        try std.testing.expectEqual(@as(?u32, next_pop), q.pop());
+        try std.testing.expectEqual(@as(?u32, next_pop + 1), q.pop());
+        next_pop += 2;
+    }
+    while (q.pop()) |value| {
+        try std.testing.expectEqual(next_pop, value);
+        next_pop += 1;
+    }
+    try std.testing.expectEqual(next_push, next_pop);
 }
 
 test "ring queue: full rejects push" {
@@ -252,7 +270,8 @@ test "ring queue: wraparound via head advance" {
 // In the pool, the three outcomes these replays pin were: a panic on a
 // never-written slot (`index out of bounds: index 2863311530` in runTask,
 // i.e. 0xAAAAAAAA), a task that never ran and hung its wait group, and a
-// task dispatched twice.
+// task dispatched twice. With the FIFO owner pop, every owner take inside
+// the window moves `head`, so the stale claim fails and the stealer retries.
 
 /// Test-only record of every value pushed to, and taken from, a replayed
 /// queue.

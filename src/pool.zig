@@ -272,6 +272,10 @@ const LocalQueue = union(enum) {
         };
     }
 
+    /// Owner-only take. Order depends on the queue kind: `chase_lev` pops
+    /// the newest entry (LIFO from `bottom`); `ring` pops the oldest (FIFO
+    /// from `head`, SONNY-2448). The pool relies on neither order: the
+    /// newest local submit is served first by `Worker.lifo_slot`.
     fn popBottom(self: *LocalQueue) ?QueueEntry {
         return switch (self.*) {
             .chase_lev => |*q| q.popBottom(),

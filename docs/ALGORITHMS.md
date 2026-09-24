@@ -202,8 +202,10 @@ Reference: `src/queue/work_deque.zig`.
 
 The default owner-local queue, modelled on Tokio's
 `runtime/scheduler/multi_thread/queue.rs` and Go's `runq*` in
-`runtime/proc.go`. Single producer (owner) writes tail; any thread may
-`stealHalf` in batches from head.
+`runtime/proc.go`. Single producer (owner) writes tail. The owner pops one
+item from head (FIFO, like Go's `runqget` and Tokio's `pop`); any thread
+may `stealHalf` in batches from head. LIFO locality for "task spawns task"
+comes from the worker's `lifo_slot`, not from this queue.
 
 ```mermaid
 flowchart LR
@@ -214,13 +216,14 @@ flowchart LR
         OP2 -- no --> OP4[buffer t mask := value unordered]
         OP4 --> OP5[tail.store t+1 release]
     end
-    subgraph ownerpop[Owner pop tail LIFO]
-        OPP1[new_tail := tail - 1 seq_cst]
-        OPP1 --> OPP2[h := head load seq_cst]
-        OPP2 -- empty --> OPP3[Restore tail, return null]
-        OPP2 --> OPP4{h == new_tail last?}
-        OPP4 -- yes --> OPP5[CAS head to h+1 race with stealers]
-        OPP4 -- no --> OPP6[Return buffer new_tail mask]
+    subgraph ownerpop[Owner pop head FIFO]
+        OPP1[h := head acquire, t := tail]
+        OPP1 --> OPP2{t == h?}
+        OPP2 -- yes --> OPP3[Return null - empty]
+        OPP2 -- no --> OPP4[v := buffer h mask]
+        OPP4 --> OPP5[CAS head to h+1 seq_cst]
+        OPP5 -- lost --> OPP1
+        OPP5 -- won --> OPP6[Return v]
     end
     subgraph stealhalf[Stealer stealHalf]
         S1[h := head, t := tail acquire]
@@ -237,13 +240,18 @@ flowchart LR
 Correctness sketch:
 
 - Owner is the sole writer of `tail` and of slot contents.
-- Stealers synchronise with each other via seq-cst CAS on `head`, which
-  is the linearization point of a batch.
-- Owner never writes slot `i` while `head <= i < tail`, so stealer reads
-  between load-head and CAS-head are safe — worst case another stealer
-  wins the CAS and the loser's reads are discarded.
-- Owner-vs-stealer race on the last element: seq-cst fence on tail then
-  re-read head, same pattern as Chase-Lev's `popBottom`.
+- Every take, owner pop or batch steal, claims its items with a seq-cst
+  CAS on `head`, which is the linearization point. A claim succeeds only
+  if `head` has not moved since the claimant loaded it, so no item is
+  taken twice and `head` never passes `tail`.
+- Owner never writes slot `i` while `head <= i < tail`. If the owner
+  reuses a slot a stealer copied, `head` moved first, so the stealer's CAS
+  fails and its copy is discarded.
+- Before v0.2.8 the owner popped LIFO from `tail` and arbitrated only the
+  last element, so a batch claim could land after the owner had taken or
+  re-pushed items inside the batch (duplicates, lost tasks, `head` past
+  `tail`; SONNY-2448). The deterministic replays in
+  `src/queue/ring_queue.zig` pin all three.
 
 Reference: `src/queue/ring_queue.zig`.
 

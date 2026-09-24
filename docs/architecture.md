@@ -144,14 +144,16 @@ flowchart TB
     Idle -- signalled --> Top
     Idle -- timeout --> Top
 
-    Next --> DrainPriority[Drain priority:<br/>1. lifo_slot swap - acquire<br/>2. local_queue popBottom<br/>3. tryDrainLaneForWorker own lane<br/>4. cross-lane rebalance if allowed]
+    Next --> DrainPriority[Drain priority:<br/>1. lifo_slot swap - acquire<br/>2. local_queue pop - ring FIFO<br/>3. tryDrainLaneForWorker own lane<br/>4. cross-lane rebalance if allowed]
     DrainPriority --> Steal[Iterate workers_nonempty<br/>for each set bit:<br/>victim_queue.stealHalf -> own local_queue]
 ```
 
 Details:
 
 - **LIFO slot first** makes worker-context submit → drain a cache-resident
-  handoff.
+  handoff. The ring local queue behind it pops FIFO from `head` (Go
+  `runqget`, Tokio `pop`), so the owner and batch stealers claim through
+  the same CAS (SONNY-2448).
 - **`owned_queue_len` reconciliation:** if `popBottom` returns null but
   the owner counter was > 0, stealers drained the queue — reset to 0 and
   clear the bitmap bit.
