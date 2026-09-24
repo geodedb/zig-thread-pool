@@ -592,6 +592,15 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
     // snapshot carries separate default/blocking wait+exec summaries in
     // addition to the pool-wide `task_{wait,exec}_ns`. We exercise both
     // lanes and assert that both per-lane histograms receive samples.
+    //
+    // SONNY-2427: the split is keyed on `Worker.serves_lane`, not on the
+    // task's lane, and the blocking worker always helps the default lane
+    // (Slice L3). Nothing used to decide which workers drained the 64
+    // default-lane tasks; whenever the blocking worker reached them first
+    // it ran all 80 tasks and `default_wait_ns.count` was legitimately 0.
+    // Pin the placement instead: hold the only blocking worker inside a
+    // blocking-lane gate task while the default-lane tasks run, so only
+    // default workers can run them.
     if (thread_pool.build_options.timestamp_mode == .disabled) return error.SkipZigTest;
     try common.skipIfSchedulerVariantIncompatible(.lane_extension);
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
@@ -606,29 +615,46 @@ test "per-lane histograms populated when allow_blocking_lane=true" {
     });
     defer pool.deinit();
 
-    var wg = pool.waitGroup();
     var counter = common.Counter{};
-    // 64 default-lane tasks and 16 blocking-lane tasks; both lanes must
-    // end up with a nonzero histogram count, and the pool-wide summary
-    // count must equal their sum.
-    for (0..64) |_| {
-        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &wg });
+    var gate = common.GateTaskContext{ .counter = &counter };
+    // Runs before `pool.deinit()` (defers are LIFO), so a failed
+    // assertion can never leave the blocking worker stuck in the gate.
+    defer gate.release.store(true, .release);
+
+    var blocking_wg = pool.waitGroup();
+    _ = try pool.submit(common.gateTask, @ptrCast(&gate), .{ .wait_group = &blocking_wg, .lane = .blocking });
+    const gate_deadline = thread_pool.clock.nanoTimestamp() + 10 * std.time.ns_per_s;
+    while (!gate.started.load(.acquire)) {
+        if (thread_pool.clock.nanoTimestamp() > gate_deadline) return error.GateTaskNeverStarted;
+        thread_pool.clock.sleep(50 * std.time.ns_per_us);
     }
-    for (0..16) |_| {
+
+    // 64 default-lane tasks and 16 blocking-lane tasks (the gate plus 15);
+    // each lane's histograms must count exactly its own tasks, and the
+    // pool-wide summary count must equal their sum.
+    var default_wg = pool.waitGroup();
+    for (0..64) |_| {
+        _ = try pool.submit(common.counterTask, @ptrCast(&counter), .{ .wait_group = &default_wg });
+    }
+    default_wg.wait();
+
+    gate.release.store(true, .release);
+    for (0..15) |_| {
         _ = try pool.submit(
             common.counterTask,
             @ptrCast(&counter),
-            .{ .wait_group = &wg, .lane = .blocking },
+            .{ .wait_group = &blocking_wg, .lane = .blocking },
         );
     }
-    wg.wait();
+    blocking_wg.wait();
 
     const stats = pool.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 80), counter.value.load(.acquire));
-    try std.testing.expect(stats.default_wait_ns.count > 0);
-    try std.testing.expect(stats.default_exec_ns.count > 0);
-    try std.testing.expect(stats.blocking_wait_ns.count > 0);
-    try std.testing.expect(stats.blocking_exec_ns.count > 0);
+    // With placement pinned, the per-lane counts are exact.
+    try std.testing.expectEqual(@as(u64, 64), stats.default_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 64), stats.default_exec_ns.count);
+    try std.testing.expectEqual(@as(u64, 16), stats.blocking_wait_ns.count);
+    try std.testing.expectEqual(@as(u64, 16), stats.blocking_exec_ns.count);
     // Pool-wide count is the sum of lane counts.
     try std.testing.expectEqual(
         stats.task_wait_ns.count,
