@@ -908,55 +908,67 @@ test "fuzz Config validation never panics" {
 }
 
 test "phase g2: worker returns from idle when lifo slot filled during spin window" {
+    // SONNY-2427: this test used to assert that the task ran < 1 ms after
+    // submit. That bound belongs to the OS scheduler, not the pool: with
+    // both workers parked, `scanAndWake` signals one within microseconds
+    // of the submit, but under CPU contention the kernel can take several
+    // ms to run the woken worker, and pinned to one CPU the old
+    // busy-waiting main thread starved it until preempted. The end-of-spin
+    // local-work probe the name refers to was dropped by the G2 re-land
+    // (see `Core.idle`); what the pool guarantees is that the
+    // spin-then-park handshake never loses the submit's wakeup. Assert
+    // that without a latency bound: the park timeout is far longer than
+    // the dispatch watchdog, so the task runs in time only if the wake
+    // reached a parked worker.
     const allocator = std.testing.allocator;
+    const watchdog_ns: i96 = 10 * std.time.ns_per_s;
 
     var pool = try thread_pool.ThreadPool.init(allocator, .{
         .min_threads = 2,
         .max_threads = 2,
         .scheduler_variant = .work_stealing,
         .queue_capacity = 256,
-        // Spin long enough that a submit landing during the spin window
-        // exercises the end-of-spin local-work probe (not the park/wake
-        // path) — but short enough the whole spin fits well inside the
-        // 1 ms latency assertion.
+        // Workers spin before parking, as in the original G2 scenario.
         .spin_before_park_iters = 10_000,
-        // Tight park timeout — if we DO accidentally park, the test
-        // wakes quickly but fails the latency assertion below.
-        .idle_park_after_ns = 500_000_000,
+        // A lost wakeup would strand the task until this timeout.
+        .idle_park_after_ns = 60 * std.time.ns_per_s,
+        // Bounds deinit on that failure path: shutdown(.drain) waits for
+        // the stranded task until this deadline, then joinAllWorkers
+        // broadcasts the parked workers awake.
+        .deinit_timeout_ns = 5 * std.time.ns_per_s,
     });
     defer pool.deinit();
 
-    // Give workers time to enter idle().
-    thread_pool.clock.sleep(5 * std.time.ns_per_ms);
+    // Replaces the old 5 ms sleep: wait until both workers are past their
+    // spin window and on the park path.
+    const setup_ns = thread_pool.clock.nanoTimestamp();
+    while (pool.statsSnapshot().parks < 2) {
+        if (thread_pool.clock.nanoTimestamp() - setup_ns > watchdog_ns) return error.WorkersNeverParked;
+        thread_pool.clock.sleep(50 * std.time.ns_per_us);
+    }
 
     const Ctx = struct {
-        ran_at_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        ran: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         fn run(ctx_ptr: *anyopaque, _: *thread_pool.TaskContext) void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            self.ran_at_ns.store(@intCast(thread_pool.clock.nanoTimestamp()), .release);
+            self.ran.store(true, .release);
         }
     };
     var ctx = Ctx{};
 
-    const submit_ns: u64 = @intCast(thread_pool.clock.nanoTimestamp());
+    // The pool's first submit always runs the wake scan (it is the head
+    // of a `wake_coalesce_batch` window), so it must signal a parked
+    // worker.
     _ = try pool.submit(Ctx.run, &ctx, .{});
 
-    // Busy-wait up to 50 ms for the task to run.
-    const deadline = submit_ns + 50 * std.time.ns_per_ms;
-    while (ctx.ran_at_ns.load(.acquire) == 0) {
-        if (@as(u64, @intCast(thread_pool.clock.nanoTimestamp())) > deadline) break;
-        std.atomic.spinLoopHint();
+    // Poll with a sleep, not a spin, so this thread never competes for
+    // CPU with the worker it is waiting on.
+    const submit_ns = thread_pool.clock.nanoTimestamp();
+    while (!ctx.ran.load(.acquire)) {
+        if (thread_pool.clock.nanoTimestamp() - submit_ns > watchdog_ns) break;
+        thread_pool.clock.sleep(50 * std.time.ns_per_us);
     }
-
-    const ran_at = ctx.ran_at_ns.load(.acquire);
-    try std.testing.expect(ran_at != 0); // task ran
-    const latency_ns = ran_at - submit_ns;
-    // Assert latency well below the park timeout. If the worker parked
-    // (because the spin didn't re-probe local state), latency would be
-    // dominated by park_cond.signal round-trip (~15 µs) which is still
-    // below 1 ms — so we assert < 1 ms to catch "spin didn't probe at all"
-    // regressions without flapping on ordinary park wakes.
-    try std.testing.expect(latency_ns < 1 * std.time.ns_per_ms);
+    try std.testing.expect(ctx.ran.load(.acquire));
 }
 
 test "per-worker park: submit wakes a parked worker" {
