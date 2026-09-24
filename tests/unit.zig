@@ -1627,6 +1627,13 @@ test "releaseSubmitter drains desc_cache back to global freelist" {
     // the pre-registration value.
     pool.releaseSubmitter(slot);
 
+    // SONNY-2427: join the workers before reading task_desc_live.
+    // finalizeTask calls `wait_group.done()` before `releaseDescriptor()`,
+    // so wg.wait() can return while a worker still holds the last task's
+    // descriptor. shutdown(.drain) does not touch submitter caches, so the
+    // count below still depends on releaseSubmitter's drain.
+    try pool.shutdown(.drain, 10 * std.time.ns_per_s);
+
     const stats_after = pool.statsSnapshot();
     try std.testing.expectEqual(live_before, stats_after.task_desc_live);
 }
