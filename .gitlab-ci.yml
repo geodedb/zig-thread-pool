@@ -41,22 +41,22 @@ default:
     - linux
 
 include:
-  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.54.6
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.6
 
   # Zig formatting (Linux).
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.6
     inputs:
       zig_version: "0.16.0"
       paths: "src/ tests/ benchmarks/ examples/"
 
   # Zig build (Linux): static lib + check-compile.
-  - component: gitlab.com/devnw/ci-catalog/zig-build@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-build@v1.55.6
     inputs:
       stage: build
       zig_version: "0.16.0"
@@ -66,7 +66,7 @@ include:
   # Explicit tags override the catalog's `tags: []` default which would
   # otherwise emit an untagged job that matches any runner (including the
   # company Windows runners — bash-on-PowerShell == fail).
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-debug"
@@ -78,7 +78,7 @@ include:
   # compiling and passing. Integration tests are deliberately NOT
   # wired here — two_pool_cross_submit requires multiple pools and
   # must never run under -Dsingle-pool=true.
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-single-pool"
@@ -86,34 +86,34 @@ include:
       test_options: "--summary all -Dsingle-pool=true"
       optimize: "Debug"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-stress"
@@ -122,7 +122,7 @@ include:
 
   # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
   # budget; timeout: is GitLab's job cap.
-  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.55.6
     inputs:
       zig_version: "0.16.0"
       test_step: "test"
@@ -132,22 +132,22 @@ include:
       allow_failure: true
 
   # Zig build + tests on macOS (gated).
-  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.55.6
     inputs:
       zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
-  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
-  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
-  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-stress"
@@ -156,31 +156,31 @@ include:
   # Zig build + tests on Windows (gated). tags override routes these to
   # the self-hosted company Windows runner group; remove the override
   # once ci-catalog >v1.22.0 lands and bakes the new default in.
-  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.55.6
     inputs:
       zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.54.6
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.6
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -254,7 +254,7 @@ zig-test-windows-stress-0.16.0:
   # `docker buildx imagetools inspect ubuntu:24.04` (or
   # `skopeo inspect --format '{{.Digest}}' docker://docker.io/library/ubuntu:24.04`)
   # and update both the digest and this date.
-  image: "ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78"
+  image: "ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7"
   interruptible: true
   before_script:
     - apt-get update -qq
