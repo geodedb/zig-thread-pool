@@ -47,7 +47,9 @@ include:
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.6
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.6
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.6
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.6
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
+    inputs:
+      release_auth: job_token
 
   # Zig formatting (Linux).
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.6
@@ -373,3 +375,13 @@ tsan-fuzz:
     - FUZZ_SEED=2 zig build fuzz -Dtsan
     - FUZZ_SEED=3 zig build fuzz -Dtsan
   timeout: 30m
+
+# SONNY-4778: external hook tools must preserve the enclosing worktree.
+hook-env-regression:
+  stage: lint
+  image: python:3.14-slim-bookworm
+  tags: [company, linux, x86]
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/test_hook_env.py
