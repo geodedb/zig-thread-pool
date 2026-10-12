@@ -8,10 +8,11 @@
 # pins since those APIs haven't changed.
 #
 # Linux jobs run on the self-hosted company Linux runner pool
-# (`company` + `linux` tags) — the bare `company` tag is shared with
+# (`company` + `linux` + `x86` tags) — the bare `company` tag is shared with
 # the Windows runner group, so without `linux` GitLab can route a
 # Linux job to a Windows runner and explode on the bash-on-PowerShell
-# mismatch. macOS jobs still use GitLab SaaS (`saas-macos-medium-m1`);
+# mismatch. The x86 tag also excludes ARM hosts from x86 scanner jobs.
+# macOS jobs still use GitLab SaaS (`saas-macos-medium-m1`);
 # Windows jobs use the self-hosted company Windows runner group
 # (`company` + `windows` tags) instead of GitLab SaaS. Cross-OS jobs
 # are gated behind rules + allow_failure so pipelines without those
@@ -39,27 +40,43 @@ default:
   tags:
     - company
     - linux
+    - x86
 
 include:
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
     inputs:
+      tags: ["company", "linux", "x86"]
       release_auth: job_token
 
   # Zig formatting (Linux).
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.6
     inputs:
+      tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       paths: "src/ tests/ benchmarks/ examples/"
 
   # Zig build (Linux): static lib + check-compile.
   - component: gitlab.com/devnw/ci-catalog/zig-build@v1.55.6
     inputs:
+      tags: ["company", "linux", "x86"]
       stage: build
       zig_version: "0.16.0"
       build_options: "build check"
@@ -74,7 +91,7 @@ include:
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   # Single-pool comptime gate (QR-002): unit suite only with
   # -Dsingle-pool=true so the F-001 identity-check elision keeps
   # compiling and passing. Integration tests are deliberately NOT
@@ -87,45 +104,46 @@ include:
       test_step: "test"
       test_options: "--summary all -Dsingle-pool=true"
       optimize: "Debug"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.6
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
 
   # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
   # budget; timeout: is GitLab's job cap.
   - component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.55.6
     inputs:
+      tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       test_step: "test"
       test_options: "--fuzz"
@@ -183,6 +201,8 @@ include:
       test_step: "test-stress"
       tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.6
+    inputs:
+      tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
