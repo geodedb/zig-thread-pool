@@ -138,14 +138,15 @@ include:
 
   # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
   # budget; timeout: is GitLab's job cap.
-  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@0cf09295dd14e61d0b84228d6c46331e87a50a5a
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       test_step: "test"
       test_options: "--fuzz"
       fuzz_duration: "60"
-      timeout: "5m"
+      # Include cold autoscaler startup and toolchain setup in the job cap.
+      timeout: "15m"
       allow_failure: true
 
   # Zig build + tests on macOS (gated).
