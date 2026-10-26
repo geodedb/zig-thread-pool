@@ -561,12 +561,10 @@ test "steal-scan bitmap: wide-pool flood with cpu-count workers" {
     try std.testing.expectEqual(total, counter.value.load(.acquire));
 }
 
-test "hot_spinners: slow tasks force parked worker recruitment via propagation" {
-    // hot_spinners=1 with slow tasks (100µs each). After the first
-    // wake_every_n_tasks=4 tasks complete, the spinner must wake a
-    // parked worker. If propagation is broken, all work stays on the
-    // single hot-spinner and the test takes ~N × 100µs instead of
-    // running in parallel.
+test "hot_spinners: slow tasks recruit parked workers concurrently" {
+    // Observe worker overlap directly. A 100µs sleep can take much longer
+    // on Windows or a busy runner, so total elapsed time cannot distinguish
+    // serial execution from successful worker recruitment.
     var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
         .min_threads = 4,
         .max_threads = 4,
@@ -581,34 +579,50 @@ test "hot_spinners: slow tasks force parked worker recruitment via propagation" 
 
     const SlowCtx = struct {
         counter: *common.Counter,
-        sleep_ns: u64,
+        active: std.atomic.Value(u32) = .init(0),
+        parallel_seen: std.atomic.Value(bool) = .init(false),
+        stalled: std.atomic.Value(bool) = .init(false),
+        deadline_ns: i96,
         fn run(raw: *anyopaque, rt: *thread_pool.TaskContext) void {
             _ = rt;
             const ctx: *@This() = @ptrCast(@alignCast(raw));
-            thread_pool.clock.sleep(ctx.sleep_ns);
-            _ = ctx.counter.value.fetchAdd(1, .monotonic);
+            if (ctx.active.fetchAdd(1, .acq_rel) > 0) {
+                ctx.parallel_seen.store(true, .release);
+            }
+            defer _ = ctx.active.fetchSub(1, .acq_rel);
+
+            // Let the initial four tasks finish so a hot worker can reach
+            // wake_every_n_tasks before requiring another worker to join.
+            if (ctx.counter.value.load(.acquire) >= 4) {
+                while (!ctx.parallel_seen.load(.acquire)) {
+                    if (thread_pool.clock.nanoTimestamp() >= ctx.deadline_ns) {
+                        ctx.stalled.store(true, .release);
+                        break;
+                    }
+                    thread_pool.clock.sleep(100_000);
+                }
+            }
+            thread_pool.clock.sleep(100_000);
+            _ = ctx.counter.value.fetchAdd(1, .release);
         }
     };
 
     var counter = common.Counter{};
-    var slow = SlowCtx{ .counter = &counter, .sleep_ns = 100_000 };
+    var slow = SlowCtx{
+        .counter = &counter,
+        .deadline_ns = thread_pool.clock.nanoTimestamp() + 5 * std.time.ns_per_s,
+    };
     var wg = pool.waitGroup();
     const total: u64 = 80;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
         _ = try pool.submit(SlowCtx.run, @ptrCast(&slow), .{ .wait_group = &wg });
     }
-    const start_ns = thread_pool.clock.nanoTimestamp();
     wg.wait();
-    const elapsed_ns = thread_pool.clock.nanoTimestamp() - start_ns;
 
     try std.testing.expectEqual(total, counter.value.load(.acquire));
-
-    // Serial execution on 1 hot-spinner: 80 * 100µs = 8ms.
-    // With propagation recruiting 3 parked workers: ~80/4 * 100µs ≈ 2ms.
-    // Allow generous 6ms ceiling to absorb noise; serial behavior would
-    // clearly exceed this.
-    try std.testing.expect(elapsed_ns < 6 * std.time.ns_per_ms);
+    try std.testing.expect(!slow.stalled.load(.acquire));
+    try std.testing.expect(slow.parallel_seen.load(.acquire));
 }
 
 test "hot_spinners: wide-pool flood with cpu-count workers, hot_spinners=1" {
