@@ -25,6 +25,7 @@
 # the auto-cancel actually kicks in; opt out per-job when needed.
 workflow:
   auto_cancel:
+    on_job_failure: all
     on_new_commit: interruptible
   rules:
     - if: '$CI_COMMIT_TAG'
@@ -229,17 +230,21 @@ stages:
     allow_failure: true
 
 zig-build-macos-0.16.0:
+  tags: [dedicated, macos, arm]
   rules: *cross-os-rules
 
 zig-test-macos-unit-0.16.0:
+  tags: [dedicated, macos, arm]
   rules: *cross-os-rules
   needs: ["zig-build-macos-0.16.0"]
 
 zig-test-macos-integration-0.16.0:
+  tags: [dedicated, macos, arm]
   rules: *cross-os-rules
   needs: ["zig-build-macos-0.16.0"]
 
 zig-test-macos-stress-0.16.0:
+  tags: [dedicated, macos, arm]
   rules: *cross-os-rules
   needs: ["zig-build-macos-0.16.0"]
 
