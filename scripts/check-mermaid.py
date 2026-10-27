@@ -24,6 +24,7 @@ Install locally with:
 or globally with:
     npm install -g @mermaid-js/mermaid-cli
 """
+
 from __future__ import annotations
 
 import os
@@ -32,7 +33,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -91,6 +91,7 @@ def validate_block(
         try:
             r = subprocess.run(
                 [*mmdc, "-i", str(inp), "-o", str(out), "-q"],
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=120,
