@@ -12,7 +12,8 @@
 # the Windows runner group, so without `linux` GitLab can route a
 # Linux job to a Windows runner and explode on the bash-on-PowerShell
 # mismatch. The x86 tag also excludes ARM hosts from x86 scanner jobs.
-# macOS jobs still use GitLab SaaS (`saas-macos-medium-m1`);
+# macOS jobs use the devnw dedicated Apple Silicon runners
+# (`dedicated` + `macos` + `arm` tags);
 # Windows jobs use the self-hosted company Windows runner group
 # (`company` + `windows` tags) instead of GitLab SaaS. Cross-OS jobs
 # are gated behind rules + allow_failure so pipelines without those
@@ -152,21 +153,25 @@ include:
   # Zig build + tests on macOS (gated).
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.58.0
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.58.0
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.58.0
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.58.0
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
