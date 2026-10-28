@@ -228,6 +228,17 @@ pub fn build(b: *std.Build) void {
     if (tsan) stress_tests.root_module.sanitize_thread = true;
     stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
+    // SONNY-2540: a focused, optimization-aware regression executable lets
+    // the qualification harness run fresh pinned/unpinned processes.
+    const recruitment_tests = b.addTest(.{
+        .name = "parked-recruitment-test",
+        .root_module = importedModule(b, "tests/parked_recruitment.zig", target, optimize, module, deps),
+    });
+    const recruitment_step = b.step("test-recruitment", "Run the parked-worker handshake regression");
+    recruitment_step.dependOn(&b.addRunArtifact(recruitment_tests).step);
+    const recruitment_build = b.step("build-recruitment", "Install the recruitment regression executable");
+    recruitment_build.dependOn(&b.addInstallArtifact(recruitment_tests, .{}).step);
+
     const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
     all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(check_tests).step);
