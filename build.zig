@@ -173,7 +173,10 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/unit.zig", target, optimize, module, deps),
     });
-    if (tsan) unit_tests.root_module.sanitize_thread = true;
+    if (tsan) {
+        unit_tests.root_module.sanitize_thread = true;
+        unit_tests.use_llvm = true;
+    }
     unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
     // Also RUN the in-file module tests (src/**). Previously they were only
     // compiled by `zig build check` and never executed, so regressions
@@ -215,7 +218,10 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/integration.zig", target, optimize, module, deps),
     });
-    if (tsan) integration_tests.root_module.sanitize_thread = true;
+    if (tsan) {
+        integration_tests.root_module.sanitize_thread = true;
+        integration_tests.use_llvm = true;
+    }
     integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
     // Under TSan, switch stress from ReleaseFast to Debug so races are not
@@ -225,8 +231,22 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module, deps),
     });
-    if (tsan) stress_tests.root_module.sanitize_thread = true;
+    if (tsan) {
+        stress_tests.root_module.sanitize_thread = true;
+        stress_tests.use_llvm = true;
+    }
     stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
+
+    // ThreadSanitizer regression suite. Always instrumented: `sanitize_thread`
+    // needs the LLVM backend, because the self-hosted x86_64 backend used for
+    // Debug builds ignores it and produces an uninstrumented binary.
+    const tsan_step = b.step("test-tsan", "Run the ThreadSanitizer regression suite");
+    const tsan_tests = b.addTest(.{
+        .root_module = importedModule(b, "tests/tsan.zig", target, .Debug, module, deps),
+        .use_llvm = true,
+    });
+    tsan_tests.root_module.sanitize_thread = true;
+    tsan_step.dependOn(&b.addRunArtifact(tsan_tests).step);
 
     const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
     all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -346,7 +366,10 @@ pub fn build(b: *std.Build) void {
         .name = "pool-fuzz",
         .root_module = importedModule(b, "tests/fuzz/pool_fuzz.zig", target, optimize, module, deps),
     });
-    if (tsan) fuzz_exe.root_module.sanitize_thread = true;
+    if (tsan) {
+        fuzz_exe.root_module.sanitize_thread = true;
+        fuzz_exe.use_llvm = true;
+    }
     b.installArtifact(fuzz_exe);
     const run_fuzz = b.addRunArtifact(fuzz_exe);
     run_fuzz.has_side_effects = true;
