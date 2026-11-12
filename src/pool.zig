@@ -2251,8 +2251,8 @@ const Core = struct {
         // with the sentinel cleared in finalizeTask BEFORE the broadcast or
         // release (see runTask's final block below for the ordering reason).
         const start_ns = self.recordTaskStart(worker, descriptor, worker_index, descriptor_index);
-        self.invokeTask(worker, descriptor, worker_index);
-        self.finalizeTask(worker, descriptor, descriptor_index, start_ns);
+        const cancelled = invokeTask(worker, descriptor, worker_index);
+        self.finalizeTask(worker, descriptor, descriptor_index, start_ns, cancelled);
     }
 
     /// QS-003 hot-path helper: claim sentinel + timestamps + increments.
@@ -2322,17 +2322,19 @@ const Core = struct {
     ///
     /// Builds the `TaskContext`, checks cancellation, and either runs the
     /// user's `task_fn` bracketed by `scratch.beginTask/finishTask`, or
-    /// marks the descriptor cancelled without running user code.
+    /// skips user code. Returns true when the task was cancelled; the
+    /// terminal state is published by `finalizeTask`, not here, because a
+    /// `wait()` caller may release a waitable descriptor as soon as it sees
+    /// `.cancelled` (SONNY-6375).
     ///
     /// Contract: `descriptor.task_fn` and `descriptor.ctx` are guaranteed
     /// non-null by the submit path; the `.?` deref is load-bearing here and
     /// must not be changed to an `orelse` fallback.
     inline fn invokeTask(
-        self: *Core,
         worker: *Worker,
         descriptor: *TaskDescriptor,
         worker_index: usize,
-    ) void {
+    ) bool {
         var runtime = TaskContext{
             .worker_index = worker_index,
             .cancellation_token = descriptor.options.cancellation_token,
@@ -2347,10 +2349,8 @@ const Core = struct {
             };
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
-        } else {
-            descriptor.state.store(.cancelled, .release);
-            _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
+        return cancelled;
     }
 
     /// QS-003 hot-path helper: post-task bookkeeping + release/broadcast.
@@ -2361,12 +2361,15 @@ const Core = struct {
     ///      readers see the updated value.
     ///   2. `current_task_started_ns.store(0)` when watchdog is enabled.
     ///   3. exec histogram + busy_ns under `timestamp_mode == .full`.
-    ///   4. `active_tasks.fetchSub` BEFORE state.store(.completed) — an
+    ///   4. `options.wait_group` / `options.waitable` read and the claim
+    ///      sentinel cleared BEFORE the terminal state is published. Once a
+    ///      waitable descriptor is `.completed`/`.cancelled`, `wait()` may
+    ///      release it (resetting `options`) and the next submit may reuse
+    ///      the slot, so the worker must not touch the descriptor after the
+    ///      state store except for the non-waitable release (SONNY-6375).
+    ///   5. `active_tasks.fetchSub` BEFORE the terminal state store — an
     ///      observer waking on `.completed` must see active_tasks already
     ///      decremented, otherwise `shutdown(.drain, …)` can spin.
-    ///   5. Claim sentinel cleared BEFORE broadcast/release — otherwise a
-    ///      fast-waking observer could re-acquire the descriptor before we
-    ///      release the sentinel and trip the double-dequeue panic.
     ///   6. Waitable descriptors broadcast; non-waitable release to freelist.
     inline fn finalizeTask(
         self: *Core,
@@ -2374,6 +2377,7 @@ const Core = struct {
         descriptor: *TaskDescriptor,
         descriptor_index: u32,
         start_ns: u64,
+        cancelled: bool,
     ) void {
         // COMPTIME-ELISION: `timestamps_enabled` folds to a constant when
         // pinned at build time; the exec_histogram observe and busy_ns
@@ -2403,24 +2407,30 @@ const Core = struct {
             worker.current_task_started_ns.store(0, .release);
         }
 
-        _ = self.counters.active_tasks.fetchSub(1, .monotonic);
-        if (descriptor.state.load(.acquire) != .cancelled) {
-            descriptor.state.store(.completed, .release);
-            _ = worker.completed.fetchAdd(1, .monotonic);
-        }
+        const wait_group = descriptor.options.wait_group;
+        const waitable = descriptor.options.waitable;
 
-        if (descriptor.options.wait_group) |wait_group| {
-            wait_group.done();
-        }
-
-        // Clear the claim sentinel before wait_group.done() observers can
-        // re-submit / re-acquire this descriptor slot. Paired with the
-        // CAS-acquire at the top of runTask.
+        // Clear the claim sentinel before any observer can release and
+        // re-acquire this descriptor slot. Paired with the CAS-acquire at
+        // the top of runTask.
         if (claim_sentinel_enabled) {
             descriptor.claimed_by.store(-1, .release);
         }
 
-        if (descriptor.options.waitable) {
+        _ = self.counters.active_tasks.fetchSub(1, .monotonic);
+        if (cancelled) {
+            _ = self.counters.cancelled.fetchAdd(1, .monotonic);
+            descriptor.state.store(.cancelled, .release);
+        } else {
+            descriptor.state.store(.completed, .release);
+            _ = worker.completed.fetchAdd(1, .monotonic);
+        }
+
+        if (wait_group) |wg| {
+            wg.done();
+        }
+
+        if (waitable) {
             self.sync.completion_mutex.lock();
             self.sync.completion_cond.broadcast();
             self.sync.completion_mutex.unlock();
