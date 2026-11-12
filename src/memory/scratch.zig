@@ -69,8 +69,11 @@ pub const WorkerScratch = struct {
     cap_bytes: usize,
     buffer: ?[]u8 = null,
     fba: ?std.heap.FixedBufferAllocator = null,
-    current_bytes: usize = 0,
-    peak_bytes: usize = 0,
+    /// Atomic because `statsSnapshot` reads both counters from another
+    /// thread while the owner updates them (SONNY-6375). Monotonic is
+    /// enough: they are point-in-time stats and order nothing.
+    current_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    peak_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Slow-path serialization for overlapping purge callers. The normal
     /// owning-worker task path remains lock-free; this only prevents
     /// external quiescent purge and the worker's own idle-time purge from
@@ -90,7 +93,7 @@ pub const WorkerScratch = struct {
     }
 
     pub fn beginTask(self: *WorkerScratch) !void {
-        self.current_bytes = 0;
+        self.current_bytes.store(0, .monotonic);
         if (self.buffer) |buf| {
             self.fba = std.heap.FixedBufferAllocator.init(buf);
         } else {
@@ -100,10 +103,9 @@ pub const WorkerScratch = struct {
 
     pub fn finishTask(self: *WorkerScratch) void {
         if (self.fba) |fba| {
-            self.current_bytes = fba.end_index;
-            if (self.current_bytes > self.peak_bytes) self.peak_bytes = self.current_bytes;
+            self.recordUsage(fba.end_index);
         } else {
-            self.current_bytes = 0;
+            self.current_bytes.store(0, .monotonic);
         }
     }
 
@@ -112,8 +114,7 @@ pub const WorkerScratch = struct {
         if (self.fba == null) return error.ScratchUnavailable;
         var fba = &self.fba.?;
         const slice = try fba.allocator().alloc(T, count);
-        self.current_bytes = fba.end_index;
-        if (self.current_bytes > self.peak_bytes) self.peak_bytes = self.current_bytes;
+        self.recordUsage(fba.end_index);
         return slice;
     }
 
@@ -126,15 +127,22 @@ pub const WorkerScratch = struct {
         }
         self.buffer = null;
         self.fba = null;
-        self.current_bytes = 0;
+        self.current_bytes.store(0, .monotonic);
     }
 
     pub fn bytesCurrent(self: *WorkerScratch) usize {
-        return self.current_bytes;
+        return self.current_bytes.load(.monotonic);
     }
 
     pub fn bytesPeak(self: *WorkerScratch) usize {
-        return self.peak_bytes;
+        return self.peak_bytes.load(.monotonic);
+    }
+
+    /// Owner-only: the owning worker is the only writer of `peak_bytes`,
+    /// so a plain load/compare/store is enough, no CAS loop.
+    fn recordUsage(self: *WorkerScratch, bytes: usize) void {
+        self.current_bytes.store(bytes, .monotonic);
+        if (bytes > self.peak_bytes.load(.monotonic)) self.peak_bytes.store(bytes, .monotonic);
     }
 
     fn ensureBuffer(self: *WorkerScratch) !void {
