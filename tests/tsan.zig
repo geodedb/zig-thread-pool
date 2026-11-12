@@ -4,4 +4,5 @@
 
 comptime {
     _ = @import("tsan/local_queue_dispatch.zig");
+    _ = @import("tsan/scratch_stats.zig");
 }
