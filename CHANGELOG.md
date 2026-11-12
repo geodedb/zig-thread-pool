@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-11-12
+
+### Fixed
+
+- `LocalQueue` dispatch copied the whole per-worker queue, atomic
+  head/tail (ring) or top/bottom (chase_lev) included, with a plain memcpy
+  on every push, pop and steal, racing the CAS of concurrent stealers
+  (SONNY-6375). The queue kind now lives in its own field and the payload
+  is reached by pointer.
+- `finalizeTask` read `options.wait_group` / `options.waitable` and cleared
+  the claim sentinel after publishing `.completed`, by which point `wait()`
+  could already have released and recycled a waitable descriptor; the
+  cancelled path could store `.completed` over a freed slot (SONNY-6375).
+- `statsSnapshot` read worker scratch byte counters non-atomically while
+  the owning worker wrote them (SONNY-6375).
+
+### Tests
+
+- `-Dtsan` now builds with the LLVM backend. The self-hosted x86_64
+  backend used for Debug builds ignores `sanitize_thread`, so every TSan
+  run before this produced an uninstrumented binary (SONNY-6375).
+- New `zig build test-tsan` step, always TSan-instrumented, with
+  regression tests for the three races above.
+
 ## [0.2.8] - 2026-09-24
 
 ### Fixed
@@ -74,7 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions 0.2.2 through 0.2.7 are not documented as entries in this file;
 see the project's git history and tags for those releases.
 
-[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.8...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.10...HEAD
+[0.2.10]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.9...v0.2.10
 [0.2.8]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.7...v0.2.8
 [0.2.1]: https://gitlab.com/devnw/zig/thread_pool/-/releases/v0.2.1
 [0.1.0]: https://gitlab.com/devnw/zig/thread_pool/-/releases/v0.1.0

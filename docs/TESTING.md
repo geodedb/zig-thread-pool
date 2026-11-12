@@ -98,14 +98,26 @@ artifact. The stress suite automatically switches from `ReleaseFast` to
 `Debug` under `-Dtsan` so the compiler does not elide races before TSan
 instruments them.
 
+`-Dtsan` artifacts are built with the LLVM backend (`use_llvm = true`).
+Zig 0.16 compiles Debug x86_64 code with the self-hosted backend, which
+silently ignores `sanitize_thread`; before SONNY-6375 every `-Dtsan` run
+produced an uninstrumented binary and the "zero warnings" baseline below
+was not real. An instrumented run reports a much higher MaxRSS in
+`--summary all` output than a plain one, which is a quick sanity check.
+
+`zig build test-tsan` runs `tests/tsan.zig`, a small regression suite
+that is always built with TSan and the LLVM backend, whether or not
+`-Dtsan` is passed.
+
 ```bash
+zig build test-tsan --summary all                # TSan regression suite
 zig build test-all -Dtsan --summary all          # all three test suites
 zig build fuzz -Dtsan                            # fuzz harness
 ```
 
-The current TSan baseline on `main` is **zero warnings** across
-`test` (41 pass, 1 skip), `test-integration` (23 pass), and
-`test-stress` (14 pass). Baseline findings are archived in
+The TSan baseline on `main` after SONNY-6375 is **zero warnings** across
+`test` (122 pass, 2 skip), `test-integration` (31 pass), `test-stress`
+(15 pass), and `test-tsan` (5 pass), on x86_64 Linux. Baseline findings are archived in
 `docs/performance/appsec-fixes-2026-04-15/TSAN-findings.md`; the nightly
 CI soak is provisioned via `.gitlab-ci.yml` jobs `tsan-stress-soak` and
 `tsan-fuzz` (scheduled / default-branch / `RUN_TSAN=true`).

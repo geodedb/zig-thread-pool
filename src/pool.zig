@@ -243,32 +243,58 @@ inline fn entryGen(entry: QueueEntry) u32 {
     return @as(u32, @truncate(entry >> 32));
 }
 
-/// Tagged-union wrapper over the two per-worker local queue implementations.
+/// Wrapper over the two per-worker local queue implementations.
 /// Selected per-pool via `Config.queue_kind`. All call sites dispatch through
 /// the unified methods (tryPushBottom, popBottom, steal, stealOne, len,
 /// capacity) so the rest of `Core` is queue-kind agnostic.
-const LocalQueue = union(enum) {
-    chase_lev: WorkDeque(QueueEntry),
-    ring: RingQueue(QueueEntry),
+///
+/// SONNY-6375: dispatch reads `kind`, which is written once at init, and
+/// reaches the payload through `chaseLev()` / `ring()`. Nothing may load the
+/// queue union by value: `switch (self.*)` on a tagged union, and the
+/// Debug/ReleaseSafe inactive-field check on an untagged one, both copy the
+/// whole queue (including the atomic head/tail or top/bottom that stealers
+/// CAS concurrently) with a plain memcpy, which is a data race.
+const LocalQueue = struct {
+    kind: types.QueueKind,
+    impl: Impl,
+
+    const Impl = union {
+        chase_lev: WorkDeque(QueueEntry),
+        ring: RingQueue(QueueEntry),
+    };
+
+    inline fn chaseLev(self: *LocalQueue) *WorkDeque(QueueEntry) {
+        std.debug.assert(self.kind == .chase_lev);
+        // The safety check for an untagged-union field loads the whole
+        // union; `kind` is the checked tag here.
+        @setRuntimeSafety(false);
+        return &self.impl.chase_lev;
+    }
+
+    inline fn ring(self: *LocalQueue) *RingQueue(QueueEntry) {
+        std.debug.assert(self.kind == .ring);
+        @setRuntimeSafety(false);
+        return &self.impl.ring;
+    }
 
     fn init(allocator: std.mem.Allocator, size: usize, kind: types.QueueKind) !LocalQueue {
         return switch (kind) {
-            .chase_lev => .{ .chase_lev = try WorkDeque(QueueEntry).init(allocator, size) },
-            .ring => .{ .ring = try RingQueue(QueueEntry).init(allocator, size) },
+            .chase_lev => .{ .kind = kind, .impl = .{ .chase_lev = try WorkDeque(QueueEntry).init(allocator, size) } },
+            .ring => .{ .kind = kind, .impl = .{ .ring = try RingQueue(QueueEntry).init(allocator, size) } },
         };
     }
 
     fn deinit(self: *LocalQueue) void {
-        switch (self.*) {
-            .chase_lev => |*q| q.deinit(),
-            .ring => |*q| q.deinit(),
+        switch (self.kind) {
+            .chase_lev => self.chaseLev().deinit(),
+            .ring => self.ring().deinit(),
         }
     }
 
     fn tryPushBottom(self: *LocalQueue, value: QueueEntry) bool {
-        return switch (self.*) {
-            .chase_lev => |*q| q.tryPushBottom(value),
-            .ring => |*q| q.tryPush(value),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().tryPushBottom(value),
+            .ring => self.ring().tryPush(value),
         };
     }
 
@@ -284,47 +310,47 @@ const LocalQueue = union(enum) {
     /// through to it — would restore full LIFO locality; that is a possible
     /// follow-up, not implemented here.
     fn popBottom(self: *LocalQueue) ?QueueEntry {
-        return switch (self.*) {
-            .chase_lev => |*q| q.popBottom(),
-            .ring => |*q| q.pop(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().popBottom(),
+            .ring => self.ring().pop(),
         };
     }
 
     /// Steal up to `out.len` items. For chase_lev returns at most 1; for
     /// ring returns up to (len+1)/2 items via stealHalf.
     fn steal(self: *LocalQueue, out: []QueueEntry) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| if (q.stealTop()) |v| blk: {
+        return switch (self.kind) {
+            .chase_lev => if (self.chaseLev().stealTop()) |v| blk: {
                 out[0] = v;
                 break :blk @as(usize, 1);
             } else 0,
-            .ring => |*q| q.stealHalf(out),
+            .ring => self.ring().stealHalf(out),
         };
     }
 
     /// Single-item drain — used by shutdown to cancel pending tasks.
     fn stealOne(self: *LocalQueue) ?QueueEntry {
-        return switch (self.*) {
-            .chase_lev => |*q| q.stealTop(),
-            .ring => |*q| blk: {
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().stealTop(),
+            .ring => blk: {
                 var buf: [1]QueueEntry = undefined;
-                if (q.stealHalf(buf[0..]) == 1) break :blk buf[0];
+                if (self.ring().stealHalf(buf[0..]) == 1) break :blk buf[0];
                 break :blk null;
             },
         };
     }
 
     fn len(self: *LocalQueue) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| q.len(),
-            .ring => |*q| q.len(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().len(),
+            .ring => self.ring().len(),
         };
     }
 
     fn capacity(self: *LocalQueue) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| q.capacity(),
-            .ring => |*q| q.capacity(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().capacity(),
+            .ring => self.ring().capacity(),
         };
     }
 };
@@ -2225,8 +2251,8 @@ const Core = struct {
         // with the sentinel cleared in finalizeTask BEFORE the broadcast or
         // release (see runTask's final block below for the ordering reason).
         const start_ns = self.recordTaskStart(worker, descriptor, worker_index, descriptor_index);
-        self.invokeTask(worker, descriptor, worker_index);
-        self.finalizeTask(worker, descriptor, descriptor_index, start_ns);
+        const cancelled = invokeTask(worker, descriptor, worker_index);
+        self.finalizeTask(worker, descriptor, descriptor_index, start_ns, cancelled);
     }
 
     /// QS-003 hot-path helper: claim sentinel + timestamps + increments.
@@ -2296,17 +2322,19 @@ const Core = struct {
     ///
     /// Builds the `TaskContext`, checks cancellation, and either runs the
     /// user's `task_fn` bracketed by `scratch.beginTask/finishTask`, or
-    /// marks the descriptor cancelled without running user code.
+    /// skips user code. Returns true when the task was cancelled; the
+    /// terminal state is published by `finalizeTask`, not here, because a
+    /// `wait()` caller may release a waitable descriptor as soon as it sees
+    /// `.cancelled` (SONNY-6375).
     ///
     /// Contract: `descriptor.task_fn` and `descriptor.ctx` are guaranteed
     /// non-null by the submit path; the `.?` deref is load-bearing here and
     /// must not be changed to an `orelse` fallback.
     inline fn invokeTask(
-        self: *Core,
         worker: *Worker,
         descriptor: *TaskDescriptor,
         worker_index: usize,
-    ) void {
+    ) bool {
         var runtime = TaskContext{
             .worker_index = worker_index,
             .cancellation_token = descriptor.options.cancellation_token,
@@ -2321,10 +2349,8 @@ const Core = struct {
             };
             descriptor.task_fn.?(descriptor.ctx.?, &runtime);
             worker.scratch.finishTask();
-        } else {
-            descriptor.state.store(.cancelled, .release);
-            _ = self.counters.cancelled.fetchAdd(1, .monotonic);
         }
+        return cancelled;
     }
 
     /// QS-003 hot-path helper: post-task bookkeeping + release/broadcast.
@@ -2335,12 +2361,15 @@ const Core = struct {
     ///      readers see the updated value.
     ///   2. `current_task_started_ns.store(0)` when watchdog is enabled.
     ///   3. exec histogram + busy_ns under `timestamp_mode == .full`.
-    ///   4. `active_tasks.fetchSub` BEFORE state.store(.completed) — an
+    ///   4. `options.wait_group` / `options.waitable` read and the claim
+    ///      sentinel cleared BEFORE the terminal state is published. Once a
+    ///      waitable descriptor is `.completed`/`.cancelled`, `wait()` may
+    ///      release it (resetting `options`) and the next submit may reuse
+    ///      the slot, so the worker must not touch the descriptor after the
+    ///      state store except for the non-waitable release (SONNY-6375).
+    ///   5. `active_tasks.fetchSub` BEFORE the terminal state store — an
     ///      observer waking on `.completed` must see active_tasks already
     ///      decremented, otherwise `shutdown(.drain, …)` can spin.
-    ///   5. Claim sentinel cleared BEFORE broadcast/release — otherwise a
-    ///      fast-waking observer could re-acquire the descriptor before we
-    ///      release the sentinel and trip the double-dequeue panic.
     ///   6. Waitable descriptors broadcast; non-waitable release to freelist.
     inline fn finalizeTask(
         self: *Core,
@@ -2348,6 +2377,7 @@ const Core = struct {
         descriptor: *TaskDescriptor,
         descriptor_index: u32,
         start_ns: u64,
+        cancelled: bool,
     ) void {
         // COMPTIME-ELISION: `timestamps_enabled` folds to a constant when
         // pinned at build time; the exec_histogram observe and busy_ns
@@ -2377,24 +2407,30 @@ const Core = struct {
             worker.current_task_started_ns.store(0, .release);
         }
 
-        _ = self.counters.active_tasks.fetchSub(1, .monotonic);
-        if (descriptor.state.load(.acquire) != .cancelled) {
-            descriptor.state.store(.completed, .release);
-            _ = worker.completed.fetchAdd(1, .monotonic);
-        }
+        const wait_group = descriptor.options.wait_group;
+        const waitable = descriptor.options.waitable;
 
-        if (descriptor.options.wait_group) |wait_group| {
-            wait_group.done();
-        }
-
-        // Clear the claim sentinel before wait_group.done() observers can
-        // re-submit / re-acquire this descriptor slot. Paired with the
-        // CAS-acquire at the top of runTask.
+        // Clear the claim sentinel before any observer can release and
+        // re-acquire this descriptor slot. Paired with the CAS-acquire at
+        // the top of runTask.
         if (claim_sentinel_enabled) {
             descriptor.claimed_by.store(-1, .release);
         }
 
-        if (descriptor.options.waitable) {
+        _ = self.counters.active_tasks.fetchSub(1, .monotonic);
+        if (cancelled) {
+            _ = self.counters.cancelled.fetchAdd(1, .monotonic);
+            descriptor.state.store(.cancelled, .release);
+        } else {
+            descriptor.state.store(.completed, .release);
+            _ = worker.completed.fetchAdd(1, .monotonic);
+        }
+
+        if (wait_group) |wg| {
+            wg.done();
+        }
+
+        if (waitable) {
             self.sync.completion_mutex.lock();
             self.sync.completion_cond.broadcast();
             self.sync.completion_mutex.unlock();
