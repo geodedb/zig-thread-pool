@@ -243,32 +243,58 @@ inline fn entryGen(entry: QueueEntry) u32 {
     return @as(u32, @truncate(entry >> 32));
 }
 
-/// Tagged-union wrapper over the two per-worker local queue implementations.
+/// Wrapper over the two per-worker local queue implementations.
 /// Selected per-pool via `Config.queue_kind`. All call sites dispatch through
 /// the unified methods (tryPushBottom, popBottom, steal, stealOne, len,
 /// capacity) so the rest of `Core` is queue-kind agnostic.
-const LocalQueue = union(enum) {
-    chase_lev: WorkDeque(QueueEntry),
-    ring: RingQueue(QueueEntry),
+///
+/// SONNY-6375: dispatch reads `kind`, which is written once at init, and
+/// reaches the payload through `chaseLev()` / `ring()`. Nothing may load the
+/// queue union by value: `switch (self.*)` on a tagged union, and the
+/// Debug/ReleaseSafe inactive-field check on an untagged one, both copy the
+/// whole queue (including the atomic head/tail or top/bottom that stealers
+/// CAS concurrently) with a plain memcpy, which is a data race.
+const LocalQueue = struct {
+    kind: types.QueueKind,
+    impl: Impl,
+
+    const Impl = union {
+        chase_lev: WorkDeque(QueueEntry),
+        ring: RingQueue(QueueEntry),
+    };
+
+    inline fn chaseLev(self: *LocalQueue) *WorkDeque(QueueEntry) {
+        std.debug.assert(self.kind == .chase_lev);
+        // The safety check for an untagged-union field loads the whole
+        // union; `kind` is the checked tag here.
+        @setRuntimeSafety(false);
+        return &self.impl.chase_lev;
+    }
+
+    inline fn ring(self: *LocalQueue) *RingQueue(QueueEntry) {
+        std.debug.assert(self.kind == .ring);
+        @setRuntimeSafety(false);
+        return &self.impl.ring;
+    }
 
     fn init(allocator: std.mem.Allocator, size: usize, kind: types.QueueKind) !LocalQueue {
         return switch (kind) {
-            .chase_lev => .{ .chase_lev = try WorkDeque(QueueEntry).init(allocator, size) },
-            .ring => .{ .ring = try RingQueue(QueueEntry).init(allocator, size) },
+            .chase_lev => .{ .kind = kind, .impl = .{ .chase_lev = try WorkDeque(QueueEntry).init(allocator, size) } },
+            .ring => .{ .kind = kind, .impl = .{ .ring = try RingQueue(QueueEntry).init(allocator, size) } },
         };
     }
 
     fn deinit(self: *LocalQueue) void {
-        switch (self.*) {
-            .chase_lev => |*q| q.deinit(),
-            .ring => |*q| q.deinit(),
+        switch (self.kind) {
+            .chase_lev => self.chaseLev().deinit(),
+            .ring => self.ring().deinit(),
         }
     }
 
     fn tryPushBottom(self: *LocalQueue, value: QueueEntry) bool {
-        return switch (self.*) {
-            .chase_lev => |*q| q.tryPushBottom(value),
-            .ring => |*q| q.tryPush(value),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().tryPushBottom(value),
+            .ring => self.ring().tryPush(value),
         };
     }
 
@@ -284,47 +310,47 @@ const LocalQueue = union(enum) {
     /// through to it — would restore full LIFO locality; that is a possible
     /// follow-up, not implemented here.
     fn popBottom(self: *LocalQueue) ?QueueEntry {
-        return switch (self.*) {
-            .chase_lev => |*q| q.popBottom(),
-            .ring => |*q| q.pop(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().popBottom(),
+            .ring => self.ring().pop(),
         };
     }
 
     /// Steal up to `out.len` items. For chase_lev returns at most 1; for
     /// ring returns up to (len+1)/2 items via stealHalf.
     fn steal(self: *LocalQueue, out: []QueueEntry) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| if (q.stealTop()) |v| blk: {
+        return switch (self.kind) {
+            .chase_lev => if (self.chaseLev().stealTop()) |v| blk: {
                 out[0] = v;
                 break :blk @as(usize, 1);
             } else 0,
-            .ring => |*q| q.stealHalf(out),
+            .ring => self.ring().stealHalf(out),
         };
     }
 
     /// Single-item drain — used by shutdown to cancel pending tasks.
     fn stealOne(self: *LocalQueue) ?QueueEntry {
-        return switch (self.*) {
-            .chase_lev => |*q| q.stealTop(),
-            .ring => |*q| blk: {
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().stealTop(),
+            .ring => blk: {
                 var buf: [1]QueueEntry = undefined;
-                if (q.stealHalf(buf[0..]) == 1) break :blk buf[0];
+                if (self.ring().stealHalf(buf[0..]) == 1) break :blk buf[0];
                 break :blk null;
             },
         };
     }
 
     fn len(self: *LocalQueue) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| q.len(),
-            .ring => |*q| q.len(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().len(),
+            .ring => self.ring().len(),
         };
     }
 
     fn capacity(self: *LocalQueue) usize {
-        return switch (self.*) {
-            .chase_lev => |*q| q.capacity(),
-            .ring => |*q| q.capacity(),
+        return switch (self.kind) {
+            .chase_lev => self.chaseLev().capacity(),
+            .ring => self.ring().capacity(),
         };
     }
 };
