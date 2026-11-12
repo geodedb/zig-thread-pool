@@ -383,6 +383,7 @@ tsan-stress-soak:
   script:
     # Run each suite under TSan three times; a single pass takes ~15s so
     # three back-to-back passes give longer interleaving coverage.
+    - zig build test-tsan --summary all
     - for i in 1 2 3; do echo "--- soak pass $i ---"; zig build test -Dtsan --summary all; done
     - for i in 1 2 3; do echo "--- integration soak pass $i ---"; zig build test-integration -Dtsan --summary all; done
     - for i in 1 2 3; do echo "--- stress soak pass $i ---"; zig build test-stress -Dtsan --summary all; done
