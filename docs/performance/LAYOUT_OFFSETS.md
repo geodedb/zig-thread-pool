@@ -101,7 +101,10 @@ compiler versions.
 | `_pad1`                     | `2 * cache_line + 16`     |         2 | padding                             |
 | `queued_tasks_blocking`     |         `3 * cache_line`  |         3 | submit path (blocking lane)         |
 | `_pad1b`                    | `3 * cache_line + 8`      |         3 | padding                             |
-| `wakeups` ... `overflow_active` | 4\*cache\_line onward |   4+      | cold observability counters         |
+| `parked_workers`            |         `4 * cache_line`  |         4 | idle (park entry / exit)            |
+| `waking_workers`            | `4 * cache_line + 8`      |         4 | scanAndWake (claim) / finishWaking  |
+| `_pad1c`                    | `4 * cache_line + 16`     |         4 | padding                             |
+| `wakeups` ... `overflow_active` | 5\*cache\_line onward |   5+      | cold observability counters         |
 
 Where `cache_line = std.atomic.cache_line` (64 bytes on x86\_64,
 platform-dependent).
@@ -115,6 +118,10 @@ platform-dependent).
 5. `cancelled` at offset `2 * cache_line + 8` -- shares line with
    `active_tasks` by design (both are runtime write-side-only, never
    touched by submitters).
+6. `parked_workers` at offset `4 * cache_line`, `waking_workers` next to
+   it -- read by every submit while `wake_coalesce_batch` would skip the
+   wake scan, written only on park entry and exit, wake claims and
+   `finishWaking` (SONNY-6479).
 
 **Why the blocking-lane separation matters:** the park handshake's SC
 load of `queued_tasks` must not observe a blocking-lane increment, else a

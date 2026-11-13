@@ -195,11 +195,12 @@ sequenceDiagram
     participant P as Parked worker
     S->>C: submitted.fetchAdd(1, .monotonic)
     S->>C: lane_counter.fetchAdd(1, .seq_cst)<br/>[park handshake]
-    alt submitted % wake_coalesce_batch == 0
+    S->>C: parked_workers / waking_workers .load(.seq_cst)
+    alt submitted % wake_coalesce_batch == 0 or (parked_workers > 0 and waking_workers == 0)
         S->>P: scanAndWake(lane)
-        Note over P: Iterate lane's worker range from<br/>rel_hint = submitted % scan_len<br/>Wake first is_parked == 1
-    else between boundaries
-        Note over P: Re-parks bail via SC load of<br/>lane_counter > 0
+        Note over P: Iterate lane's worker range, then its helpers,<br/>from rel_hint = submitted % scan_len<br/>Claim and wake first is_parked == 1
+    else between boundaries, nobody parked or a worker already waking
+        Note over P: Workers about to park bail via SC load of<br/>lane_counter > 0; the waking worker<br/>wakes the next (finishWaking)
     end
 ```
 
