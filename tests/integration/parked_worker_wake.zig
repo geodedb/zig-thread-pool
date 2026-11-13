@@ -11,6 +11,11 @@
 //!      although an idle blocking worker helps the default lane.
 //!   3. `submitBatch` woke one worker per batch.
 //!
+//! Waking the blocking worker for default-lane work exposed a fourth: a
+//! worker helping another lane pulled a batch of that lane's tasks into its
+//! own local queue, where the lane's workers cannot steal them
+//! (`laneMask`), so they waited for the helper's current task to finish.
+//!
 //! Every test parks the pool's workers on a 500 ms timer and bounds task
 //! start latency at 50 ms: a task that waited for a timer is unmistakable,
 //! and a woken worker starts in well under a millisecond.
@@ -35,12 +40,14 @@ const Round = struct {
     finished: std.atomic.Value(u32) = .init(0),
     release: std.atomic.Value(bool) = .init(false),
     last_start_ns: std.atomic.Value(u64) = .init(0),
+    /// Bit `i` set once a task of this round ran on worker `i`.
+    ran_on: std.atomic.Value(u64) = .init(0),
 };
 
 fn roundTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
-    _ = runtime;
     const r: *Round = @ptrCast(@alignCast(raw_ctx));
     _ = r.last_start_ns.fetchMax(nowNs(), .acq_rel);
+    _ = r.ran_on.fetchOr(@as(u64, 1) << @intCast(runtime.worker_index), .acq_rel);
     _ = r.started.fetchAdd(1, .acq_rel);
     if (r.hold) {
         const deadline = nowNs() + wait_limit_ns;
@@ -52,11 +59,16 @@ fn roundTask(raw_ctx: *anyopaque, runtime: *thread_pool.TaskContext) void {
 }
 
 fn waitAtLeast(counter: *const std.atomic.Value(u32), want: u32) !void {
-    const deadline = nowNs() + wait_limit_ns;
+    if (!waitAtLeastFor(counter, want, wait_limit_ns)) return error.Timeout;
+}
+
+fn waitAtLeastFor(counter: *const std.atomic.Value(u32), want: u32, limit_ns: u64) bool {
+    const deadline = nowNs() + limit_ns;
     while (counter.load(.acquire) < want) {
-        if (nowNs() >= deadline) return error.Timeout;
+        if (nowNs() >= deadline) return false;
         thread_pool.clock.sleep(50 * std.time.ns_per_us);
     }
+    return true;
 }
 
 /// Wait until every worker has entered its park section: `parks` counts
@@ -114,7 +126,7 @@ fn runRound(pool: *thread_pool.ThreadPool, workers: usize, tasks: u32, hold: boo
 
 fn expectPrompt(name: []const u8, worst_ns: u64) !void {
     if (worst_ns >= start_bound_ns) {
-        std.debug.print("{s}: worst task start {d} ms after submit (bound {d} ms, park {d} ms)\n", .{
+        std.debug.print("{s}: a task started {d} ms late (bound {d} ms, park {d} ms)\n", .{
             name,
             worst_ns / std.time.ns_per_ms,
             start_bound_ns / std.time.ns_per_ms,
@@ -215,4 +227,79 @@ test "SONNY-6479: submitBatch wakes one parked worker per task (global_queue)" {
 
 test "SONNY-6479: submitBatch wakes one parked worker per task (work_stealing)" {
     try batchWakesEnoughWorkers(.work_stealing);
+}
+
+// Path 2, second half. Every default worker is busy and the blocking worker
+// is free, so a batch of default-lane tasks is picked up by the blocking
+// worker. When the default workers become free they must find the rest of
+// the batch. Before the fix the blocking worker pulled the whole batch into
+// its own local queue, which default workers never steal from, so the rest
+// waited for the blocking worker's current task.
+fn helperLeavesWorkStealable(variant: thread_pool.SchedulerVariant) !void {
+    try common.skipIfSchedulerVariantIncompatible(variant);
+    const workers: usize = 8;
+    const default_workers: u32 = workers - 1;
+    const default_mask: u64 = ((@as(u64, 1) << workers) - 1) & ~@as(u64, 1);
+    const later_tasks: u32 = 4;
+    var pool = try thread_pool.ThreadPool.init(std.testing.allocator, .{
+        .min_threads = workers,
+        .max_threads = workers,
+        .queue_capacity = 64,
+        .local_queue_capacity = 32,
+        .scheduler_variant = variant,
+        .allow_blocking_lane = true,
+        .blocking_workers = 1,
+        .wake_coalesce_batch = 1,
+        .idle_park_after_ns = park_ns,
+        .timestamp_mode = common.default_timestamp_mode,
+    });
+    defer pool.deinit();
+
+    var rounds: usize = 0;
+    var attempts: usize = 0;
+    while (rounds < 3) : (attempts += 1) {
+        if (attempts >= 20) return error.CouldNotOccupyDefaultWorkers;
+        try waitAllParked(&pool, workers);
+        var busy: Round = .{ .hold = true };
+        var later: Round = .{ .hold = true };
+        var busy_n: u32 = 0;
+        var later_n: u32 = 0;
+        defer {
+            busy.release.store(true, .release);
+            later.release.store(true, .release);
+            waitAtLeast(&busy.finished, busy_n) catch @panic("SONNY-6479 test: tasks did not finish");
+            waitAtLeast(&later.finished, later_n) catch @panic("SONNY-6479 test: tasks did not finish");
+        }
+
+        for (0..default_workers) |_| {
+            _ = try pool.submit(roundTask, @ptrCast(&busy), .{});
+            busy_n += 1;
+        }
+        try waitAtLeast(&busy.started, default_workers);
+        // The scenario needs the blocking worker free. If it took one of the
+        // busy tasks instead of a default worker, set the round up again.
+        if (busy.ran_on.load(.acquire) != default_mask) continue;
+
+        var batch: [later_tasks]thread_pool.BatchTask = undefined;
+        for (&batch) |*t| t.* = .{ .task_fn = roundTask, .ctx = @ptrCast(&later) };
+        later_n = @intCast((try pool.submitBatch(&batch, .{})).submitted);
+        try std.testing.expectEqual(later_tasks, later_n);
+        try waitAtLeast(&later.started, 1);
+        try std.testing.expectEqual(@as(u64, 1), later.ran_on.load(.acquire));
+
+        const freed_at = nowNs();
+        busy.release.store(true, .release);
+        const all_started = waitAtLeastFor(&later.started, later_tasks, 4 * park_ns);
+        const waited = if (all_started) later.last_start_ns.load(.acquire) -| freed_at else 4 * park_ns;
+        try expectPrompt("tasks left behind by the blocking worker", waited);
+        rounds += 1;
+    }
+}
+
+test "SONNY-6479: default-lane tasks the blocking worker picked up stay stealable by default workers (global_queue)" {
+    try helperLeavesWorkStealable(.global_queue);
+}
+
+test "SONNY-6479: default-lane tasks the blocking worker picked up stay stealable by default workers (work_stealing)" {
+    try helperLeavesWorkStealable(.work_stealing);
 }
