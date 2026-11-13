@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-13
+
 ### Fixed
 
 - Work queued while a worker was parked waited for that worker's
@@ -138,7 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions 0.2.2 through 0.2.7 are not documented as entries in this file;
 see the project's git history and tags for those releases.
 
-[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.10...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.11...HEAD
+[0.2.11]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.10...v0.2.11
 [0.2.10]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.9...v0.2.10
 [0.2.8]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.7...v0.2.8
 [0.2.1]: https://gitlab.com/devnw/zig/thread_pool/-/releases/v0.2.1
