@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-13
+
+### Fixed
+
+- Work queued while a worker was parked waited for that worker's
+  `idle_park_after_ns` timer instead of waking it (SONNY-6479). A worker
+  that is already parked cannot see queued work, but:
+  - `submit` looked for a parked worker only on every
+    `wake_coalesce_batch`-th call (default 32). It now also looks whenever
+    a worker is parked and no worker is already being woken
+    (`Counters.parked_workers`, `Counters.waking_workers`). A woken worker
+    wakes the next parked one when it claims a task and work is still
+    queued (`finishWaking`), so a burst pays for one wake at a time. A
+    task submitted to an idle pool with a 500 ms park started 495 ms
+    late; it now starts within 0.1 ms.
+  - the wake scan signalled the first worker that still read as parked,
+    including one already signalled that had not run yet. The waker now
+    claims the worker it signals.
+  - a default-lane submit never woke the parked blocking-lane worker,
+    which helps the default lane, and a parking blocking worker checked
+    only the blocking lane's queue. With every default worker busy, a
+    further default-lane task waited for the blocking worker's timer. The
+    scan now falls back to a parked worker of the helping lane, and a
+    helper checks the lane it helps before parking.
+  - `submitBatch` woke one worker per batch and nothing woke more, so the
+    rest of a batch of long tasks waited for timers. The wake chain now
+    reaches as many workers as the batch needs.
+- A worker helping another lane (`rebalanceLane`) pulled a batch of that
+  lane's tasks into its own local queue, where the lane's workers never
+  steal (SONNY-6479). The rest of the batch waited for the helper's
+  current task even after the lane's own workers went idle. A helper now
+  takes one task at a time from the helped lane.
+
+### Changed
+
+- `Config.wake_coalesce_batch` keeps its meaning (scan once per that many
+  submits) but no longer decides whether a parked worker is woken. Its doc
+  comment described backpressure signalling in `releaseDescriptor`, which
+  it has not controlled; it now describes the submit-side scan. With the
+  wake chain, 0 or 1 (scan on every submit) is no longer needed for
+  latency and wakes a separate worker per submit.
+
 ## [0.2.10] - 2026-11-12
 
 ### Fixed
@@ -98,7 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions 0.2.2 through 0.2.7 are not documented as entries in this file;
 see the project's git history and tags for those releases.
 
-[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.10...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.11...HEAD
+[0.2.11]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.10...v0.2.11
 [0.2.10]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.9...v0.2.10
 [0.2.8]: https://gitlab.com/devnw/zig/thread_pool/-/compare/v0.2.7...v0.2.8
 [0.2.1]: https://gitlab.com/devnw/zig/thread_pool/-/releases/v0.2.1

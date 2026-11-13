@@ -63,10 +63,13 @@ flowchart LR
   cross-thread steal from submitter-owned push queues without paying
   MPMC inject contention.
 - Worker wake: `scanAndWake` performs a linear scan from a rotating
-  hint (`submitted % scan_len`), wakes the first parked worker it
-  finds, and exits.  The scan is issued at most once per
-  `wake_coalesce_batch` (default 32) submissions so the futex cost
-  is amortised across bursts.
+  hint (`submitted % scan_len`), claims and wakes the first parked
+  worker it finds, and exits.  The scan is issued once per
+  `wake_coalesce_batch` (default 32) submissions, and in between only
+  when a worker is parked and none is already waking
+  (`Counters.parked_workers`, `Counters.waking_workers`); a woken
+  worker wakes the next one while work is queued (`finishWaking`), so
+  the futex cost stays off the submit path during bursts.
 
 ### `lane_extension`
 

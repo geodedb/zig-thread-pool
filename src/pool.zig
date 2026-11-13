@@ -452,6 +452,14 @@ const Worker = struct {
     /// acquiring park_mutex during signal — saves a futex syscall when the
     /// worker isn't actually parked.
     is_parked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Set by a waker that claimed this worker (cleared `is_parked` and
+    /// counted it in `Counters.waking_workers`) before signalling it.
+    /// Guarded by `park_mutex`; the worker moves it into `waking` when its
+    /// wait returns, whether the signal or the timeout ended the wait.
+    wake_claimed: bool = false,
+    /// Owner-private: this worker is counted in `Counters.waking_workers`
+    /// and must call `finishWaking` once it has a task or goes idle.
+    waking: bool = false,
     /// Owner-private upper bound on `local_queues[worker_index]` length.
     /// Incremented on every push by the owner; decremented on every
     /// successful pop. Stealers reduce real length below this value —
@@ -577,6 +585,21 @@ const Counters = extern struct {
     queued_tasks_blocking: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     _pad1b: [cache_line_size - field_size]u8 = undefined,
 
+    // === Park/wake state (SONNY-6479) ===
+    // `parked_workers`: workers inside `idle`'s park section. Written on
+    // park entry and exit. `waking_workers`: workers a submit claimed and
+    // signalled that have not yet found a task or gone back to `idle`;
+    // written by the waker and by the woken worker. Both are read by every
+    // submit while `wake_coalesce_batch` would skip the wake scan: a parked
+    // worker sleeps until `idle_park_after_ns` unless signalled, so a
+    // submit wakes one whenever a worker is parked and none is already
+    // waking (a waking worker passes the wake on, see `finishWaking`).
+    // Own cacheline so park/wake traffic does not invalidate the submit
+    // path's counter lines.
+    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    waking_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    _pad1c: [cache_line_size - 2 * field_size]u8 = undefined,
+
     // === Diagnostic/cold counters ===
     wakeups: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     queue_depth_peak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -607,6 +630,7 @@ const Counters = extern struct {
         std.debug.assert(@offsetOf(Counters, "submitted") == cache_line_size);
         std.debug.assert(@offsetOf(Counters, "active_tasks") == 2 * cache_line_size);
         std.debug.assert(@offsetOf(Counters, "queued_tasks_blocking") == 3 * cache_line_size);
+        std.debug.assert(@offsetOf(Counters, "parked_workers") == 4 * cache_line_size);
         // `cancelled` shares a line with `active_tasks` by design — both are
         // written only on completion/cancellation, never by submitters, so
         // the line stays worker-private.
@@ -1579,16 +1603,33 @@ const Core = struct {
         const queue_depth = lane_counter.fetchAdd(1, .seq_cst) +% 1;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
 
-        // Coalesce wake scans: only do the expensive worker scan + futex
-        // signal every `wake_coalesce_batch` submits. Between flushes, parked
-        // workers that attempt to re-park bail immediately via the SC
-        // queued_tasks handshake (they see > 0 and return without sleeping).
+        // Coalesce wake scans: the worker scan + futex signal runs every
+        // `wake_coalesce_batch` submits, and in between only when a worker
+        // is parked and no worker is already waking. Workers that attempt to
+        // park bail via the SC queued_tasks handshake (they see > 0 and
+        // return without sleeping), but a worker ALREADY parked sleeps until
+        // `idle_park_after_ns` unless signalled (SONNY-6479: a task
+        // submitted to an idle pool waited out that timer). A waking worker
+        // re-checks the queues when it finishes waking and wakes the next
+        // parked worker if work is left (`finishWaking`), so wakes chain
+        // instead of every submit paying a futex wake.
+        //
+        // Lost-wakeup proof (all SC): this submit does lane counter
+        // fetchAdd, then `parked_workers` load, then `waking_workers` load.
+        // `idle` does `is_parked.store(1)`, `parked_workers.fetchAdd`, then
+        // lane counter loads. Either the parked load misses the worker, so
+        // the worker's counter load sees this task and it does not sleep;
+        // or the waking load sees 0 and the scan's `is_parked` load finds
+        // the worker; or the waking load sees a waking worker whose
+        // `finishWaking` (fetchSub, then counter loads) comes later in the
+        // SC order and therefore sees this task.
+        //
         // Using the pool-wide submitted counter avoids TLS state that leaks
         // across pool lifetimes. The first submit (prev_submitted=0) always
         // wakes to ensure at least one worker is active.
         const batch: u64 = self.config.wake_coalesce_batch;
-        if (batch <= 1 or prev_submitted % batch == 0) {
-            self.scanAndWake(options.lane);
+        if (batch <= 1 or prev_submitted % batch == 0 or self.wakeNeeded()) {
+            _ = self.scanAndWake(options.lane);
         }
 
         return handle;
@@ -1745,8 +1786,9 @@ const Core = struct {
 
     /// Batched submitter-side notify: bumps `counters.submitted` and the
     /// lane's `queued_tasks*` counter by `count` (single seq_cst fetchAdd
-    /// for the park handshake), then wakes at most one parked worker that
-    /// serves `lane`.
+    /// for the park handshake), then wakes one parked worker that serves
+    /// `lane` (or helps it, see `scanAndWake`) unless a worker is already
+    /// waking.
     ///
     /// Must be called after `enqueuePush` has succeeded `count` times for
     /// the same lane since the last notify. A single seq_cst fetchAdd(count)
@@ -1758,47 +1800,110 @@ const Core = struct {
     /// Lane scope: when `blocking_workers == 0` the wake scan covers all
     /// workers (byte-for-byte identical to the pre-lane-extension path —
     /// A/B regression gate). When `blocking_workers > 0` the scan covers
-    /// only workers in `lane`'s range, avoiding cross-lane wakeups that
-    /// would spin-loop through `nextTask` and re-park immediately.
+    /// `lane`'s range first and falls back only to workers that help `lane`
+    /// (`rebalanceLane`), so a cross-lane wake always finds work it may run
+    /// instead of spin-looping through `nextTask` and re-parking.
     ///
-    /// Waking exactly one worker per notify — not `count` — matches the
-    /// single-submit path and avoids a thundering-herd on the inject queue's
-    /// head cacheline. Measured: a wake-up-to-`count` variant regressed
-    /// flood_1m_batched throughput ~50% vs this wake-one variant.
+    /// One wake per batch, not `count`: the rest of the batch is handed on
+    /// by `finishWaking`, which wakes the next parked worker while work is
+    /// left (SONNY-6479: before, nothing woke anyone after the first, and
+    /// the rest of a batch of long tasks waited for park timers). Waking
+    /// `count` workers at once measured a ~50% flood_1m_batched regression
+    /// from thundering-herd on the inject queue's head cacheline. Skipped
+    /// while a worker is waking; the proof at `enqueueTask` applies.
     fn notifySubmits(self: *Core, count: u64, lane: types.TaskLane) void {
         if (count == 0) return;
         _ = self.counters.submitted.fetchAdd(count, .monotonic);
         const lane_counter = self.queuedTasksCounter(lane);
         const queue_depth = lane_counter.fetchAdd(count, .seq_cst) +% count;
         updatePeak(&self.counters.queue_depth_peak, queue_depth);
-        self.scanAndWake(lane);
+        if (self.counters.waking_workers.load(.seq_cst) == 0) _ = self.scanAndWake(lane);
     }
 
-    /// Scan workers in `lane` for one parked worker and signal it.
-    /// Extracted from notifySubmits so enqueueTask can call it
+    /// Whether a submit outside a `wake_coalesce_batch` boundary must scan:
+    /// some worker is parked and none is already waking. SC loads, after
+    /// the submit's SC lane-counter fetchAdd; see `enqueueTask`.
+    inline fn wakeNeeded(self: *Core) bool {
+        return self.counters.parked_workers.load(.seq_cst) != 0 and
+            self.counters.waking_workers.load(.seq_cst) == 0;
+    }
+
+    /// Called by a worker that was claimed and signalled (`Worker.waking`)
+    /// once it has claimed a task or is about to go idle. Submits skip the
+    /// wake scan while a worker is waking, so this re-checks every lane's
+    /// queue and wakes the next parked worker for any lane with work left.
+    /// The SC fetchSub orders the counter loads after every submit that saw
+    /// this worker waking; see `enqueueTask`. Like a submit, it leaves the
+    /// wake to another waking worker if there is one, so wakes chain one at
+    /// a time instead of fanning out.
+    fn finishWaking(self: *Core, worker: *Worker) void {
+        worker.waking = false;
+        _ = self.counters.waking_workers.fetchSub(1, .seq_cst);
+        if (!self.wakeNeeded()) return;
+        if (self.counters.queued_tasks.load(.seq_cst) != 0) _ = self.scanAndWake(.default);
+        if (self.counters.queued_tasks_blocking.load(.seq_cst) != 0) _ = self.scanAndWake(.blocking);
+    }
+
+    /// Wake one parked worker for `lane`'s work. Returns whether one was
+    /// signalled. Extracted from notifySubmits so enqueueTask can call it
     /// independently after coalesced counter updates.
-    fn scanAndWake(self: *Core, lane: types.TaskLane) void {
+    ///
+    /// Workers serving `lane` come first. When none is parked, a worker of
+    /// the lane that helps `lane` (`rebalanceLane`) is woken instead: an
+    /// idle blocking worker always helps the default lane, and without this
+    /// a default-lane task queued behind busy default workers waited for
+    /// the blocking worker's park timer (SONNY-6479). `idle` checks the
+    /// helped lane's counter before parking, which is the other half of the
+    /// handshake for this cross-lane signal.
+    fn scanAndWake(self: *Core, lane: types.TaskLane) bool {
         const nb: usize = self.config.blocking_workers;
-        const scan_start: usize = if (lane == .blocking) 0 else nb;
-        const scan_end: usize = if (lane == .blocking) nb else self.workers.len;
-        const scan_len = scan_end - scan_start;
-        if (scan_len == 0) return;
+        if (lane == .blocking) {
+            if (self.wakeOneParkedIn(0, nb)) return true;
+        } else {
+            if (self.wakeOneParkedIn(nb, self.workers.len)) return true;
+        }
+        const helper_lane: types.TaskLane = if (lane == .blocking) .default else .blocking;
+        if (self.rebalanceLane(helper_lane) != lane) return false;
+        return if (helper_lane == .blocking)
+            self.wakeOneParkedIn(0, nb)
+        else
+            self.wakeOneParkedIn(nb, self.workers.len);
+    }
+
+    /// Signal one parked worker in `workers[start..end)`, scanning from a
+    /// rotating offset. Returns whether a parked worker was signalled.
+    fn wakeOneParkedIn(self: *Core, start: usize, end: usize) bool {
+        const scan_len = end - start;
+        if (scan_len == 0) return false;
 
         const submitted = self.counters.submitted.load(.monotonic);
         const rel_hint: usize = @intCast(submitted % scan_len);
         var off: usize = 0;
         while (off < scan_len) : (off += 1) {
-            const idx = scan_start + ((rel_hint + off) % scan_len);
+            const idx = start + ((rel_hint + off) % scan_len);
             const w = &self.workers[idx];
             if (w.is_parked.load(.seq_cst) == 1) {
                 w.park_mutex.lock();
-                if (w.is_parked.load(.monotonic) == 1) {
+                // Holding park_mutex with is_parked == 1 means the worker
+                // is in timedWait (it holds the mutex from setting the flag
+                // until the wait releases it). Claim it: a signalled worker
+                // that has not run yet still read as parked, so the next
+                // scan signalled it again (a no-op) instead of waking
+                // another worker. The claim also counts it as waking, which
+                // holds back further submit-side wakes until the worker
+                // passes the wake on (`finishWaking`).
+                const claimed = w.is_parked.load(.monotonic) == 1;
+                if (claimed) {
+                    w.is_parked.store(0, .release);
+                    w.wake_claimed = true;
+                    _ = self.counters.waking_workers.fetchAdd(1, .seq_cst);
                     w.park_cond.signal();
                 }
                 w.park_mutex.unlock();
-                break;
+                if (claimed) return true;
             }
         }
+        return false;
     }
 
     /// Slice L4 — watchdog main loop. Wakes every `watchdog_interval_ns`,
@@ -1906,7 +2011,11 @@ const Core = struct {
             self.runTask(worker_index, maybe_entry.?);
         }
 
-        self.workers[worker_index].overflow_retired.store(true, .release);
+        // A retiring worker must not stay counted as waking: submits would
+        // skip their wake scan for good (SONNY-6479).
+        const retiring = &self.workers[worker_index];
+        if (retiring.waking) self.finishWaking(retiring);
+        retiring.overflow_retired.store(true, .release);
     }
 
     fn workerMain(self: *Core, worker_index: usize) void {
@@ -2063,6 +2172,12 @@ const Core = struct {
     /// inject queue, never the other lane's. This keeps cross-lane steal
     /// decisions lossless — a blocking worker rebalancing to the default
     /// lane never contaminates `blocking_inject` with default tasks.
+    ///
+    /// Only a worker draining its own lane takes a batch. A worker helping
+    /// another lane (`rebalanceLane`) takes one task: a batch would land in
+    /// its local queue, which `lane`'s workers never steal from
+    /// (`laneMask`), so the rest of the batch waited for the helper's
+    /// current task even after `lane`'s own workers went idle (SONNY-6479).
     inline fn tryDrainLaneForWorker(
         self: *Core,
         worker: *Worker,
@@ -2081,9 +2196,10 @@ const Core = struct {
             return lane_inject.pop();
         }
 
+        const own_lane = lane == worker.serves_lane;
         {
             var buf: [32]QueueEntry = undefined;
-            const cap = @min(self.config.inject_batch_size, buf.len);
+            const cap = if (own_lane) @min(self.config.inject_batch_size, buf.len) else 1;
             const n = lane_inject.popMany(buf[0..cap]);
             if (n > 0) {
                 const first = buf[0];
@@ -2114,7 +2230,7 @@ const Core = struct {
                 const sub_idx: usize = @ctz(sub_mask);
                 sub_mask &= sub_mask - 1;
                 var stolen: [32]QueueEntry = undefined;
-                const budget = @min(self.config.steal_batch_size, stolen.len);
+                const budget = if (own_lane) @min(self.config.steal_batch_size, stolen.len) else 1;
                 const n = self.submitter_queues[sub_idx].steal(stolen[0..budget]);
                 if (n > 0) {
                     const first = stolen[0];
@@ -2144,7 +2260,7 @@ const Core = struct {
             const victim_index: usize = @ctz(mask);
             mask &= mask - 1;
             var stolen: [32]QueueEntry = undefined;
-            const budget = @min(self.config.steal_batch_size, stolen.len);
+            const budget = if (own_lane) @min(self.config.steal_batch_size, stolen.len) else 1;
             const n = self.local_queues[victim_index].steal(stolen[0..budget]);
             if (n > 0) {
                 const first = stolen[0];
@@ -2243,6 +2359,9 @@ const Core = struct {
             return;
         }
         self.decrementQueued(descriptor.options.lane);
+        // Pass the wake on before a possibly long task runs, after this
+        // task left the counters so they show only the work still queued.
+        if (worker.waking) self.finishWaking(worker);
 
         // --- QS-003 decomposition: start / invoke / finalize ---
         //
@@ -2441,6 +2560,9 @@ const Core = struct {
 
     fn idle(self: *Core, worker_index: usize) void {
         var worker = &self.workers[worker_index];
+        // Woken but found nothing to run: stop counting as waking before
+        // parking again, passing the wake on if work arrived meanwhile.
+        if (worker.waking) self.finishWaking(worker);
         // Phase G2 (re-land 2026-04-13): no `counters.queued_tasks` poll.
         // The submit path writes that line with .seq_cst on every submit;
         // 56 workers × spin_iters shared loads per park cycle dominated
@@ -2489,9 +2611,22 @@ const Core = struct {
         // reads that store's specific value — if the SC load observes an earlier
         // value, no HB edge forms and the IRIW scenario is permitted.
         worker.is_parked.store(1, .seq_cst);
+        // SONNY-6479: counted so `enqueueTask` scans on every submit while
+        // any worker is parked. SC after the is_parked store and before the
+        // counter loads below; see the proof at `enqueueTask`.
+        _ = self.counters.parked_workers.fetchAdd(1, .seq_cst);
         const lane_counter = self.queuedTasksCounter(worker.serves_lane);
-        if (lane_counter.load(.seq_cst) != 0 or self.state.load(.acquire) != .running) {
+        // A worker that helps another lane (`rebalanceLane`) also checks that
+        // lane's counter: `scanAndWake` signals it for that lane's work when
+        // the lane has no parked worker of its own, and this SC load is its
+        // half of the handshake for that signal.
+        const helped_pending = if (self.rebalanceLane(worker.serves_lane)) |other|
+            self.queuedTasksCounter(other).load(.seq_cst) != 0
+        else
+            false;
+        if (lane_counter.load(.seq_cst) != 0 or helped_pending or self.state.load(.acquire) != .running) {
             worker.is_parked.store(0, .release);
+            _ = self.counters.parked_workers.fetchSub(1, .seq_cst);
             worker.park_mutex.unlock();
             _ = worker.wakeups.fetchAdd(1, .monotonic);
             return;
@@ -2503,7 +2638,14 @@ const Core = struct {
         const timestamps_enabled_idle = timestampsEnabled(self);
         const parked_at_ns: u64 = if (timestamps_enabled_idle) nowNs() else 0;
         worker.park_cond.timedWait(&worker.park_mutex, self.config.idle_park_after_ns) catch {};
+        // A claim stands even if the timeout won the race with the signal:
+        // the waker counted this worker as waking either way.
+        if (worker.wake_claimed) {
+            worker.wake_claimed = false;
+            worker.waking = true;
+        }
         worker.is_parked.store(0, .release);
+        _ = self.counters.parked_workers.fetchSub(1, .seq_cst);
         worker.park_mutex.unlock();
         _ = worker.wakeups.fetchAdd(1, .monotonic);
 

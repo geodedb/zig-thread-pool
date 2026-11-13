@@ -246,11 +246,12 @@ pub const Config = struct {
     /// normalised to 1.  Larger values amortise the inject-queue head
     /// CAS across more tasks but risk one worker monopolising a burst.
     inject_batch_size: usize = 32,
-    /// `releaseDescriptor` signals blocked submitters on backpressure once
-    /// per this many releases, rather than on every release. 0 disables
-    /// coalescing (signal every release — the pre-2026-04-12 behavior).
-    /// The submitter's `timedWait` on `backpressure_cond` bounds worst-case
-    /// missed-signal latency.
+    /// A submit scans for a parked worker to wake once per this many
+    /// submits, and in between only when a worker is parked and no worker
+    /// is already being woken; a woken worker wakes the next while work is
+    /// queued.  A task therefore never waits for a parked worker's
+    /// `idle_park_after_ns` timer (SONNY-6479).  0 and 1 scan on every
+    /// submit.  Clamped to 1024.
     wake_coalesce_batch: u32 = 32,
     /// Number of workers reserved as always-spinning hot workers.
     /// These workers never park; they consume 1 core each at 100% CPU

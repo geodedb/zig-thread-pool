@@ -17,6 +17,11 @@ comptime {
     _ = @import("integration/submitter_lifecycle.zig");
 }
 
+// SONNY-6479 regression test: queued work wakes a parked worker
+comptime {
+    _ = @import("integration/parked_worker_wake.zig");
+}
+
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
     const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
     while (thread_pool.clock.nanoTimestamp() < deadline) {

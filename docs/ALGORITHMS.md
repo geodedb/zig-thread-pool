@@ -68,9 +68,11 @@ Key design points:
    may steal from head.
 3. **`inject_queue` is MPMC.** It is the fallback when both LIFO and
    local paths miss, and the ground truth for `global_queue` variant.
-4. **Wake coalescing:** notify side wakes at most one parked worker per
-   batch of `wake_coalesce_batch` submits. Between flushes, parked
-   workers re-park bail via the seq-cst `queued_tasks` handshake.
+4. **Wake coalescing:** the notify side scans for a parked worker once
+   per `wake_coalesce_batch` submits, and in between whenever a worker is
+   parked and none is already waking. Workers about to park bail via the
+   seq-cst `queued_tasks` handshake; a waking worker passes the wake on
+   (`finishWaking`).
 
 Reference: `src/pool.zig::enqueuePush`, `src/pool.zig::enqueueTask`,
 `src/pool.zig::notifySubmits`.
@@ -370,7 +372,9 @@ Reference: `src/pool.zig::workerMain`, `src/pool.zig::nextTask`,
 ## Wake Coalescing + Parked-Worker Scan
 
 `notifySubmits` batches the park handshake + futex wake, and `scanAndWake`
-probes at most one parked worker per notify.
+claims and wakes one parked worker per call. A claimed worker counts as
+waking until it has a task or goes idle; then `finishWaking` wakes the
+next parked worker if work is still queued, so wakes chain one at a time.
 
 ```mermaid
 sequenceDiagram
@@ -380,23 +384,42 @@ sequenceDiagram
     Note over Sub: enqueuePush succeeded
     Sub->>Counter: submitted.fetchAdd(1, .monotonic)
     Sub->>Counter: lane_counter.fetchAdd(1, .seq_cst)  [park handshake]
-    alt batch boundary (submitted % wake_coalesce_batch == 0)
+    Sub->>Counter: parked_workers / waking_workers .load(.seq_cst)
+    alt batch boundary (submitted % wake_coalesce_batch == 0) or (parked_workers > 0 and waking_workers == 0)
         Sub->>Park: scanAndWake(lane)
-        Note over Park: iterate workers from submitted % scan_len<br/>first is_parked == 1 wins<br/>lock park_mutex, cond.signal
-    else between batches
-        Note over Sub: no wake - parked worker's re-park<br/>handshake checks lane_counter > 0
+        Note over Park: iterate lane's workers from submitted % scan_len,<br/>then the lane's helpers (rebalanceLane)<br/>first is_parked == 1 wins: lock park_mutex,<br/>claim (is_parked = 0), cond.signal
+    else between batches, nobody parked or a worker already waking
+        Note over Sub: no wake - a worker about to park sees<br/>lane_counter > 0 and bails; a waking worker's<br/>finishWaking sees it and wakes the next
     end
 ```
 
 Why it works:
 
 - **SC fetchAdd** on `lane_counter` plus SC read by a parking worker form
-  an SC total order. A worker that is about to park first does an SC load
-  of `lane_counter`; if it sees `> 0`, it bails back to `nextTask`.
-- **Wake at most one** per notify — a wake-up-to-`count` variant regressed
-  `flood_1m_batched` `~50%` due to thundering-herd on the inject head
-  cacheline (measured in 2026-04-14 cascading-wake plan, memoised as a
-  closed plane).
+  an SC total order. A worker that is about to park first does an SC store
+  of `is_parked = 1` and an SC `parked_workers` increment, then SC loads of
+  its lane's counter (and of the lane it helps); if it sees `> 0`, it bails
+  back to `nextTask`. Either that load sees the submit, or the submitter's
+  SC `parked_workers` load sees the worker: then its scan finds it, or its
+  SC `waking_workers` load sees a waking worker whose `finishWaking`
+  (fetchSub, then counter loads) comes later in the SC order and sees the
+  submit.
+- **A parked worker is always reachable.** A worker already parked cannot
+  see queued work until `idle_park_after_ns` expires, so a submit skips
+  the scan only when nobody is parked or a waking worker will re-check
+  (SONNY-6479).
+- **Claiming.** The waker clears `is_parked` under `park_mutex` and counts
+  the worker in `waking_workers` before it signals, so the next scan wakes
+  a different worker instead of re-signalling one that has not run yet.
+- **Wakes chain, one at a time.** `submitBatch` wakes one worker; that
+  worker, on claiming a task, wakes the next while work is queued
+  (SONNY-6479). A wake-up-to-`count` variant measured a `~50%`
+  `flood_1m_batched` regression from thundering-herd on the inject head
+  cacheline (2026-04-14 cascading-wake plan).
+- **Cross-lane wake.** When `lane` has no parked worker, `scanAndWake`
+  wakes a parked worker of the lane that helps it (`rebalanceLane`), and
+  that worker takes one task at a time from the helped lane so the rest
+  stay stealable by the lane's own workers.
 - **Scan hint from `submitted % scan_len`** rotates the first-probed
   worker across submits so consecutive waves don't always hit worker 0.
 

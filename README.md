@@ -221,7 +221,7 @@ and submitter count, so the output is directly diffable.
 .queue_kind         = .ring,           // .ring (default) / .chase_lev
 .inject_batch_size  = 32,              // popMany drain batch
 .steal_batch_size   = 16,              // max entries per stealHalf call
-.wake_coalesce_batch = 32,             // wake scan + signal every N submits
+.wake_coalesce_batch = 32,             // wake scan every N submits; parked workers are always woken
 .max_submitter_queues = 0,             // >0 enables registerSubmitter API
 .allow_blocking_lane = false,          // enable blocking-lane routing
 .blocking_workers   = 0,               // workers reserved for .blocking lane

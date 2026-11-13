@@ -140,12 +140,16 @@ need per-task histograms.
 ### Wake coalescing
 
 ```zig
-.wake_coalesce_batch = 32,  // signal workers every Nth release, not every release
+.wake_coalesce_batch = 32,  // scan for a parked worker every Nth submit
 ```
 
-This amortizes futex wake cost across multiple submissions. The default of 32
-is well-tuned for high-throughput workloads. Set to 0 to disable coalescing
-if you need minimal wake latency for sparse submissions.
+A submit looks for a parked worker to wake once per `wake_coalesce_batch`
+submits, and in between whenever a worker is parked and no other worker is
+already being woken. A woken worker wakes the next one while work is still
+queued, so a task never waits for a parked worker's `idle_park_after_ns`
+timer, and a burst of submits pays for one wake at a time instead of one
+per submit. The default of 32 suits high-throughput workloads. Setting it
+to 0 or 1 scans on every submit, which wakes a separate worker per submit.
 
 ## Submitting Tasks
 
