@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails. Regression: `tests/integration/allocate_storage_failure.zig`
   (`zig build test-integration`), an allocation-failure sweep over every
   allocation init makes, for the default lane and a blocking lane.
+- `make cross-check` (and so `make ci`) called `zig build cross-check`, a
+  step `build.zig` no longer has; it now builds the targets the CI
+  cross-check job builds (`x86_64-linux`, `aarch64-macos`,
+  `x86_64-windows-gnu`; override with `CROSS_TARGETS`).
 
 ## [0.2.11] - 2026-11-13
 

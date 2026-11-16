@@ -65,8 +65,13 @@ bench-runtime-compare:
 tools:
 	$(ZIG) build tools
 
+# The targets the CI cross-check job builds. There is no `zig build
+# cross-check` step (build.zig: it was removed), so this called a step that
+# did not exist and `make ci` failed.
+CROSS_TARGETS ?= x86_64-linux aarch64-macos x86_64-windows-gnu
+
 cross-check:
-	$(ZIG) build cross-check
+	for t in $(CROSS_TARGETS); do $(ZIG) build -Dtarget=$$t || exit 1; done
 
 example:
 	$(ZIG) build example
