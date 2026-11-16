@@ -22,6 +22,11 @@ comptime {
     _ = @import("integration/parked_worker_wake.zig");
 }
 
+// SONNY-6593 regression test: an allocation failure in init leaks nothing
+comptime {
+    _ = @import("integration/allocate_storage_failure.zig");
+}
+
 fn waitUntilGateStarted(ctx: *common.GateTaskContext) !void {
     const deadline = thread_pool.clock.nanoTimestamp() + (5 * std.time.ns_per_s);
     while (thread_pool.clock.nanoTimestamp() < deadline) {
