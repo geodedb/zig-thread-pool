@@ -8,10 +8,10 @@
 //! slices allocated before it. The F-002 sweep (spawn_failure.zig) starts
 //! at fail_index 10, past every allocation `allocateStorage` makes.
 //!
-//! Strategy: fail allocation n = 0, 1, 2, ... (std.testing.FailingAllocator
-//! fails allocation n only) until an init runs with no failure induced,
-//! each over its own DebugAllocator so a leak names the index that caused
-//! it.
+//! Strategy: fail from allocation n = 0, 1, 2, ... (std.testing.FailingAllocator
+//! fails allocation n and every one after it) until an init runs with no
+//! failure induced, each over its own DebugAllocator so a leak names the
+//! index that caused it.
 //! Both queue shapes are swept: the default lane only, and a blocking lane
 //! (one more ring allocated in `allocateStorage`).
 
