@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ThreadPool.init` leaked the storage it had already allocated when a
+  later allocation in `Core.allocateStorage` failed (SONNY-6593): the
+  workers, local queues, descriptors, free-index list and inject rings
+  were `try` expressions in one struct literal with no `errdefer`, and
+  `Core.init` installs its `deinitOwned` cleanup only after
+  `allocateStorage` returns. Each allocation is now freed if a later one
+  fails. Regression: `tests/integration/allocate_storage_failure.zig`
+  (`zig build test-integration`), an allocation-failure sweep over every
+  allocation init makes, for the default lane and a blocking lane.
+
 ## [0.2.11] - 2026-11-13
 
 ### Fixed

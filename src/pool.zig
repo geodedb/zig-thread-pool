@@ -820,22 +820,40 @@ const Core = struct {
     /// leaves a cleaner stack trace to fail here before installing it).
     fn allocateStorage(self: *Core, allocator: std.mem.Allocator, normalized: types.Config) !void {
         const total_worker_slots = normalized.max_threads + normalized.max_overflow_workers;
+        // SONNY-6593: each allocation is freed if a later one fails. They
+        // were `try` expressions inside the struct literal below, with no
+        // errdefer, and `init` installs its `deinitOwned` errdefer only
+        // after this returns, so a failure leaked every slice before it.
+        const workers = try allocator.alloc(Worker, total_worker_slots);
+        errdefer allocator.free(workers);
+        const local_queues = try allocator.alloc(LocalQueue, total_worker_slots);
+        errdefer allocator.free(local_queues);
+        const descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity);
+        errdefer allocator.free(descriptors);
+        const free_indices = try allocator.alloc(std.atomic.Value(u32), normalized.queue_capacity);
+        errdefer allocator.free(free_indices);
+        var inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity);
+        errdefer inject_queue.deinit();
+        var blocking_inject: ?BoundedRing(QueueEntry) = if (normalized.blocking_workers > 0)
+            try BoundedRing(QueueEntry).init(allocator, if (normalized.blocking_queue_capacity > 0)
+                normalized.blocking_queue_capacity
+            else
+                normalized.queue_capacity)
+        else
+            null;
+        errdefer if (blocking_inject) |*bi| bi.deinit();
+        const worker_stats_buffer = try allocator.alloc(types.WorkerStats, total_worker_slots);
+
         self.* = .{
             .allocator = allocator,
             .config = normalized,
-            .workers = try allocator.alloc(Worker, total_worker_slots),
-            .local_queues = try allocator.alloc(LocalQueue, total_worker_slots),
-            .descriptors = try allocator.alloc(TaskDescriptor, normalized.queue_capacity),
-            .free_indices = try allocator.alloc(std.atomic.Value(u32), normalized.queue_capacity),
-            .inject_queue = try BoundedRing(QueueEntry).init(allocator, normalized.queue_capacity),
-            .blocking_inject = if (normalized.blocking_workers > 0)
-                try BoundedRing(QueueEntry).init(allocator, if (normalized.blocking_queue_capacity > 0)
-                    normalized.blocking_queue_capacity
-                else
-                    normalized.queue_capacity)
-            else
-                null,
-            .worker_stats_buffer = try allocator.alloc(types.WorkerStats, total_worker_slots),
+            .workers = workers,
+            .local_queues = local_queues,
+            .descriptors = descriptors,
+            .free_indices = free_indices,
+            .inject_queue = inject_queue,
+            .blocking_inject = blocking_inject,
+            .worker_stats_buffer = worker_stats_buffer,
         };
 
         self.accounting = .{
